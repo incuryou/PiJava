@@ -141,6 +141,9 @@ static void runtime_early_repaint_handoff() {++VMS_EXEC(g_runtime_profile).pendi
 static void reset_runtime_stats();
 static uint64_t g_stat_present_seen=0;   // 0.2.113 F4: g_present_frames at the start of the current STAT window
  VMS_PLAT_ACCESSOR(g_present_stats, PresentStats)
+#if defined(__SWITCH__) && defined(J2ME_ENABLE_DEKO3D)
+ VMS_PLAT_ACCESSOR(g_gpu_active, bool) // Renderer diagnostics precede the host module.
+#endif
  VMS_PLAT_ACCESSOR(g_last_present_us, int64_t)
 static int64_t paint_clock_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -2699,7 +2702,7 @@ static p1::Work p1_host_work_turn(bool gpu,bool heartbeat,Schedule schedule,Slee
     CityHostSpan city_host("host_work");
     const bool runnable=game_runnable(),pending=p1_pending_work();
     p1::Turn t{gpu,VMS_RS(g_fb_dirty),heartbeat,runnable,pending,host_frame_ready242(),speed_group_incomplete(),VMS_EXEC(g_last_slice_us),
-        (!gpu&&!VMS_RS(g_fb_dirty)&&!heartbeat&&!runnable&&!pending)?idle_sleep_ms():0};
+        (!VMS_RS(g_fb_dirty)&&!heartbeat&&!runnable&&!pending)?idle_sleep_ms():0};
     const auto work=p1::decide(t);p1_host_decision(int(work),t);
     switch(work){
     case p1::Work::Ready:audio_pump_frame();break;
@@ -3747,7 +3750,11 @@ static void maybe_emit_runtime_stats(){
     char timings[256];
     char presentation[384];
     std::snprintf(presentation,sizeof(presentation), " renderer=%s presents=%llu present_avg_ms=%.3f present_max_ms=%.3f acquire_avg_ms=%.3f prepare_avg_ms=%.3f submit_avg_ms=%.3f gpu_wait_avg_ms=%.3f",
+#ifdef J2ME_ENABLE_DEKO3D
+        VMS_PLAT(g_gpu_active)?"gpu":"cpu",
+#else
         "cpu",
+#endif
         (unsigned long long)VMS_PLAT(g_present_stats).count,
         VMS_PLAT(g_present_stats).average_ms(VMS_PLAT(g_present_stats).total_us),VMS_PLAT(g_present_stats).max_us/1000.0,
         VMS_PLAT(g_present_stats).average_ms(VMS_PLAT(g_present_stats).acquire_us),VMS_PLAT(g_present_stats).average_ms(VMS_PLAT(g_present_stats).prepare_us),

@@ -23,7 +23,7 @@ inline constexpr std::array<host_controller::Anchor,16> anchors={{
 inline constexpr std::array<host_controller::ButtonFace,16> button_faces={{
     {host_keymap::ZL,866,198,39,9,{851,192,31,13},{885,191,17,11},"ZL",true},
     {host_keymap::L,855,226,43,9.5,{840,220,31,13},{878,217,17,11},"L",true},
-    {host_keymap::Minus,920,244,10,11,{912,235,17,19},{912,258,17,13},"-",false},
+    {host_keymap::Minus,920,244,10,11,{912,234,17,19},{912,258,17,13},"-",false},
     {host_controller::Menu,851,293,23,24,{830,284,43,14},{844,300,15,9},"L3",false},
     {host_keymap::DUp,900,340,10.5,10.5,{892,332,17,17},{892,336,17,13},"",false},
     {host_keymap::DLeft,874,366,10.5,11,{866,357,17,19},{866,362,17,14},"",false},
@@ -31,7 +31,7 @@ inline constexpr std::array<host_controller::ButtonFace,16> button_faces={{
     {host_keymap::DDown,900,392,10.5,10.5,{892,384,17,17},{892,388,17,13},"",false},
     {host_keymap::ZR,1088,198,39,9,{1073,192,31,13},{1053,191,17,11},"ZR",true},
     {host_keymap::R,1100,226,43,9.5,{1085,220,31,13},{1061,217,17,11},"R",true},
-    {host_keymap::Plus,1034,244,10,11,{1026,235,17,19},{1026,258,17,13},"+",false},
+    {host_keymap::Plus,1034,244,10,11,{1026,234,17,19},{1026,258,17,13},"+",false},
     {host_keymap::X,1103,264,16,17,{1089,252,29,14},{1099,268,9,9},"X",false},
     {host_keymap::Y,1067,296,16,17,{1053,284,29,14},{1063,300,9,9},"Y",false},
     {host_keymap::A,1138,296,16,17,{1124,284,29,13},{1134,299,9,9},"A",false},

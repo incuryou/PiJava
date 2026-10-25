@@ -16,8 +16,7 @@ static host_controller::Legends g_controller_legends;
 static bool standard_game_keys();
 static host_keymap::Tracker g_keymap_tracker;
 static std::string g_keymap_id, g_keymap_name;
-static std::vector<uint32_t> g_keymap_phone;
-static bool g_keymap_phone_attempted=false;
+static bool g_keymap_pro_attempted=false;
 static u64 g_keymap_blocked=0;
 static const char* g_keymap_path="sdmc:/switch/j2me/keymap.cfg";
 #include "../host_speed.h"
@@ -25,11 +24,14 @@ static const char* g_keymap_path="sdmc:/switch/j2me/keymap.cfg";
 static speed_keys::State g_speed_keys; // P8.3: SHA256-keyed speed.cfg
 #include "../host_skin.h"
 #include "../host_font.h"
+#include "../chapter_save_ui.h"
 #ifdef J2ME_ENABLE_DEKO3D
 #include "../switch_gpu_present.h"
  VMS_PLAT_ACCESSOR(g_gpu_present, SwitchGpuPresent)
 struct GpuHostLayerCache {
-    std::vector<uint32_t> rgba,canvas; uint64_t generation=0;
+    std::vector<uint32_t> rgba,canvas,raw; uint64_t generation=0;
+    j2me_present::gpu_filter::FrameCache raw_frame;
+    int logged_path=-1,logged_filter=-1,logged_w=0,logged_h=0;uint64_t logged_epoch=0;
     int bezel=-1,fps=-1; uint64_t mapping_generation=0; bool was_layered=false; std::string previous_label;
     void clear(){*this=GpuHostLayerCache{};}
 };
@@ -90,6 +92,9 @@ struct MenuNameUi { menu_catalog::State catalog; int64_t scroll_t0 = 0; int last
 static MenuNameUi g_menu_name_ui;
 static menu_actions::Deletion g_menu_delete;
 static menu_actions::Repeat g_menu_repeat;
+static chapter_ui::State g_chapter_import;
+static u64 g_chapter_blocked=0;
+static const char* g_chapter_rms_root="sdmc:/switch/j2me/rms";
 static bool g_menu_note_error=false,g_menu_note_neutral=true;
 static void close_host_fonts() {
     if (VMS_PLAT(g_host_font_service)) { plExit(); VMS_PLAT(g_host_font_service) = false; }
@@ -175,21 +180,26 @@ static void close_presenter() {
     VMS_PLAT(g_cpu_cleared)=0;
     VMS_PLAT(g_present_stats)={};
 }
-static bool toggle_presenter() {
-    if(VMS_DIAG(g_p1_profile).active){log_line("P1CONFIG renderer requested_toggle=1 effective=cpu source=P1_profile");return false;}
-    const bool request_gpu = !VMS_PLAT(g_gpu_active);
-    log_line(std::string("RENDER request=")+(request_gpu?"gpu":"cpu"));
-    log_drain();
-    close_presenter();
+// Called after loading menu.cfg and on explicit filter changes, never per frame.
+// Backend selection also selects the existing CPU/GPU scheduling branch.
+static bool select_presenter() {
+    bool request_gpu=false;
 #ifdef J2ME_ENABLE_DEKO3D
-    if(request_gpu) {
-        VMS_PLAT(g_gpu_active)=VMS_PLAT(g_gpu_present).init();
-        if(!VMS_PLAT(g_gpu_active))log_line("RENDER GPU initialization returned failure; CPU selected");
-    }
-#else
-    if(request_gpu)log_line("RENDER GPU unavailable in CPU-only build");
+    request_gpu=j2me_present::gpu_filter::supported(VMS_PLAT(g_menu_settings).filter)&&!VMS_DIAG(g_p1_profile).active;
 #endif
-    log_line(std::string("RENDER backend=")+(VMS_PLAT(g_gpu_active)?"deko3d":"cpu"));
+    if(request_gpu!=VMS_PLAT(g_gpu_active)) {
+        log_drain();
+        close_presenter(); // Release the old window owner before creating the next.
+#ifdef J2ME_ENABLE_DEKO3D
+        if(request_gpu) {
+            VMS_PLAT(g_gpu_active)=VMS_PLAT(g_gpu_present).init();
+            if(!VMS_PLAT(g_gpu_active))log_line("RENDER GPU initialization returned failure; CPU selected");
+        }
+#endif
+    }
+    log_line(std::string("RENDER policy=filter filter=")+std::to_string(int(VMS_PLAT(g_menu_settings).filter))+
+        " requested="+(request_gpu?"gpu":"cpu")+" effective="+(VMS_PLAT(g_gpu_active)?"gpu":"cpu")+
+        " p1_cpu="+std::to_string(VMS_DIAG(g_p1_profile).active));
     return VMS_PLAT(g_gpu_active);
 }
 // libnx calls __appExit after C++ destructors and the logger's atexit join.
@@ -240,12 +250,23 @@ static void acquire_cpu_frame() {
     }
 }
 
+static void acquire_game_frame() {
+#ifdef J2ME_ENABLE_DEKO3D
+    if(VMS_PLAT(g_gpu_active)) {
+        if(VMS_PLAT(g_gpu_present).acquire_frame())return;
+        log_line("RENDER GPU acquire returned failure; falling back to CPU");
+        close_presenter();
+    }
+#endif
+    acquire_cpu_frame();
+}
+
 // Shared host chrome and overlay implementation: CPU and GPU use the same
 // menus, phone skins, FPS placement, text metrics and pause sheet.
 static void compose_host_surface(u32* frame,u32 pitch,const std::string& label,
                                  bool include_game,bool force_chrome) {
     if (g_keymap_editor.open) {
-        host_keymap::render(frame,pitch,g_keymap_editor,g_keymap_phone,host_text_callback(frame,pitch),host_text_callback(frame,pitch,true),
+        host_keymap::render(frame,pitch,g_keymap_editor,host_text_callback(frame,pitch),host_text_callback(frame,pitch,true),
             [](const std::string& label,int size) {
                 const auto measured=VMS_PLAT(g_host_font).measure(label,size);
                 return measured.ok?measured.x+measured.w:host_menu::text_advance(label,size);
@@ -268,6 +289,7 @@ static void compose_host_surface(u32* frame,u32 pitch,const std::string& label,
                                g_menu_name_ui.catalog.details, monotonic_ms() - g_menu_name_ui.scroll_t0, &g_menu_name_ui.scrolling,
                                g_menu_note_error,g_menu_note_neutral);
         host_menu::render_delete(frame,pitch,g_menu_delete,host_text_callback(frame,pitch),host_text_callback(frame,pitch,true));
+        chapter_ui::render(frame,pitch,g_chapter_import,host_text_callback(frame,pitch));
     } else if (VMS_PLAT(g_host_surface) == HostSurface::Import) {
         host_menu::rect(frame, pitch, 0, 0, 1280, 720, host_menu::color(0x1c201f));
         const auto text = host_text_callback(frame, pitch);
@@ -360,21 +382,52 @@ static void present() {
             cache.mapping_generation=g_controller_legends.generation();
         }
         was_layered=layered;
-        bool valid=!layered || j2me_present::game_rgba(VMS_RS(g_fb),VMS_RS(g_screen_w),VMS_RS(g_screen_h),rgba,VMS_PLAT(g_menu_settings).filter);
+        const auto filter=VMS_PLAT(g_menu_settings).filter;
+        const bool shader=layered&&j2me_present::gpu_filter::supported(filter);
+        const j2me_present::gpu_filter::FrameKey frame_key{resver::g_epoch,uint64_t(uint32_t(VMS_RS(g_game_frames))),VMS_RS(g_screen_w),VMS_RS(g_screen_h),filter};
+        bool valid=true;
+        if(shader){
+            // Dirty is also an explicit refresh signal (for example host-side
+            // restored pixels), even if a completed-frame counter repeats.
+            const bool changed=cache.raw_frame.needs_upload(frame_key);
+            if(VMS_RS(g_fb_dirty)&&!changed)VMS_PLAT(g_gpu_present).invalidate_game();
+            if(changed||VMS_RS(g_fb_dirty)){
+                valid=logical_screen::valid(frame_key.w,frame_key.h)&&j2me_present::gpu_filter::pack(VMS_RS(g_fb),frame_key.w,frame_key.h,filter,cache.raw);
+                if(valid)cache.raw_frame.committed(frame_key);
+            }
+        }else{
+            cache.raw_frame.invalidate();VMS_PLAT(g_gpu_present).invalidate_game();
+            valid=!layered||j2me_present::game_rgba(VMS_RS(g_fb),VMS_RS(g_screen_w),VMS_RS(g_screen_h),rgba,filter);
+        }
+        const int path=shader?2:layered?1:0;
+        if(cache.logged_path!=path||cache.logged_filter!=int(filter)||cache.logged_w!=frame_key.w||cache.logged_h!=frame_key.h||cache.logged_epoch!=frame_key.epoch){
+            log_line(std::string("GPUFILTER path=")+(shader?"fragment_raw":layered?"cpu_prepared_blit":"composed_overlay")+
+                " filter="+std::to_string(int(filter))+" source="+std::to_string(frame_key.w)+"x"+std::to_string(frame_key.h)+" epoch="+std::to_string(frame_key.epoch));
+            cache.logged_path=path;cache.logged_filter=int(filter);cache.logged_w=frame_key.w;cache.logged_h=frame_key.h;cache.logged_epoch=frame_key.epoch;
+        }
         const int64_t prepared=paint_clock_us();
         const bool ok=valid && VMS_PLAT(g_gpu_present).present_layers(reinterpret_cast<const uint8_t*>(canvas.data()),generation,
-                        layered?reinterpret_cast<const uint8_t*>(rgba.data()):nullptr);
+                        layered&&!shader?reinterpret_cast<const uint8_t*>(rgba.data()):nullptr,
+                        shader?cache.raw.data():nullptr,shader?&frame_key:nullptr);
         const int64_t done=paint_clock_us();const auto timing=VMS_PLAT(g_gpu_present).lastTimings();
         const uint64_t prepare=uint64_t(prepared-present_started)+timing.upload_us;
-        const uint64_t total=uint64_t(done-present_started);
+        const uint64_t total=uint64_t(done-present_started)+timing.acquire_before_present_us;
         const uint64_t accounted=timing.acquire_wait_us+prepare+timing.gpu_wait_us;
         VMS_PLAT(g_present_stats).add(total,timing.acquire_wait_us,prepare,total>accounted?total-accounted:0,timing.gpu_wait_us);
         if(ok) {
+            // One cached chrome canvas feeds all GPU slots; each slot's
+            // generation still controls its upload. No three-pass CPU clear.
+            VMS_PLAT(g_cpu_cleared)=3;
             // Same scheduler feedback contract as CPU presentation.
-            if(VMS_EXEC(g_frame_work_finished_us)){VMS_EXEC(g_frame_wait_budget).observe(VMS_EXEC(g_frame_work_us),done-VMS_EXEC(g_frame_work_finished_us));VMS_EXEC(g_frame_work_finished_us)=0;}
+            if(VMS_EXEC(g_frame_work_finished_us)){
+                const int64_t blocking_acquire=int64_t(timing.acquire_wait_us-timing.acquire_before_present_us);
+                VMS_EXEC(g_frame_wait_budget).observe(VMS_EXEC(g_frame_work_us),std::max<int64_t>(0,done-VMS_EXEC(g_frame_work_finished_us)-blocking_acquire));
+                VMS_EXEC(g_frame_work_finished_us)=0;
+            }
             return;
         }
         log_line("RENDER GPU submission returned failure; falling back to CPU");close_presenter();
+        if(VMS_PLAT(g_host_surface)==HostSurface::Menu){VMS_PLAT(g_menu_status)="GPU 运行失败，已回退 CPU";g_menu_note_error=true;g_menu_note_neutral=false;}
     }
 #endif
     { P7_SCOPE(PresentWait); acquire_cpu_frame(); }
@@ -447,6 +500,31 @@ static void draw_import_prompt(const Entry& entry) {
     VMS_PLAT(g_host_surface) = HostSurface::Import;
     VMS_PLAT(g_cpu_cleared) = 0;
     VMS_PLAT(g_import_label) = entry.label;
+}
+static void update_chapter_import(u64 down,u64 held,const std::vector<Entry>& items,int sel,std::string& status) {
+    g_chapter_blocked&=held;down&=~g_chapter_blocked;held&=~g_chapter_blocked;
+    const bool up=held&HidNpadButton_AnyUp,down_held=held&HidNpadButton_AnyDown;
+    const bool left=held&(HidNpadButton_L|HidNpadButton_ZL),right=held&(HidNpadButton_R|HidNpadButton_ZR);
+    const int direction=g_chapter_import.confirming?0:up!=down_held?(down_held?1:-1):
+        !up&&!down_held&&left!=right?(right?chapter_ui::State::rows:-chapter_ui::State::rows):0;
+    const int repeated=g_menu_repeat.update(direction,monotonic_ms());
+    using chapter_ui::Action;using chapter_ui::Event;
+    Event event=Event::None;
+    if(down&HidNpadButton_B)g_chapter_import.act(Action::Back);
+    else if(down&HidNpadButton_A)event=g_chapter_import.act(Action::Confirm);
+    else if(repeated)g_chapter_import.act(repeated==chapter_ui::State::rows?Action::NextPage:
+        repeated==-chapter_ui::State::rows?Action::PreviousPage:repeated>0?Action::Down:Action::Up);
+    if(event==Event::Prepare)g_chapter_import.prepare("sdmc:/switch/j2me/rms",g_chapter_import.note);
+    if(event==Event::Import){
+        g_chapter_import.busy=true;VMS_PLAT(g_cpu_cleared)=0;present();
+        const auto result=g_chapter_import.execute("sdmc:/switch/j2me/rms");
+        g_menu_note_error=!result.ok;g_menu_note_neutral=false;
+        status=result.ok?"已继承游戏内存档；按 A 开始，勿用 X 继续旧即时存档":result.error;
+        log_line("CHAPTER import ok="+std::to_string(result.ok)+" stores="+std::to_string(result.stores)+
+            " source="+g_chapter_import.source_id+" target="+g_chapter_import.target_id+" backup="+result.backup+" error="+result.error);
+    }
+    VMS_PLAT(g_cpu_cleared)=0;
+    if(!g_chapter_import.open){g_menu_repeat.reset();draw_menu(items,sel,status);}
 }
 static void update_menu_delete(u64 down,std::vector<Entry>& items,int& sel,std::string& status) {
     using menu_actions::Action;using menu_actions::Result;
@@ -554,9 +632,8 @@ static bool update_keymap_editor(u64 down,u64 held,bool focus_paused) {
     else if(down&HidNpadButton_AnyLeft)host_keymap::act(g_keymap_editor,Action::Left);
     else if(down&HidNpadButton_AnyRight)host_keymap::act(g_keymap_editor,Action::Right);
     if(previous_page!=g_keymap_editor.page)log_line(std::string("L3MENU page=")+(g_keymap_editor.page==host_keymap::Page::SaveExit?"save_exit":"keymap"));
-    if(g_keymap_editor.page==host_keymap::Page::Keymap && !g_keymap_phone_attempted) {
-        g_keymap_phone_attempted=true;g_keymap_phone=host_keymap::load_phone("romfs:/ui/nokia5300.rgba");
-        log_line("KEYMAP phone_loaded="+std::to_string(!g_keymap_phone.empty()));
+    if(g_keymap_editor.page==host_keymap::Page::Keymap && !g_keymap_pro_attempted) {
+        g_keymap_pro_attempted=true;
         log_line("KEYMAP pro_loaded="+std::to_string(g_keymap_pro.load("romfs:/ui/pro-controller.rgba")));
     }
     if(result==host_keymap::Result::Save) {
@@ -632,6 +709,7 @@ static void launch_entry(const Entry& e, bool import_legacy = false) {
     load_props();
     load_sidecar_jad(e.path);
     const std::string identity=rms_jar_identity(bytes.data(),bytes.size());
+    if(!chapter_save::recover(g_chapter_rms_root,identity,err))die("存档恢复失败："+err);
     select_screen_sidecar(e.path,identity);
     std::string main = manifest_midlet();
     if (main.empty()) main = find_midlet_class();
@@ -689,11 +767,12 @@ int main(int argc, char** argv) {
     log_line("PROG keys=up2 down8 left4 right6 L1 R3 ZL7 ZR9 minus* plus# A5 RStick0 X=left-soft B=right-soft Ymenu");
     Result audio_rc=VMS_PLAT(g_audio_sink).init();
     log_line(R_SUCCEEDED(audio_rc) ? "AUDIO 48000Hz stereo PCM16 MIDI/WAV; approximate GM synth" : "AUDIO unavailable result="+std::to_string(audio_rc));
-    log_line("PROG L3=pause/resume; Y=destroyApp and menu; Java exception traces enabled");
+    log_line("PROG L3=game settings; Java exception traces enabled");
 #ifdef J2ME_ENABLE_DEKO3D
-    log_line("RENDER backend=cpu; menu L3 toggles experimental GPU layered-ring presentation (all skins)");
+    log_line("GPUFILTER available=Bilinear,Scale2x,LCD,CRT,ScanlinesDX path=offline_fragment_raw cache=epoch_frame_dimensions_filter backend_policy=filter");
+    log_line("GPUSCHED policy=shared_cpu submit=new_frame_or_heartbeat acquire=before_java wake_budget=bounded swap_interval=1");
 #else
-    log_line("RENDER backend=cpu; GPU work paused for compatibility release");
+    log_line("RENDER policy=filter effective=cpu reason=cpu_only_build");
 #ifdef __SWITCH__
     // Clock policy belongs to the host/user. Both render builds are query-only.
 
@@ -711,13 +790,20 @@ int main(int argc, char** argv) {
     VMS_PLAT_LOCAL3(sel, main_sel, in_game, main_in_game, last_ks, main_last_ks, static int sel = 0, in_game = 0, last_ks = -1;)
     VMS_PLAT_LOCAL(import_prompt, main_import_prompt, static bool import_prompt = false;)
     bool focus_paused=false;
+    const bool config_loaded = host_menu::load_settings("sdmc:/switch/j2me/menu.cfg", VMS_PLAT(g_menu_settings));
+    select_presenter();
     std::string status;
+#ifdef J2ME_ENABLE_DEKO3D
+    if(j2me_present::gpu_filter::supported(VMS_PLAT(g_menu_settings).filter)&&!VMS_PLAT(g_gpu_active))
+        status=VMS_DIAG(g_p1_profile).active?"P1 诊断配置固定 CPU；停用 p1-profile.cfg 后可测试 GPU":"GPU 初始化失败，已回退 CPU";
+#else
+    status="CPU 显示后端（此构建不含 GPU）";
+#endif
     int sd_jars = 0; for (auto& it : items) if (it.path.find("sdmc:") == 0) sd_jars++;
     log_line("MENU items=" + std::to_string(items.size()) + " sd_jars=" + std::to_string(sd_jars));
     VMS_CL(g_classpath).push_back("romfs:/classes");
     const bool keymaps_loaded=host_keymap::load(g_keymap_path,g_keymaps);
     log_line("KEYMAP config_loaded="+std::to_string(keymaps_loaded)+" per_game="+std::to_string(g_keymaps.games.size())+" L3_reserved=1 Y_reserved=0 inputs=23");
-    const bool config_loaded = host_menu::load_settings("sdmc:/switch/j2me/menu.cfg", VMS_PLAT(g_menu_settings));
     const bool speeds_loaded = host_speed::load("sdmc:/switch/j2me/speed.cfg", VMS_PLAT(g_game_speeds));
     g_speed_keys.dir = "sdmc:/switch/j2me"; speed_keys::load_cache(g_speed_keys);
     { const auto mr = speed_keys::migrate(g_speed_keys, VMS_PLAT(g_game_speeds)); speed_keys::save_cache(g_speed_keys);
@@ -733,6 +819,7 @@ int main(int argc, char** argv) {
     while (appletMainLoop()) {
         if (setjmp(g_die_jmp) != 0) {
             g_keymap_editor.open=false;g_keymap_tracker.clear();
+            g_chapter_import=chapter_ui::State{};
             stop_thread(); in_game = 0; import_prompt = false; VMS_PLAT(g_exit_sheet) = false; VMS_PLAT(g_sheet_paused_here) = false; VMS_PLAT(g_sheet_swallow) = 0; status = VMS_EXEC(g_error);
             g_menu_note_error=true;g_menu_note_neutral=false;g_menu_repeat.reset();
             draw_menu(items, sel, status); log_line("EX back-to-menu " + VMS_EXEC(g_error)); present(); continue;
@@ -752,7 +839,7 @@ int main(int argc, char** argv) {
             }
             sel=std::max(0,std::min(sel,std::max(0,int(items.size())-1)));draw_menu(items,sel,status);
         }
-        if(!focused) {g_keymap_editor.choice_repeat.reset();{ P7_SCOPE(Idle); svcSleepThread(10000000); }continue;}
+        if(!focused) {if(g_chapter_import.open){g_chapter_blocked=~u64(0);g_menu_repeat.reset();}g_keymap_editor.choice_repeat.reset();{ P7_SCOPE(Idle); svcSleepThread(10000000); }continue;}
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
         u64 up = padGetButtonsUp(&pad);
@@ -776,6 +863,10 @@ int main(int argc, char** argv) {
         }
         if(!in_game && g_menu_delete.open) {
             g_menu_repeat.reset();update_menu_delete(down,items,sel,status);
+            present();{P7_SCOPE(Idle);svcSleepThread(16000000);}continue;
+        }
+        if (!in_game && g_chapter_import.open) {
+            update_chapter_import(down,held,items,sel,status);
             present();{P7_SCOPE(Idle);svcSleepThread(16000000);}continue;
         }
         if (!in_game && import_prompt) {
@@ -832,6 +923,12 @@ int main(int argc, char** argv) {
                 else g_menu_delete.begin(items[sel].path,game_names::strip_jar(items[sel].path));
                 draw_menu(items,sel,status);present();continue;
             }
+            else if ((down & HidNpadButton_Y) && VMS_PLAT(g_menu_focus)==host_menu::Focus::Games) {
+                g_menu_repeat.reset();
+                g_chapter_blocked=held;
+                if(!g_chapter_import.begin(items,sel))status="至少需要两款游戏，才能选择来源章节";
+                draw_menu(items,sel,status);present();continue;
+            }
             else if (down & HidNpadButton_X) {
                 if(VMS_DIAG(g_p1_profile).active)status="P1 测试请正常启动游戏";
                 else if (items.empty()) status = "先选择一款游戏";
@@ -861,7 +958,8 @@ int main(int argc, char** argv) {
                         const std::string identity=rms_jar_identity(bytes.data(),bytes.size());
                         select_screen_sidecar(items[sel].path,identity);
                         select_game_keymap(items[sel],identity);
-                        if (restore_instant_state(items[sel].path,identity)) {
+                        if(!chapter_save::recover(g_chapter_rms_root,identity,err)) status="存档恢复失败："+err;
+                        else if (restore_instant_state(items[sel].path,identity)) {
                             in_game = 1; VMS_EXEC(g_slices) = 0; status.clear(); changed = false;
                             VMS_EXEC(g_last_console_line).clear(); VMS_EXEC(g_self_exit) = false;   // 0.2.112 F2: per-continue
                             VMS_PLAT(g_chrome_bezel) = -2; VMS_PLAT(g_chrome_fps) = -2; VMS_PLAT(g_cpu_cleared) = 0; VMS_RS(g_fb_dirty) = true;
@@ -900,6 +998,7 @@ int main(int argc, char** argv) {
                     settings_changed = true;
                 } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Filter) {
                     settings_changed=host_menu::change_filter(VMS_PLAT(g_menu_settings),1);
+                    if(settings_changed)select_presenter();
                 } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Fps) {
                     VMS_PLAT(g_menu_settings).show_fps = !VMS_PLAT(g_menu_settings).show_fps; settings_changed = true;
                 } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Speed && !items.empty()) {
@@ -942,7 +1041,7 @@ int main(int argc, char** argv) {
         } else if (in_game) {
             if(!sched_legacy()) {
                 // P2.6: shared scheduler core; this layer only supplies frame acquisition and host sleeps.
-                sched_game_work(VMS_PLAT(g_gpu_active),acquire_cpu_frame,[](int64_t ms){
+                sched_game_work(VMS_PLAT(g_gpu_active),acquire_game_frame,[](int64_t ms){
                     // idle nap (scheduled-frame wake waits are wait_game_wake inside the core, as before).
                     { P7_SCOPE(Idle); std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }});
             } else {
@@ -952,9 +1051,8 @@ int main(int argc, char** argv) {
                 // VMS_RS(g_fb_dirty) and is shown below; 8..20ms sleeps still use the vsync path.
                 const int64_t pace_now = paint_clock_us();
                 const bool present_due = VMS_PLAT(g_last_present_us) != 0 && pace_now - VMS_PLAT(g_last_present_us) >= 50000;
-                p1_host_work_turn(VMS_PLAT(g_gpu_active),present_due,[](bool gpu){
-                    if(gpu)scheduled_frame(acquire_cpu_frame,game_wake_delay,wait_game_wake,advance_game_frame,0);
-                    else scheduled_frame(acquire_cpu_frame,game_wake_delay,wait_game_wake,advance_game_frame,
+                p1_host_work_turn(VMS_PLAT(g_gpu_active),present_due,[](bool){
+                    scheduled_frame(acquire_game_frame,game_wake_delay,wait_game_wake,advance_game_frame,
                         VMS_EXEC(g_frame_wait_budget),paint_clock_us,&VMS_EXEC(g_wake_stats));
                 },[](int64_t ms){{ P7_SCOPE(Idle); std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }});
             }

@@ -1,22 +1,11 @@
 # Public source provenance
 
-This repository begins with PiJava `0.2.114-keyui5`.
-The engineering source snapshot before public export had SHA-256:
-`a87dfff3a0f467f5fb71295c993b45eb048d29ce90b0dec2e23b9cf96ab3e622`.
+The current update imports the production subset of the maintainer-supplied `PiJava-keyui6-gpuf5-save1-source.zip` (SHA256 `bb1895603d0ca5c85e94e8501fde79399cd435ba4ff077d3e7658a317a94d24e`). The accompanying identity identifies upstream commit `caf1063217bbe38a3644893a40e89dc91228a0cd`; that is an input identity, not a public Git ancestor.
 
-`src/` and `java/` retain the same bytes. Public changes are documentation,
-license notices and a project-created generic handset illustration replacing
-the inherited UI image whose original permission record was unavailable.
-The compatibility resource filename is unchanged. See `THIRD_PARTY.md`.
+The production C++/Java/shader sources and all 289 ROMFS resources are byte-preserved. The removed mapping-page phone bitmap is absent both from the imported source and from the supplied NRO. No replacement phone image is added. Runtime phone-style skins remain selectable and are distinct from the deleted editor illustration.
 
-Private Git history, SDK archives, commercial games, RMS/save files, keys,
-raw engineering receipts and private build-service controls are not imported.
-The obsolete `gen_vmstate.py` migration helper depends on an absent private
-inventory and is excluded; its generated runtime sources remain included.
+Public changes select source/build files and replace release prose, root source manifests and license summaries. The previous public GPL root license and original third-party notices are retained. The generated runtime API classes are necessary application inputs; they are not game/test classes.
 
-The existing benchmark/profile sources are developer tools, not bundled games.
-Some require external test inputs or historical comparison binaries; the normal
-build and recommended focused checks are documented in `BUILDING.md`.
+Test classes, examples, benchmark/profile inputs, game data, logs, screenshots, raw test/build reports, private CI, SDK archives, saves and keys are excluded. The empty examples placeholder preserves the unchanged build tool's optional scan; the publication does not add a new test data directory. Private build history is not imported.
 
-The public repository's new commit history starts with this curated snapshot.
-A source snapshot is not a claim of full-game or device acceptance.
+The current source and assets are described separately from the supplied binary release: the latter keeps its internal keyui5/save1 identifier, while KeyUI6 denotes its final mapping layout.

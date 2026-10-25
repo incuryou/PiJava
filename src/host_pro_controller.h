@@ -22,12 +22,12 @@ public:
     }
     const host_controller::Legends& labels()const{return labels_;}
     void render(uint32_t* frame,size_t pitch,const host_keymap::Config& config,bool standard,int selected,
-                const host_menu::Text& text,const host_menu::CenteredText& center,host_controller::InkMeasure measure=nullptr){
-        if(!frame||pitch<1280)return;
-        if(pixels_.empty())host_menu::rect(frame,pitch,image_x+35,image_y+70,image_w-70,image_h-95,host_menu::color(0x343a42));
+                const host_menu::Text& text,const host_menu::CenteredText& center,host_controller::InkMeasure measure=nullptr,int offset_x=0){
+        if(!frame||pitch<1280||image_x+offset_x<0||image_x+offset_x+image_w>1280)return;
+        if(pixels_.empty())host_menu::rect(frame,pitch,image_x+offset_x+35,image_y+70,image_w-70,image_h-95,host_menu::color(0x343a42));
         else for(int y=0;y<image_h;++y)for(int x=0;x<image_w;++x){
             const uint32_t src=pixels_[size_t(y)*image_w+x];const unsigned alpha=src>>24;if(!alpha)continue;
-            uint32_t& dst=frame[size_t(image_y+y)*pitch+image_x+x];uint32_t mixed=0xff000000u;
+            uint32_t& dst=frame[size_t(image_y+y)*pitch+image_x+offset_x+x];uint32_t mixed=0xff000000u;
             for(int shift=0;shift<24;shift+=8)mixed|=((((src>>shift)&255)*alpha+((dst>>shift)&255)*(255-alpha)+127)/255)<<shift;
             dst=mixed;
         }
@@ -38,24 +38,24 @@ public:
         }
         for(size_t n=0;n<button_faces.size();++n){const auto& face=button_faces[n];const auto& fitted=fitted_[n];
             for(int row=0;row<fitted.count;++row){const auto& run=fitted.runs[size_t(row)];const int width=run.tag?face.tag.w:face.phone.w;
-                if(center)center(run.cx,run.cy,run.text,host_menu::color(0xffffff),run.font,width);
-                else if(text)text(run.cx-run.w/2,run.cy-run.h/2,run.text,host_menu::color(0xffffff),run.font,width);
+                if(center)center(run.cx+offset_x,run.cy,run.text,host_menu::color(0xffffff),run.font,width);
+                else if(text)text(run.cx+offset_x-run.w/2,run.cy-run.h/2,run.text,host_menu::color(0xffffff),run.font,width);
             }
-            if(fitted.lock){const int x=fitted.lock_x,y=fitted.lock_y;
+            if(fitted.lock){const int x=fitted.lock_x+offset_x,y=fitted.lock_y;
                 host_menu::rect(frame,pitch,x-2,y,5,3,host_menu::color(0xffffff));
                 host_menu::rect(frame,pitch,x-1,y-2,3,1,host_menu::color(0xffffff));
                 host_menu::rect(frame,pitch,x-1,y-2,1,2,host_menu::color(0xffffff));host_menu::rect(frame,pitch,x+1,y-2,1,2,host_menu::color(0xffffff));
             }
             // Metrics that cannot fit are reported visibly, never by erasing
             // a different valid legend. These marks need no font glyph.
-            const auto warning=[&](const host_controller::Inset& area){const int x=area.x+area.w/2,y=area.y+area.h/2;host_menu::rect(frame,pitch,x-1,y-3,2,4,host_menu::color(0xffcf50));host_menu::rect(frame,pitch,x-1,y+2,2,2,host_menu::color(0xffcf50));};
+            const auto warning=[&](const host_controller::Inset& area){const int x=area.x+area.w/2+offset_x,y=area.y+area.h/2;host_menu::rect(frame,pitch,x-1,y-3,2,4,host_menu::color(0xffcf50));host_menu::rect(frame,pitch,x-1,y+2,2,2,host_menu::color(0xffcf50));};
             if(fitted.main_fallback)warning(face.phone);
             if(fitted.tag_fallback)warning(face.tag);
         }
         if(selected>=host_keymap::SUp&&selected<=host_keymap::SRight)selected=host_controller::Menu;
         if(selected>=host_keymap::RUp&&selected<=host_keymap::RRight)selected=host_keymap::R3;
         for(const auto& a:button_faces)if(a.input==selected){
-            const int cx=a.cx,cy=a.cy,rx=int(a.rx)+3,ry=int(a.ry)+3;
+            const int cx=a.cx+offset_x,cy=a.cy,rx=int(a.rx)+3,ry=int(a.ry)+3;
             for(int y=cy-ry-2;y<=cy+ry+2;++y)for(int x=cx-rx-2;x<=cx+rx+2;++x){
                 const double d=double(x-cx)*(x-cx)/(rx*rx)+double(y-cy)*(y-cy)/(ry*ry);
                 if(d>=.86&&d<=1.13)frame[size_t(y)*pitch+x]=host_menu::color(0xd91538);

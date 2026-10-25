@@ -299,6 +299,7 @@ inline void render_menu(uint32_t* frame, size_t pitch,
     label(48, 653, "↑ ↓ 选择", secondary, 18, 90);
     label(160, 653, "← → 游戏 / 选项", secondary, 18, 148);
     label(326, 653, "L / R 翻页", secondary, 18, 148);
+    label(500, 653, "Y 继承存档", secondary, 18, 160);
     rounded(936, 638, 140, 55, 27.5f, accent);
     switch_key(969, 665, 'X');
     label(995, 653, "继续", on_accent, 24, 65);

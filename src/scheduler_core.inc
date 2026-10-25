@@ -33,9 +33,8 @@ static p1::Work sched_game_work(bool gpu, Acquire acquire, SleepMs idle_sleep) {
     speed_wait_paced_sleep();
     const int64_t pace_now = paint_clock_us();
     const bool present_due = VMS_PLAT(g_last_present_us) != 0 && pace_now - VMS_PLAT(g_last_present_us) >= 50000;
-    return p1_host_work_turn(gpu, present_due, [&](bool g) {
-        if (g) scheduled_frame(acquire, game_wake_delay, wait_game_wake, advance_game_frame, 0);
-        else scheduled_frame(acquire, game_wake_delay, wait_game_wake, advance_game_frame,
+    return p1_host_work_turn(gpu, present_due, [&](bool) {
+        scheduled_frame(acquire, game_wake_delay, wait_game_wake, advance_game_frame,
             VMS_EXEC(g_frame_wait_budget), paint_clock_us, &VMS_EXEC(g_wake_stats));
     }, idle_sleep);
 }

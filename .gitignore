@@ -2,6 +2,12 @@
 /dist/
 /work/
 /outputs/
+/tests/
+/benchmarks/
+/profiles/
+/screenshots/
+/evidence/
+/reports/
 /private-tests/
 /games/
 /rms/
@@ -22,4 +28,3 @@ __pycache__/
 .env.*
 *.class
 !romfs/classes/**/*.class
-/tools/gen_vmstate.py

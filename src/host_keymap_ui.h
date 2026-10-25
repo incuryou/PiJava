@@ -43,14 +43,6 @@ inline void input_prompt(uint32_t* f,size_t pitch,int cx,int cy,int input,int si
 }
 constexpr int phone_key_height=56,phone_row_step=63;
 
-inline std::vector<uint32_t> load_phone(const char* path) {
-    constexpr size_t count=227*518;
-    std::FILE* file=std::fopen(path,"rb");if(!file)return {};
-    std::vector<uint32_t> out(count);
-    bool ok=std::fread(out.data(),4,count,file)==count && std::fgetc(file)==EOF && !std::ferror(file);
-    if(std::fclose(file))ok=false;
-    if(!ok)out.clear();return out;
-}
 using TextRight = std::function<int(const std::string&,int)>;
 inline void footer(uint32_t* f,size_t pitch,
                    std::initializer_list<std::pair<const char*,std::string>> actions,
@@ -66,7 +58,7 @@ inline void footer(uint32_t* f,size_t pitch,
         left=x+width+32; // Equal blank space from text ink to the next icon.
     }
 }
-inline void render(uint32_t* f,size_t pitch,const Editor& e,const std::vector<uint32_t>& phone,
+inline void render(uint32_t* f,size_t pitch,const Editor& e,
                    const host_menu::Text& text,const host_menu::CenteredText& center,const TextRight& right={},host_pro::Preview* preview=nullptr,host_controller::InkMeasure ink_measure=nullptr) {
     const bool saves=e.page==Page::SaveExit;
     if(!f||pitch<1280)return;
@@ -83,10 +75,6 @@ inline void render(uint32_t* f,size_t pitch,const Editor& e,const std::vector<ui
     }
     prompt(f,pitch,1080,42,"L",30,center);prompt(f,pitch,1122,42,"R",30,center);
     if(center)center(1191,42,"切换页面",muted,18,92);
-    if(!saves && phone.size()==227*518)for(int y=17;y<518;++y)for(int x=0;x<227;++x) {
-        uint32_t sample=phone[size_t(y)*227+x];blend(f[size_t(y+103)*pitch+x+49],sample,sample>>24);
-    }
-    if(!saves)rect(f,pitch,309,111,1,494,color(0xdfe4eb));
     rect(f,pitch,32,625,1216,1,color(0xdfe4eb));
     if(saves) {
         if(text) {
@@ -114,20 +102,13 @@ inline void render(uint32_t* f,size_t pitch,const Editor& e,const std::vector<ui
         footer(f,pitch,{{"A","确认"},{"B",e.pending==Pending::None?"返回":"取消"}},text,center,right);
         return;
     }
-    if(text && !e.note.empty())text(332,88,e.note,e.note_error?red:color(0x208351),15,900);
-    if(text){text(332,117,"选择手机按键",ink,22,330);text(716,117,"选择 Switch 按键",ink,22,330);
-        text(1100,121,std::string("手机 ")+phone_names[e.phone],red,18,145);}
-    rect(f,pitch,688,111,1,494,color(0xdfe4eb));
+    if(text && !e.note.empty())text(188,88,e.note,e.note_error?red:color(0x208351),15,900);
+    if(text){text(188,117,"选择手机按键",ink,22,330);text(572,117,"选择 Switch 按键",ink,22,330);
+        text(956,121,std::string("手机 ")+phone_names[e.phone],red,18,145);}
+    rect(f,pitch,544,111,1,494,color(0xdfe4eb));
     auto b=effective(e.draft,e.standard);
-    // The highlight follows the same phone identity as the center grid.
-    struct KeyRect{int x,y,w,h;};KeyRect phone_key{};
-    if(e.phone>=N1){const int p=e.phone-N1;phone_key={34+(p%3)*52,365+(p/3)*26,49,23};}
-    else {static constexpr KeyRect nav[]={{47,266,28,16},{103,267,21,12},{151,266,28,16},{91,282,13,23},{104,282,20,21},{124,282,13,23},{103,304,21,12}};phone_key=nav[e.phone];}
-    const int hx=49+phone_key.x,hy=103+phone_key.y;
-    rect(f,pitch,hx,hy,phone_key.w,2,red);rect(f,pitch,hx,hy+phone_key.h-2,phone_key.w,2,red);
-    rect(f,pitch,hx,hy,2,phone_key.h,red);rect(f,pitch,hx+phone_key.w-2,hy,2,phone_key.h,red);
     for(int p=0;p<PhoneCount;++p) {
-        auto pos=position(p);int x=332+pos.first*111;
+        auto pos=position(p);int x=188+pos.first*111;
         int y=155+pos.second*62;
         int h=55;bool selected=p==e.phone;
         rounded(f,pitch,x,y+3,102,h,10,color(0xe4e9ee));
@@ -142,9 +123,9 @@ inline void render(uint32_t* f,size_t pitch,const Editor& e,const std::vector<ui
         }
     }
     const int selected=e.phase==Phase::Choice?choice_inputs[e.choice]:b[e.phone][std::max(0,std::min(SlotCount-1,e.slot))];
-    if(preview)preview->render(f,pitch,e.draft,e.standard,selected,text,center,ink_measure);
+    if(preview)preview->render(f,pitch,e.draft,e.standard,selected,text,center,ink_measure,-144);
     for(int slot=0;slot<SlotCount;++slot) {
-        const int x=716+slot*178,y=490;bool focused=e.phase!=Phase::Phone && slot==e.slot;
+        const int x=572+slot*178,y=490;bool focused=e.phase!=Phase::Phone && slot==e.slot;
         if(text)text(x+12,y-24,"映射 "+std::to_string(slot+1),focused?red:muted,16,140);
         rounded(f,pitch,x,y+4,164,66,10,color(0xe4e9ee));
         rounded(f,pitch,x,y,164,66,10,focused?red:color(0xbcc9d6));
@@ -155,11 +136,11 @@ inline void render(uint32_t* f,size_t pitch,const Editor& e,const std::vector<ui
             input_prompt(f,pitch,x+82,y+32,i,34,center);
         }
     }
-    if(text&&e.phase!=Phase::Choice){text(716,573,selected==none?"未设置":std::string("Switch ")+input_names[selected]+" → 手机 "+phone_names[e.phone],ink,18,520);
-        text(716,600,"方向键选择 · A 确认 · B 返回 · L3 固定菜单",muted,15,520);}
+    if(text&&e.phase!=Phase::Choice){text(572,573,selected==none?"未设置":std::string("Switch ")+input_names[selected]+" → 手机 "+phone_names[e.phone],ink,18,520);
+        text(572,600,"方向键选择 · A 确认 · B 返回 · L3 固定菜单",muted,15,520);}
     if(e.phase==Phase::Choice) {
         // A compact scrolling selector, not a wall of all controller keys.
-        const int box=716+std::max(0,std::min(SlotCount-1,e.slot))*178;
+        const int box=572+std::max(0,std::min(SlotCount-1,e.slot))*178;
         rounded(f,pitch,box,302,164,306,12,color(0xbcc9d6));
         rounded(f,pitch,box+2,304,160,302,10,white);
         int first=std::max(0,std::min(e.choice-2,InputCount-5));

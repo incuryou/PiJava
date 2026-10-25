@@ -39,7 +39,7 @@ def inspect_toolchain(dkp, gpu=True, nacp=True):
     if nacp:
         paths.append('tools/bin/nacptool')
     if gpu:
-        paths += ['libnx/include/deko3d.h', 'libnx/lib/libdeko3d.a']
+        paths += ['libnx/include/deko3d.h', 'libnx/lib/libdeko3d.a', 'tools/bin/uam']
     paths += ['portlibs/switch/lib/lib' + name + '.a' for name in LIBRARIES]
     missing = [str(dkp / name) for name in paths if not (dkp / name).is_file()]
     if missing:
