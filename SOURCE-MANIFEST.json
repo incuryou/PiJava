@@ -16,8 +16,8 @@
       "sha256": "347a25a0b0ddc659484b9cf2373dc36edb6900073995f56cecd71609096f2f9b"
     },
     "LICENSE": {
-      "bytes": 35388,
-      "sha256": "a58fa0122b525f1d9ae531781bfeead1977e9ac88d10fb570e8821d6e4232e85"
+      "bytes": 35149,
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
     },
     "NOTICE.md": {
       "bytes": 1601,
@@ -5161,7 +5161,7 @@
     },
     "SHA256SUMS": {
       "bytes": 134805,
-      "sha256": "3677ab18b92201874ae4adff0e02281b6c83b04fadcf862caa86902a369da2d9"
+      "sha256": "26dadb38ae303a966734405b30b34e6e8a919da1b3de1b901dddef3cf07d0303"
     }
   },
   "policy": "Git-selected public files; self-manifest excluded",
