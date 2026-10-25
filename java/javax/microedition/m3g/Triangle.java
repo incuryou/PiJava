@@ -1,0 +1,856 @@
+/*
+	This file is part of FreeJ2ME.
+
+	FreeJ2ME is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	FreeJ2ME is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with FreeJ2ME.  If not, see http://www.gnu.org/licenses/
+*/
+package javax.microedition.m3g;
+
+
+class Triangle
+{
+	// 1.0f / 255.0f, to prevent a bunch of divisions in lighting calculations
+	private static final float INVDIV = 0.003921569f;
+
+	// Temporary buffer for normals and lighting calculations
+	private static final float[] N_EYE = new float[4];
+	private static final float[] V_EYE = new float[4];
+	private static final float[] L_MAT = new float[16];
+
+	// Temporary buffer for input and output vertices/texCoords/vertex colors.
+	private static final int[] inC = new int[3];
+	private static final int[] outC = new int[4];
+	private static final float[] inV = new float[12];
+	private static final float[][] inT = new float[Graphics3D.NUM_TEXTURE_UNITS][12];
+	private static final float[] outV = new float[16];
+	private static final float[][] outT = new float[Graphics3D.NUM_TEXTURE_UNITS][16];
+
+	// Temporary variables for lighting calculations.
+	private static int matAmbient, matDiffuse, matSpecular, matEmissive, lightAlpha;
+	private static float shininess, maR, mdR, msR, meR, maG, mdG, msG, meG, maB, mdB, msB, meB;
+
+	// Output array of triangles. Allows us to reuse the memory block allocated for triangle
+	// data without needing to GC it every render pass (it'll still reallocate if the triangle count increases)
+	private static Triangle[] result;
+
+	// Used for sorting triangles front-to-back
+	private float sortZ;
+
+	private boolean hasVertexColors = false;
+
+	// These are for AntiAliasing. Since we use Edge AA (Wu's algorithm), it
+	// can be optimized by checking against shared edges to not antialias those
+	// at all.
+	boolean edgeABBoundary = false;
+	boolean edgeBCBoundary = false;
+	boolean edgeCABoundary = false;
+
+	private final int[] colors = new int[3];
+
+	// 1/w of each vertex after projection, for perspective-correct texturing.
+	private final float[] invW = new float[] { 1f, 1f, 1f };
+
+	private final float[] v = new float[12];
+		// xA, yA, zA, wA,
+		// xB, yB, zB, wB,
+		// xC, yC, zC, wC;
+		// 0   1   2   3
+
+	private float[][] t = new float[Graphics3D.ACTIVE_TEXTURE_UNITS][6];
+		// For each texture unit:
+		// [sA, tA,
+		// sB, tB,
+		// sC, tC,];
+		// 0   1
+		// We have no use for the `r` and `q` coordinates.
+
+    private static native int _gather242(float[] verts, float[][] texc, VertexArray colors,
+        VertexBuffer vertices, int i0, int i1, int i2, int cull, boolean clockwise, int units);
+    private static native boolean _emit242(Triangle triangle, float[] verts, float[][] texc,
+        int[] colors, int fan, boolean hasTex, boolean hasColors, boolean perspective, int units);
+
+	Triangle() { }
+
+	public static final Triangle[] fromVertAndTris(
+		// Position and texture vertex data
+		float[] vert, float[][] texc,
+		// Material and shading
+		Material material, int shadingMode, boolean twoSide, boolean localCameraLight,
+		// Normal data
+		float[] eyePos, VertexArray vertNorms, Transform normalMatrix,
+		// Lights
+		M3GVector<Light> lights, float[] lightEyePos, float[] lightEyeDir, int curScope,
+		// IndexArray, clipping, winding order and perspectiveCorrection
+		int[] tris, int[] renderableTriangles, int cullingMode, VertexBuffer vertices,
+		boolean polygonClockwise, boolean perspectiveCorrect, boolean hasAA)
+	{
+		renderableTriangles[0] = 0;
+		final int totalTris = tris.length / 3;
+		boolean hasTex = texc[0] != null;
+		// Is the app using lights? Set up to calculate per-vertex lighting.
+		boolean hasLighting = (vertNorms != null && material != null &&
+			lights != null && !lights.isEmpty());
+		VertexArray colorArray = vertices.getColors();
+		boolean hasColors = hasLighting || (colorArray != null);
+
+		// Only allocate a new triangle array if it doesn't exist, or cannot fit the incoming mesh.
+		// Near-plane clipping can split a crossing triangle into two, hence the `* 2`, as
+		// the worst case here is a single triangle that takes the whole screen and is clipped to 2.
+		if(Triangle.result == null || totalTris * 2 > Triangle.result.length)
+		{
+			// Let's start off by copying the references of the old array to the
+			// new one. Saves having to reallocate all objects again whenever
+			// the size increases, as we can just reuse the same references.
+			final int oldLen = (Triangle.result == null) ? 0 : Triangle.result.length;
+
+			Triangle[] newRef = new Triangle[totalTris * 2];
+			if (oldLen > 0) { System.arraycopy(Triangle.result, 0, newRef, 0, oldLen); }
+
+			for (int i = oldLen; i < totalTris * 2; i++) {newRef[i] = new Triangle(); }
+			Triangle.result = newRef;
+		}
+
+		// These can be set only once for the entire mesh, as the material
+		// applies to all of it. If Vertex Color Tracking is enabled, each
+		// vertex's color will override these anyway.
+		if(hasLighting)
+		{
+			// Material Colors
+			matAmbient  = material.getColor(Material.AMBIENT);
+			matDiffuse  = material.getColor(Material.DIFFUSE);
+			matSpecular = material.getColor(Material.SPECULAR);
+			matEmissive = material.getColor(Material.EMISSIVE);
+			shininess = material.getShininess();
+
+			maR = ((matAmbient >> 16) & 0xFF) * INVDIV; maG = ((matAmbient >> 8) & 0xFF) * INVDIV; maB = (matAmbient & 0xFF) * INVDIV;
+			mdR = ((matDiffuse >> 16) & 0xFF) * INVDIV; mdG = ((matDiffuse >> 8) & 0xFF) * INVDIV; mdB = (matDiffuse & 0xFF) * INVDIV;
+			msR = ((matSpecular >> 16) & 0xFF) * INVDIV; msG = ((matSpecular >> 8) & 0xFF) * INVDIV; msB = (matSpecular & 0xFF) * INVDIV;
+			meR = ((matEmissive >> 16) & 0xFF) * INVDIV; meG = ((matEmissive >> 8) & 0xFF) * INVDIV; meB = (matEmissive & 0xFF) * INVDIV;
+			lightAlpha = (matDiffuse >>> 24);
+		}
+
+		// Track the vertex indices and calculated colors of the prior non-culled
+		// triangle so we can speed up lighting calculations by reusing vertex
+		// data the same way a TriangleStripArray reuses them.
+		int lastIdx0 = -1, lastIdx1 = -1, lastIdx2 = -1;
+		int lastColor0 = 0, lastColor1 = 0, lastColor2 = 0;
+
+		// Track the indices of the previously processed triangle in the strip
+		// for Edge AA.
+		int prevI0 = -1, prevI1 = -1, prevI2 = -1;
+		boolean tEdgeABBoundary = false, tEdgeBCBoundary = false, tEdgeCABoundary = false;
+
+		int triOffset = 0;
+
+		for (int tri_id = 0; tri_id < totalTris; tri_id++, triOffset += 3)
+		{
+			final int i0 = tris[triOffset];
+			final int i1 = tris[triOffset + 1];
+			final int i2 = tris[triOffset + 2];
+
+			final int idx0 = i0 << 2;
+			final int idx1 = i1 << 2;
+			final int idx2 = i2 << 2;
+
+            int gathered242=_gather242(vert,texc,colorArray,vertices,i0,i1,i2,
+                cullingMode,polygonClockwise,Graphics3D.ACTIVE_TEXTURE_UNITS);
+            if(gathered242==0)continue;
+            boolean isFrontFace;
+            if(gathered242>0) { isFrontFace=gathered242==1; }
+            else {
+			// Cull as early as possible, so we save the need to even do copies.
+			// in those cases.
+			final float ax = vert[idx0], ay = vert[idx0 + 1], aw = vert[idx0 + 3];
+			final float bx = vert[idx1], by = vert[idx1 + 1], bw = vert[idx1 + 3];
+			final float cx = vert[idx2], cy = vert[idx2 + 1], cw = vert[idx2 + 3];
+
+			final boolean ccw = ((ax * by - ay * bx) * cw +
+				(bx * cy - by * cx) * aw + (cx * ay - cy * ax) * bw) > 0.0f;
+
+			// XOR: When even a ternary is considered "too much overhead".
+			isFrontFace = polygonClockwise ^ ccw;
+
+			final boolean cullTriangle = (cullingMode == PolygonMode.CULL_BACK && !isFrontFace) ||
+				(cullingMode == PolygonMode.CULL_FRONT && isFrontFace);
+
+			if (cullTriangle || outsideFrustum(vert, idx0, idx1, idx2)) { continue; }
+
+			Triangle.inV[0] = vert[idx0];     Triangle.inV[1] = vert[idx0 + 1];
+			Triangle.inV[2] = vert[idx0 + 2]; Triangle.inV[3] = vert[idx0 + 3];
+
+			Triangle.inV[4] = vert[idx1];     Triangle.inV[5] = vert[idx1 + 1];
+			Triangle.inV[6] = vert[idx1 + 2]; Triangle.inV[7] = vert[idx1 + 3];
+
+			Triangle.inV[8] = vert[idx2];     Triangle.inV[9] = vert[idx2 + 1];
+			Triangle.inV[10] = vert[idx2 + 2]; Triangle.inV[11] = vert[idx2 + 3];
+
+			if (hasTex)
+			{
+				for (int u = 0; u < Graphics3D.ACTIVE_TEXTURE_UNITS; u++)
+				{
+					final float[] tex = texc[u];
+					if (tex != null)
+					{
+						final float[] inTU = Triangle.inT[u];
+						inTU[0] = tex[idx0];     inTU[1] = tex[idx0 + 1];
+						inTU[2] = tex[idx0 + 2]; inTU[3] = tex[idx0 + 3];
+
+						inTU[4] = tex[idx1];     inTU[5] = tex[idx1 + 1];
+						inTU[6] = tex[idx1 + 2]; inTU[7] = tex[idx1 + 3];
+
+						inTU[8] = tex[idx2];     inTU[9] = tex[idx2 + 1];
+						inTU[10] = tex[idx2 + 2]; inTU[11] = tex[idx2 + 3];
+					}
+				}
+			}
+
+			// Do we have vertex colors? If so, prep them here
+			if (colorArray != null)
+			{
+				byte[] components = colorArray.vertArrayByteSize;
+				int compCount = colorArray.getComponentCount();
+							
+				for (int i = 0; i < 3; i++)
+				{
+					int idx = tris[triOffset + i] * compCount;
+							
+					inC[i] = (compCount == 3) ?
+						(0xFF << 24) | 
+						((components[idx + 0] & 0xFF) << 16) |
+						((components[idx + 1] & 0xFF) << 8) |
+						(components[idx + 2] & 0xFF) :
+						((components[idx + 3] & 0xFF) << 24) |
+						((components[idx + 0] & 0xFF) << 16) |
+						((components[idx + 1] & 0xFF) << 8) |
+						(components[idx + 2] & 0xFF);
+				}
+			}
+			else { inC[0] = inC[1] = inC[2] = vertices.getDefaultColor(); }
+
+            }
+
+			if (hasLighting)
+			{
+				calculateLighting(eyePos, vertNorms, normalMatrix, material, shadingMode, twoSide && !isFrontFace,
+					localCameraLight, lights, lightEyePos, lightEyeDir, curScope, tris, triOffset,
+					lastIdx0, lastIdx1, lastIdx2, lastColor0, lastColor1, lastColor2, Triangle.inC);
+
+				// Update light tracker with current triangle's indices and colors
+				// as we might very well reuse those for the next one's if this
+				// came from a TriangleStripArray (speeding up lighting
+				// calculations by a lot).
+				lastIdx0 = i0; lastIdx1 = i1; lastIdx2 = i2;
+				lastColor0 = Triangle.inC[0];
+				lastColor1 = Triangle.inC[1];
+				lastColor2 = Triangle.inC[2];
+			}
+
+			/*
+			 * Clip against the homogeneous near plane (z >= -w), interpolating
+			 * positions, texture coordinates and vertex colors before perspective division.
+			 *
+			 * First though, check if we even need to clip it at all, and save
+			 * a method call and a few copy operations if we don't.
+			 */
+			final int outCount;
+			final float[] srcV;
+			final float[][] srcT;
+			final int[] srcC;
+
+			final boolean needsNearClip = (Triangle.inV[2] < -Triangle.inV[3]) ||
+				(Triangle.inV[6] < -Triangle.inV[7])  ||
+				(Triangle.inV[10] < -Triangle.inV[11]);
+
+			if (!needsNearClip)
+			{
+				outCount = 3;
+				srcV = Triangle.inV;
+				srcT = Triangle.inT;
+				srcC = Triangle.inC;
+			}
+			else
+			{
+				outCount = clipNearPlane(Triangle.inV, Triangle.inT, Triangle.inC,
+						hasTex, texc, Triangle.outV, Triangle.outT, Triangle.outC);
+
+				if (outCount < 3) { continue; }
+
+				srcV = Triangle.outV;
+				srcT = Triangle.outT;
+				srcC = Triangle.outC;
+			}
+
+			// AA is enabled? Check for shared edge boundaries
+			if(hasAA)
+			{
+				final boolean shared01 = (i0 == prevI0 || i0 == prevI1 || i0 == prevI2) &&
+					(i1 == prevI0 || i1 == prevI1 || i1 == prevI2);
+
+				final boolean shared12 = (i1 == prevI0 || i1 == prevI1 || i1 == prevI2) &&
+					(i2 == prevI0 || i2 == prevI1 || i2 == prevI2);
+
+				final boolean shared20 = (i2 == prevI0 || i2 == prevI1 || i2 == prevI2) &&
+					(i0 == prevI0 || i0 == prevI1 || i0 == prevI2);
+
+				// An edge is a boundary ONLY IF it is NOT shared with the
+				// prior triangle.
+				tEdgeABBoundary = !shared01;
+				tEdgeBCBoundary = !shared12;
+				tEdgeCABoundary = !shared20;
+			}
+
+			// Update strip history for the next iteration
+			prevI0 = i0;
+			prevI1 = i1;
+			prevI2 = i2;
+
+			/* Triangulate the resulting polygon (3 or 4 vertices) as a fan. */
+			for (int fan = 0; fan + 2 < outCount; fan++)
+			{
+				final Triangle tri = Triangle.result[renderableTriangles[0]];
+
+				if(hasAA)
+				{
+					if (outCount == 3)
+					{
+						tri.edgeABBoundary = tEdgeABBoundary;
+						tri.edgeBCBoundary = tEdgeBCBoundary;
+						tri.edgeCABoundary = tEdgeCABoundary;
+					}
+					else
+					{
+						// Near-plane clipped fans should retain the real outer
+						// boundaries and completely ignore internal clip split.
+						tri.edgeABBoundary = (fan == 0) ? tEdgeABBoundary : false;
+						tri.edgeBCBoundary = (fan == 0) ? false : tEdgeBCBoundary;
+						tri.edgeCABoundary = (fan == 0) ? false : tEdgeCABoundary;
+					}
+				}
+
+                if(_emit242(tri,srcV,srcT,srcC,fan,hasTex,hasColors,perspectiveCorrect,
+                    Graphics3D.ACTIVE_TEXTURE_UNITS)) { renderableTriangles[0]++; continue; }
+
+				// Apply perspective division to the triangle, it's going to NDC
+
+				int off0 = 0;             // Fan origin (vertex 0)
+				int off1 = (fan + 1) << 2; // Vertex 1
+				int off2 = (fan + 2) << 2; // Vertex 2
+
+				// It is faster to calculate the reciprocal of w (1/w) and just
+				// multiply vertices and texture coordinates by it, than it is to
+				// constantly divide them by W here.
+				final float invW0 = 1.0f / srcV[off0 + 3];
+				final float invW1 = 1.0f / srcV[off1 + 3];
+				final float invW2 = 1.0f / srcV[off2 + 3];
+
+				tri.v[0] = srcV[off0] * invW0; tri.v[1] = srcV[off0 + 1] * invW0; tri.v[2] = srcV[off0 + 2] * invW0; tri.v[3] = 1.0f;
+				tri.v[4] = srcV[off1] * invW1; tri.v[5] = srcV[off1 + 1] * invW1; tri.v[6] = srcV[off1 + 2] * invW1; tri.v[7] = 1.0f;
+				tri.v[8] = srcV[off2] * invW2; tri.v[9] = srcV[off2 + 1] * invW2; tri.v[10] = srcV[off2 + 2] * invW2; tri.v[11] = 1.0f;
+
+				tri.invW[0] = invW0;
+				tri.invW[1] = invW1;
+				tri.invW[2] = invW2;
+
+				// Texture coordinates are stored as s/w and t/w if
+				// perspective correction is enabled (undone per-pixel in rasterizer)
+				if (hasTex)
+				{
+					if (Graphics3D.ACTIVE_TEXTURE_UNITS > tri.t.length) { tri.t = new float[Graphics3D.ACTIVE_TEXTURE_UNITS][6]; }
+
+					for (int u = 0; u < Graphics3D.ACTIVE_TEXTURE_UNITS; u++)
+					{
+						final float[] srcTU = srcT[u];
+						if (srcTU == null) { continue; }
+
+						final float[] tu = tri.t[u];
+
+						if (perspectiveCorrect)
+						{
+							tu[0] = srcTU[off0]     * invW0; tu[1] = srcTU[off0 + 1] * invW0;
+							tu[2] = srcTU[off1]     * invW1; tu[3] = srcTU[off1 + 1] * invW1;
+							tu[4] = srcTU[off2]     * invW2; tu[5] = srcTU[off2 + 1] * invW2;
+						}
+						else
+						{
+							tu[0] = srcTU[off0];     tu[1] = srcTU[off0 + 1];
+							tu[2] = srcTU[off1];     tu[3] = srcTU[off1 + 1];
+							tu[4] = srcTU[off2];     tu[5] = srcTU[off2 + 1];
+						}
+					}
+				}
+
+				// Calculate the average Z for front-to-back sorting.
+				tri.sortZ = (tri.v[2] + tri.v[6] + tri.v[10]) * 0.33333334f;
+
+				if (hasColors)
+				{
+					tri.hasVertexColors = true;
+					tri.colors[0] = srcC[0];
+					tri.colors[1] = srcC[fan + 1];
+					tri.colors[2] = srcC[fan + 2];
+				}
+				else { tri.hasVertexColors = false; }
+
+				renderableTriangles[0]++;
+			}
+		}
+
+		return sortFrontToBack(Triangle.result, renderableTriangles[0]);
+	}
+
+	private static native boolean _lighting242(float[] eyePos, VertexArray vertNorms,
+		Transform normalMatrix, Material material, int shadingMode, boolean flipNormals,
+		boolean localCameraLight, M3GVector<Light> lights, float[] lightEyePos,
+		float[] lightEyeDir, int curScope, int[] tris, int triOffset, int prev0,
+		int prev1, int prev2, int color0, int color1, int color2, int[] outColors);
+
+	private static final void calculateLighting(float[] eyePos, VertexArray vertNorms,
+		Transform normalMatrix, Material material, int shadingMode, boolean flipNormals,
+		boolean localCameraLight, M3GVector<Light> lights, float[] lightEyePos,
+		float[] lightEyeDir, int curScope, int[] tris, int triOffset, int prev0,
+		int prev1, int prev2, int color0, int color1, int color2, int[] outColors)
+	{
+        if (_lighting242(eyePos,vertNorms,normalMatrix,material,shadingMode,flipNormals,
+            localCameraLight,lights,lightEyePos,lightEyeDir,curScope,tris,triOffset,prev0,
+            prev1,prev2,color0,color1,color2,outColors)) return;
+
+		boolean vertColorTrackingEnabled = material.isVertexColorTrackingEnabled();
+
+		// Cache the normal matrix into a local reference.
+		normalMatrix.get(L_MAT);
+
+		// Flat Shading? We calculate only vertex 0 (A) and copy to others
+		int firstVertex = (shadingMode == PolygonMode.SHADE_FLAT) ? 2 : 0;
+		for (int v = firstVertex; v <= 2; v++)
+		{
+			final int vertIndex = tris[triOffset + v];
+
+			if(shadingMode != PolygonMode.SHADE_FLAT)
+			{
+				// Check if this vertex is one of the "reused" ones of a StripArray.
+				// If it is, we can just reuse its color from the previous triangle
+				// right away, skipping the need to calculate lighting at all.
+				// Flat shading doesn't benefit from this (and introduces
+				// breakages) since it calculates far less vertices to begin with.
+				if (vertIndex == prev0) { outColors[v] = color0; continue; }
+				if (vertIndex == prev1) { outColors[v] = color1; continue; }
+				if (vertIndex == prev2) { outColors[v] = color2; continue; }
+			}
+			// Didn't hit any of those above? That means we must calculate the
+			// lighting on this vertex.
+
+			// Vertex color tracking is enabled? Then the vertex colors replace
+			// the material's diffuse and ambient ones.
+			if (vertColorTrackingEnabled)
+			{
+				int vertColor = outColors[v];
+				lightAlpha = (vertColor >>> 24);
+
+				final float vR = ((vertColor >> 16) & 0xFF) * INVDIV;
+				final float vG = ((vertColor >> 8)  & 0xFF) * INVDIV;
+				final float vB = (vertColor         & 0xFF) * INVDIV;
+
+				mdR = vR; mdG = vG; mdB = vB;
+				maR = vR; maG = vG; maB = vB;
+			}
+
+			// Normals may be stored as either short or byte
+			if (vertNorms.getComponentType() == 1)
+			{
+				N_EYE[0] = vertNorms.vertArrayByteSize[vertIndex * 3 + 0] * 0.007874016f; // * (1 / 127)
+				N_EYE[1] = vertNorms.vertArrayByteSize[vertIndex * 3 + 1] * 0.007874016f;
+				N_EYE[2] = vertNorms.vertArrayByteSize[vertIndex * 3 + 2] * 0.007874016f;
+			}
+			else
+			{
+				N_EYE[0] = vertNorms.vertArrayShortSize[vertIndex * 3 + 0] * 3.051851E-5f; // * (1 / 32767)
+				N_EYE[1] = vertNorms.vertArrayShortSize[vertIndex * 3 + 1] * 3.051851E-5f;
+				N_EYE[2] = vertNorms.vertArrayShortSize[vertIndex * 3 + 2] * 3.051851E-5f;
+			}
+
+			// Vertex normals must now be multiplied by the normal matrix to
+			// reach eye space.
+			float nx = N_EYE[0], ny = N_EYE[1], nz = N_EYE[2];
+			N_EYE[0] = L_MAT[0] * nx + L_MAT[1] * ny + L_MAT[2] * nz;
+			N_EYE[1] = L_MAT[4] * nx + L_MAT[5] * ny + L_MAT[6] * nz;
+			N_EYE[2] = L_MAT[8] * nx + L_MAT[9] * ny + L_MAT[10] * nz;
+
+			// Inline M3GMath.normalize() here so we can cut on method call
+			// overhead.
+			float lenSq = N_EYE[0] * N_EYE[0] + N_EYE[1] * N_EYE[1] + N_EYE[2] * N_EYE[2];
+			if (lenSq > 1.0e-30f)
+			{
+				float invLen = M3GMath.fastInvSqrt(lenSq);
+				N_EYE[0] *= invLen;
+				N_EYE[1] *= invLen;
+				N_EYE[2] *= invLen;
+			}
+			else { N_EYE[0] = 0.0f; N_EYE[1] = 0.0f; N_EYE[2] = 1.0f; }
+
+			/*
+			 * Two-sided lighting, per JSR-184 (PolygonMode): the back face of a
+			 * polygon is lit with reversed normals (n' = -n). Front/back is the
+			 * same screen-space winding test used for culling, so the caller
+			 * passes flipNormals = twoSided && !isFrontFace and the whole
+			 * triangle is flipped coherently. The previous per-vertex heuristic
+			 * (flip when dot(n, view) < 0) left silhouette vertices unflipped,
+			 * shading inward-normal geometry (e.g. tubes) almost black.
+			 */
+			if (flipNormals)
+			{
+				N_EYE[0] = -N_EYE[0];
+				N_EYE[1] = -N_EYE[1];
+				N_EYE[2] = -N_EYE[2];
+			}
+
+			V_EYE[0] = eyePos[vertIndex * 4];
+			V_EYE[1] = eyePos[vertIndex * 4 + 1];
+			V_EYE[2] = eyePos[vertIndex * 4 + 2];
+
+			// Emission color is our base here.
+			float r = meR, g = meG, b = meB;
+
+			float viewX, viewY, viewZ;
+
+			if(localCameraLight)
+			{
+				viewX = -V_EYE[0];
+				viewY = -V_EYE[1];
+				viewZ = -V_EYE[2];
+				float viewLen = M3GMath.fastInvSqrt(viewX * viewX + viewY * viewY + viewZ * viewZ);
+				if (viewLen > M3GMath.EPSILON) { viewX *= viewLen; viewY *= viewLen; viewZ *= viewLen; }
+			}
+			else
+			{
+				viewX = 0.0f;
+				viewY = 0.0f;
+				viewZ = 1.0f;
+			}
+
+			for (int l = 0; l < lights.size(); l++)
+			{
+				Light light = lights.get(l);
+				final int lightStride = l << 2; // l * 4
+
+				// Skip lights that aren't set to render or are at a different scope.
+				if (!light.isRenderingEnabled() || (light.getScope() & curScope) == 0)
+				{
+					continue;
+				}
+
+				int lMode = light.getMode();
+				float lIntensity = light.getIntensity();
+
+				int lColor = light.getColor();
+				float lR = (((lColor >> 16) & 0xFF) * INVDIV) * lIntensity;
+				float lG = (((lColor >> 8) & 0xFF)  * INVDIV) * lIntensity;
+				float lB = ((lColor & 0xFF)         * INVDIV) * lIntensity;
+
+				// Ambient Lights only affect the material's ambient according to M3G.
+				if (lMode == Light.AMBIENT)
+				{
+					r += maR * lR; g += maG * lG; b += maB * lB;
+					continue; // Skip diffuse and specular entirely on this light.
+				}
+
+				// Now for directional, omni or spot lights, we calculate diffuse and specular,
+				// so we need their direction and attenuation.
+				float lightDirX, lightDirY, lightDirZ;
+				float attenuation = 1.0f;
+
+				if (lMode == Light.DIRECTIONAL)
+				{
+					lightDirX = -lightEyeDir[lightStride];
+					lightDirY = -lightEyeDir[lightStride + 1];
+					lightDirZ = -lightEyeDir[lightStride + 2];
+				}
+				else
+				{
+					// Positional lights use distance attenuation
+					float lx = lightEyePos[lightStride] - V_EYE[0];
+					float ly = lightEyePos[lightStride + 1] - V_EYE[1];
+					float lz = lightEyePos[lightStride + 2] - V_EYE[2];
+					float d2 = lx * lx + ly * ly + lz * lz;
+					float invDist = M3GMath.fastInvSqrt(d2);
+
+					if (invDist > M3GMath.EPSILON)
+					{
+						lightDirX = lx * invDist;
+						lightDirY = ly * invDist;
+						lightDirZ = lz * invDist;
+
+						float dist = d2 * invDist;
+
+						attenuation = M3GMath.fastReciprocal(
+							light.getConstantAttenuation() +
+							light.getLinearAttenuation() * dist +
+							light.getQuadraticAttenuation() * d2
+						);
+					}
+					else
+					{
+						lightDirX = 0; lightDirY = 0; lightDirZ = 1;
+						attenuation = M3GMath.fastReciprocal(light.getConstantAttenuation());
+					}
+
+					// Additional directional cone attenuation for SPOT lights
+					if (lMode == Light.SPOT)
+					{
+						float sdX = lightEyeDir[lightStride];
+						float sdY = lightEyeDir[lightStride + 1];
+						float sdZ = lightEyeDir[lightStride + 2];
+
+						// Negate these light directions, as lightDir points from vertex to
+						// light and the spotlights's sd* variables point from
+						// light to scene. Evaluating them without any negation resulted
+						// in a negative dot product that just got it culled right below.
+						float spotDot = (-lightDirX * sdX + -lightDirY * sdY + -lightDirZ * sdZ);
+
+						if (spotDot >= light.cutoffCos)
+						{
+							attenuation *= (float) Math.pow(spotDot, light.getSpotExponent());
+						}
+						else { attenuation = 0.0f; }
+					}
+				}
+
+				if (attenuation <= 0.0f) { continue; }
+
+				nx = N_EYE[0]; ny = N_EYE[1]; nz = N_EYE[2];
+
+				// Calculate Dot Product between the normal and light (N . L)
+				float nDotL = nx * lightDirX + ny * lightDirY + nz * lightDirZ;
+
+				if (nDotL > 0.0f)
+				{
+					// Diffuse lighting
+					float diffFactor = nDotL * attenuation;
+					r += mdR * lR * diffFactor;
+					g += mdG * lG * diffFactor;
+					b += mdB * lB * diffFactor;
+
+					// Specular lighting (Gouraud, since we do it per-vertex)
+					float hX = lightDirX + viewX, hY = lightDirY + viewY, hZ = lightDirZ + viewZ;
+					float hLen = M3GMath.fastInvSqrt(hX * hX + hY * hY + hZ * hZ);
+
+					if (hLen > M3GMath.EPSILON)
+					{
+						hX *= hLen; hY *= hLen; hZ *= hLen;
+						float nDotH = nx * hX + ny * hY + nz * hZ;
+
+						if (nDotH > 0.0f)
+						{
+							float specFactor = (float) Math.pow(nDotH, shininess) * attenuation;
+							r += msR * lR * specFactor;
+							g += msG * lG * specFactor;
+							b += msB * lB * specFactor;
+						}
+					}
+				}
+			}
+
+			// We now have the final color for the vertex
+			int ir = (int)(r * 255.0f);
+			int ig = (int)(g * 255.0f);
+			int ib = (int)(b * 255.0f);
+
+			// Clamp it to the 0-255 range
+			ir &= ~(ir >> 31);
+			ig &= ~(ig >> 31);
+			ib &= ~(ib >> 31);
+
+			ir = (ir | -((255 - ir) >>> 31)) & 0xFF;
+			ig = (ig | -((255 - ig) >>> 31)) & 0xFF;
+			ib = (ib | -((255 - ib) >>> 31)) & 0xFF;
+
+			outColors[v] = ((lightAlpha & 0xFF) << 24) | (ir << 16) | (ig << 8) | ib;
+
+			// On flat shading we just apply vertex 2's color to the others.
+			if (shadingMode == PolygonMode.SHADE_FLAT)
+			{
+				outColors[0] = outColors[1] = outColors[v];
+				break;
+			}
+		}
+	}
+
+	/*
+	 * Sutherland-Hodgman clip of one triangle against the homogeneous near plane
+	 * z + w >= 0. This is valid for perspective, parallel and generic projection
+	 * matrices; camera-space distances are not available for a generic matrix.
+	 * Writes the resulting polygon (0, 3 or 4 vertices) into outV/outT and returns
+	 * its vertex count. Positions, texture coordinates and vertex colors
+	 * interpolate linearly in clip space, which is exact for all.
+	 */
+	private static final int clipNearPlane(float[] inV, float[][] inT, int[] inC,
+		boolean hasTex, float[][] texc, float[] outV, float[][] outT, int[] outC)
+	{
+		int outCount = 0;
+
+		for (int i = 0; i < 3; i++)
+		{
+			final int j = (i + 1) & ((i - 2) >> 31); // j = (i + 1) % 3
+			final float wi = inV[4*i+3], wj = inV[4*j+3];
+			final float distanceI = inV[4*i+2] + wi;
+			final float distanceJ = inV[4*j+2] + wj;
+			final boolean insideI = distanceI >= 0.0f, insideJ = distanceJ >= 0.0f;
+
+			if (insideI)
+			{
+				System.arraycopy(inV, 4*i, outV, 4*outCount, 4);
+				if(hasTex)
+				{
+					for (int u = 0; u < Graphics3D.ACTIVE_TEXTURE_UNITS; u++)
+					{
+						if (texc[u] != null) { System.arraycopy(inT[u], 4*i, outT[u], 4*outCount, 4); }
+					}
+				}
+
+				outC[outCount] = inC[i];
+				outCount++;
+			}
+			if (insideI != insideJ)
+			{
+				final float amt = distanceI / (distanceI - distanceJ);
+				for (int c = 0; c < 4; c++)
+				{
+					outV[4*outCount + c] = inV[4*i + c] + amt * (inV[4*j + c] - inV[4*i + c]);
+					if (hasTex)
+					{
+						for (int u = 0; u < Graphics3D.ACTIVE_TEXTURE_UNITS; u++)
+						{
+							if (texc[u] != null)
+							{
+								outT[u][4*outCount + c] = inT[u][4*i + c] + amt * (inT[u][4*j + c] - inT[u][4*i + c]);
+							}
+						}
+					}
+				}
+
+				final int cA = inC[i], cB = inC[j];
+				final int alpha = (int) (amt * 256f);
+
+				final int rbA = cA & 0x00FF00FF, rbB = cB & 0x00FF00FF;
+				final int agA = (cA >>> 8) & 0x00FF00FF, agB = (cB >>> 8) & 0x00FF00FF;
+
+				final int rb = (rbA + (((rbB - rbA) * alpha) >> 8)) & 0x00FF00FF;
+				final int ag = (agA + (((agB - agA) * alpha) >> 8)) & 0x00FF00FF;
+
+				outC[outCount] = rb | (ag << 8);
+				outCount++;
+			}
+		}
+		return outCount;
+	}
+
+	private static native boolean _sortFrontToBack(Triangle[] array, int count);
+
+	private static Triangle[] sortFrontToBack(Triangle[] array, int count)
+	{
+		// No use trying to sort less than 2 triangles
+		if (count < 2 || _sortFrontToBack(array, count)) { return array; }
+
+		// Insertion sort should be good enough for most M3G apps, as triangle
+		// count is often very low.
+		for (int i = 1; i < count; i++)
+		{
+			Triangle tri = array[i];
+			int j = i - 1;
+
+			while (j >= 0 && array[j].sortZ < tri.sortZ)
+			{
+				array[j + 1] = array[j];
+				j--;
+			}
+			array[j + 1] = tri;
+		}
+
+		return array;
+	}
+
+	private static final boolean outsideFrustum(float[] vert, int idx0, int idx1, int idx2)
+	{
+		final float w0 = vert[idx0 + 3], w1 = vert[idx1 + 3], w2 = vert[idx2 + 3];
+
+		if (vert[idx0]     < -w0 && vert[idx1]     < -w1 && vert[idx2]     < -w2) { return true; }
+		if (vert[idx0]     >  w0 && vert[idx1]     >  w1 && vert[idx2]     >  w2) { return true; }
+
+		if (vert[idx0 + 1] < -w0 && vert[idx1 + 1] < -w1 && vert[idx2 + 1] < -w2) { return true; }
+		if (vert[idx0 + 1] >  w0 && vert[idx1 + 1] >  w1 && vert[idx2 + 1] >  w2) { return true; }
+
+		if (vert[idx0 + 2] < -w0 && vert[idx1 + 2] < -w1 && vert[idx2 + 2] < -w2) { return true; }
+		if (vert[idx0 + 2] >  w0 && vert[idx1 + 2] >  w1 && vert[idx2 + 2] >  w2) { return true; }
+
+		return false;
+	}
+
+	public static final void transform(Triangle[] triangles, int visibleTris, Transform trVert, Transform[] trTex, boolean hasTexture)
+	{
+		for (int i = 0; i < visibleTris; i++) { trVert.transform(triangles[i].v); }
+
+		if(hasTexture)
+		{
+			for (int i = 0; i < visibleTris; i++)
+			{
+				for(int u = 0; u < Graphics3D.ACTIVE_TEXTURE_UNITS; u++)
+				{
+					// Each trTex transform is bound to a texture unit, so it is
+					// safe to use it as a check to see if we have these coords.
+					trTex[u].transformTexCoords(triangles[i].t[u]);
+				}
+			}
+		}
+	}
+
+	private static final boolean isCounterClockwise(float[] vert, int idx0, int idx1, int idx2)
+	{
+		final float ax = vert[idx0], ay = vert[idx0 + 1], aw = vert[idx0 + 3];
+		final float bx = vert[idx1], by = vert[idx1 + 1], bw = vert[idx1 + 3];
+		final float cx = vert[idx2], cy = vert[idx2 + 1], cw = vert[idx2 + 3];
+
+		// Usually counterClockWise would be <= 0.0, but we're in Clip space
+		// here where Y is the inverse of NDC, so invert to > 0.0;
+		return ax * (by * cw - cy * bw) + bx * (cy * aw - ay * cw)
+			+ cx * (ay * bw - by * aw) > 0.0f;
+	}
+
+	public final float xA() { return v[0]; }
+	public final float yA() { return v[1]; }
+	public final float zA() { return v[2]; }
+	public final float wA() { return v[3]; }
+	public final float xB() { return v[4]; }
+	public final float yB() { return v[5]; }
+	public final float zB() { return v[6]; }
+	public final float wB() { return v[7]; }
+	public final float xC() { return v[8]; }
+	public final float yC() { return v[9]; }
+	public final float zC() { return v[10]; }
+	public final float wC() { return v[11]; }
+
+	public final float sA(int unit) { return t[unit][0]; }
+	public final float tA(int unit) { return t[unit][1]; }
+	public final float sB(int unit) { return t[unit][2]; }
+	public final float tB(int unit) { return t[unit][3]; }
+	public final float sC(int unit) { return t[unit][4]; }
+	public final float tC(int unit) { return t[unit][5]; }
+
+	public final float iwA() { return invW[0]; }
+	public final float iwB() { return invW[1]; }
+	public final float iwC() { return invW[2]; }
+
+	public final int colorA() { return colors[0]; }
+	public final int colorB() { return colors[1]; }
+	public final int colorC() { return colors[2]; }
+
+	public final boolean hasVertexColors() { return this.hasVertexColors; }
+}

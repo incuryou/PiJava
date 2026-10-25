@@ -1,0 +1,1 @@
+Synthetic JPEG fixtures generated with Pillow/libjpeg for decoder and Java Image API tests. No game images included. RGB files are independent libjpeg decode references. baseline=17x11, progressive=24x19, grayscale=9x7, CMYK=7x5; truncated has no EOI; oversized=1025x1 exceeds existing emulator image bounds.

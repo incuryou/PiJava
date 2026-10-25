@@ -1,0 +1,944 @@
+{
+  "format": "J2SJ split baseline JPEG",
+  "results": [
+    {
+      "name": "ivory",
+      "id": 4,
+      "source_sha256": "61db282a438438845b873525c4c0fdc266ddd2183e3e602a28a66872b9db0b8c",
+      "source_aperture": [
+        541,
+        77,
+        1128,
+        837
+      ],
+      "viewport": [
+        400,
+        40,
+        480,
+        640
+      ],
+      "packed_sha256": "7137101d9656a9ec95e962504f5d7d04e2fd8a88fdabcb3ba174f95579869f20",
+      "bytes": 86909,
+      "jpeg_half_bytes": [
+        43191,
+        43698
+      ],
+      "anchors": [
+        {
+          "input": "ZL",
+          "source_center": [
+            270,
+            103
+          ],
+          "rect": [
+            152,
+            44,
+            96,
+            36
+          ],
+          "tag": "ZL",
+          "tag_center": [
+            259,
+            62
+          ]
+        },
+        {
+          "input": "L",
+          "source_center": [
+            245,
+            174
+          ],
+          "rect": [
+            133,
+            104,
+            96,
+            35
+          ],
+          "tag": "L",
+          "tag_center": [
+            240,
+            122
+          ]
+        },
+        {
+          "input": "Minus",
+          "source_center": [
+            436,
+            222
+          ],
+          "rect": [
+            298,
+            141,
+            48,
+            42
+          ],
+          "tag": "-",
+          "tag_center": [
+            322,
+            206
+          ]
+        },
+        {
+          "input": "Menu",
+          "source_center": [
+            253,
+            362
+          ],
+          "rect": [
+            135,
+            248,
+            104,
+            64
+          ],
+          "tag": "",
+          "tag_center": [
+            187,
+            309
+          ]
+        },
+        {
+          "input": "DUp",
+          "source_center": [
+            322,
+            532
+          ],
+          "rect": [
+            207,
+            398,
+            63,
+            50
+          ],
+          "tag": "",
+          "tag_center": [
+            238,
+            453
+          ]
+        },
+        {
+          "input": "DLeft",
+          "source_center": [
+            241,
+            608
+          ],
+          "rect": [
+            147,
+            462,
+            63,
+            50
+          ],
+          "tag": "",
+          "tag_center": [
+            178,
+            517
+          ]
+        },
+        {
+          "input": "DRight",
+          "source_center": [
+            398,
+            608
+          ],
+          "rect": [
+            263,
+            462,
+            63,
+            50
+          ],
+          "tag": "",
+          "tag_center": [
+            294,
+            517
+          ]
+        },
+        {
+          "input": "DDown",
+          "source_center": [
+            322,
+            685
+          ],
+          "rect": [
+            207,
+            527,
+            63,
+            50
+          ],
+          "tag": "",
+          "tag_center": [
+            238,
+            581
+          ]
+        },
+        {
+          "input": "ZR",
+          "source_center": [
+            1400,
+            103
+          ],
+          "rect": [
+            1032,
+            44,
+            96,
+            36
+          ],
+          "tag": "ZR",
+          "tag_center": [
+            1021,
+            62
+          ]
+        },
+        {
+          "input": "R",
+          "source_center": [
+            1429,
+            174
+          ],
+          "rect": [
+            1054,
+            104,
+            95,
+            35
+          ],
+          "tag": "R",
+          "tag_center": [
+            1042,
+            122
+          ]
+        },
+        {
+          "input": "Plus",
+          "source_center": [
+            1233,
+            224
+          ],
+          "rect": [
+            933,
+            143,
+            48,
+            42
+          ],
+          "tag": "+",
+          "tag_center": [
+            957,
+            208
+          ]
+        },
+        {
+          "input": "X",
+          "source_center": [
+            1407,
+            298
+          ],
+          "rect": [
+            1048,
+            202,
+            74,
+            49
+          ],
+          "tag": "X",
+          "tag_center": [
+            1085,
+            256
+          ]
+        },
+        {
+          "input": "Y",
+          "source_center": [
+            1309,
+            390
+          ],
+          "rect": [
+            976,
+            279,
+            74,
+            49
+          ],
+          "tag": "Y",
+          "tag_center": [
+            1013,
+            333
+          ]
+        },
+        {
+          "input": "A",
+          "source_center": [
+            1507,
+            388
+          ],
+          "rect": [
+            1122,
+            277,
+            73,
+            49
+          ],
+          "tag": "A",
+          "tag_center": [
+            1159,
+            331
+          ]
+        },
+        {
+          "input": "B",
+          "source_center": [
+            1405,
+            482
+          ],
+          "rect": [
+            1047,
+            357,
+            73,
+            48
+          ],
+          "tag": "B",
+          "tag_center": [
+            1084,
+            411
+          ]
+        },
+        {
+          "input": "Zero",
+          "source_center": [
+            1324,
+            644
+          ],
+          "rect": [
+            973,
+            486,
+            103,
+            63
+          ],
+          "tag": "",
+          "tag_center": [
+            1024,
+            547
+          ]
+        }
+      ]
+    },
+    {
+      "name": "blue",
+      "id": 5,
+      "source_sha256": "bce3d4fd0431877486a535fa29a9c920fdd71e218d7097347f2b7f151d29c046",
+      "source_aperture": [
+        562,
+        45,
+        1111,
+        864
+      ],
+      "viewport": [
+        400,
+        40,
+        480,
+        640
+      ],
+      "packed_sha256": "2b78e526df1445b74cbdc8e5ebc7e6ebd322c3f6808ea95bd5aa009efda7e9fb",
+      "bytes": 112296,
+      "jpeg_half_bytes": [
+        56032,
+        56244
+      ],
+      "anchors": [
+        {
+          "input": "ZL",
+          "source_center": [
+            270,
+            88
+          ],
+          "rect": [
+            146,
+            57,
+            92,
+            33
+          ],
+          "tag": "ZL",
+          "tag_center": [
+            249,
+            74
+          ]
+        },
+        {
+          "input": "L",
+          "source_center": [
+            244,
+            166
+          ],
+          "rect": [
+            127,
+            118,
+            93,
+            33
+          ],
+          "tag": "L",
+          "tag_center": [
+            231,
+            135
+          ]
+        },
+        {
+          "input": "Minus",
+          "source_center": [
+            433,
+            228
+          ],
+          "rect": [
+            285,
+            163,
+            46,
+            40
+          ],
+          "tag": "-",
+          "tag_center": [
+            308,
+            224
+          ]
+        },
+        {
+          "input": "Menu",
+          "source_center": [
+            271,
+            365
+          ],
+          "rect": [
+            143,
+            261,
+            100,
+            58
+          ],
+          "tag": "",
+          "tag_center": [
+            193,
+            317
+          ]
+        },
+        {
+          "input": "DUp",
+          "source_center": [
+            329,
+            535
+          ],
+          "rect": [
+            204,
+            399,
+            60,
+            47
+          ],
+          "tag": "",
+          "tag_center": [
+            234,
+            450
+          ]
+        },
+        {
+          "input": "DLeft",
+          "source_center": [
+            245,
+            618
+          ],
+          "rect": [
+            144,
+            464,
+            61,
+            47
+          ],
+          "tag": "",
+          "tag_center": [
+            174,
+            515
+          ]
+        },
+        {
+          "input": "DRight",
+          "source_center": [
+            414,
+            619
+          ],
+          "rect": [
+            264,
+            465,
+            61,
+            47
+          ],
+          "tag": "",
+          "tag_center": [
+            295,
+            516
+          ]
+        },
+        {
+          "input": "DDown",
+          "source_center": [
+            331,
+            704
+          ],
+          "rect": [
+            205,
+            532,
+            61,
+            46
+          ],
+          "tag": "",
+          "tag_center": [
+            236,
+            582
+          ]
+        },
+        {
+          "input": "ZR",
+          "source_center": [
+            1406,
+            90
+          ],
+          "rect": [
+            1044,
+            59,
+            93,
+            33
+          ],
+          "tag": "ZR",
+          "tag_center": [
+            1033,
+            75
+          ]
+        },
+        {
+          "input": "R",
+          "source_center": [
+            1430,
+            167
+          ],
+          "rect": [
+            1061,
+            119,
+            93,
+            33
+          ],
+          "tag": "R",
+          "tag_center": [
+            1050,
+            135
+          ]
+        },
+        {
+          "input": "Plus",
+          "source_center": [
+            1240,
+            228
+          ],
+          "rect": [
+            949,
+            163,
+            46,
+            40
+          ],
+          "tag": "+",
+          "tag_center": [
+            972,
+            224
+          ]
+        },
+        {
+          "input": "X",
+          "source_center": [
+            1403,
+            304
+          ],
+          "rect": [
+            1053,
+            220,
+            71,
+            45
+          ],
+          "tag": "X",
+          "tag_center": [
+            1088,
+            270
+          ]
+        },
+        {
+          "input": "Y",
+          "source_center": [
+            1298,
+            391
+          ],
+          "rect": [
+            978,
+            288,
+            71,
+            45
+          ],
+          "tag": "Y",
+          "tag_center": [
+            1013,
+            338
+          ]
+        },
+        {
+          "input": "A",
+          "source_center": [
+            1507,
+            389
+          ],
+          "rect": [
+            1127,
+            286,
+            71,
+            45
+          ],
+          "tag": "A",
+          "tag_center": [
+            1162,
+            336
+          ]
+        },
+        {
+          "input": "B",
+          "source_center": [
+            1404,
+            483
+          ],
+          "rect": [
+            1053,
+            360,
+            72,
+            45
+          ],
+          "tag": "B",
+          "tag_center": [
+            1089,
+            410
+          ]
+        },
+        {
+          "input": "Zero",
+          "source_center": [
+            1323,
+            654
+          ],
+          "rect": [
+            981,
+            487,
+            100,
+            58
+          ],
+          "tag": "",
+          "tag_center": [
+            1031,
+            543
+          ]
+        }
+      ]
+    },
+    {
+      "name": "black",
+      "id": 6,
+      "source_sha256": "9b24216c1ada05bd3b3fea307d5216bc871794e8ef1ca1b23205a308556fd9d6",
+      "source_aperture": [
+        552,
+        78,
+        1120,
+        834
+      ],
+      "viewport": [
+        400,
+        40,
+        480,
+        640
+      ],
+      "packed_sha256": "4f4ec8c3ee483f9b1d85f91bc2855c7a732d6234f63e9fd4bbe73c1ff5e054d8",
+      "bytes": 82009,
+      "jpeg_half_bytes": [
+        40968,
+        41021
+      ],
+      "anchors": [
+        {
+          "input": "ZL",
+          "source_center": [
+            269,
+            101
+          ],
+          "rect": [
+            148,
+            42,
+            94,
+            35
+          ],
+          "tag": "ZL",
+          "tag_center": [
+            253,
+            59
+          ]
+        },
+        {
+          "input": "L",
+          "source_center": [
+            241,
+            176
+          ],
+          "rect": [
+            128,
+            105,
+            94,
+            36
+          ],
+          "tag": "L",
+          "tag_center": [
+            233,
+            123
+          ]
+        },
+        {
+          "input": "Minus",
+          "source_center": [
+            430,
+            229
+          ],
+          "rect": [
+            288,
+            147,
+            47,
+            42
+          ],
+          "tag": "-",
+          "tag_center": [
+            312,
+            212
+          ]
+        },
+        {
+          "input": "Menu",
+          "source_center": [
+            253,
+            365
+          ],
+          "rect": [
+            133,
+            251,
+            101,
+            64
+          ],
+          "tag": "",
+          "tag_center": [
+            183,
+            313
+          ]
+        },
+        {
+          "input": "DUp",
+          "source_center": [
+            321,
+            532
+          ],
+          "rect": [
+            202,
+            399,
+            61,
+            51
+          ],
+          "tag": "",
+          "tag_center": [
+            233,
+            454
+          ]
+        },
+        {
+          "input": "DLeft",
+          "source_center": [
+            239,
+            607
+          ],
+          "rect": [
+            142,
+            462,
+            62,
+            51
+          ],
+          "tag": "",
+          "tag_center": [
+            173,
+            517
+          ]
+        },
+        {
+          "input": "DRight",
+          "source_center": [
+            398,
+            608
+          ],
+          "rect": [
+            258,
+            463,
+            61,
+            51
+          ],
+          "tag": "",
+          "tag_center": [
+            288,
+            518
+          ]
+        },
+        {
+          "input": "DDown",
+          "source_center": [
+            322,
+            685
+          ],
+          "rect": [
+            203,
+            528,
+            61,
+            51
+          ],
+          "tag": "",
+          "tag_center": [
+            233,
+            583
+          ]
+        },
+        {
+          "input": "ZR",
+          "source_center": [
+            1405,
+            107
+          ],
+          "rect": [
+            1039,
+            47,
+            95,
+            35
+          ],
+          "tag": "ZR",
+          "tag_center": [
+            1029,
+            65
+          ]
+        },
+        {
+          "input": "R",
+          "source_center": [
+            1431,
+            177
+          ],
+          "rect": [
+            1058,
+            106,
+            94,
+            36
+          ],
+          "tag": "R",
+          "tag_center": [
+            1047,
+            124
+          ]
+        },
+        {
+          "input": "Plus",
+          "source_center": [
+            1235,
+            229
+          ],
+          "rect": [
+            940,
+            147,
+            47,
+            42
+          ],
+          "tag": "+",
+          "tag_center": [
+            963,
+            212
+          ]
+        },
+        {
+          "input": "X",
+          "source_center": [
+            1407,
+            300
+          ],
+          "rect": [
+            1052,
+            203,
+            72,
+            49
+          ],
+          "tag": "X",
+          "tag_center": [
+            1088,
+            258
+          ]
+        },
+        {
+          "input": "Y",
+          "source_center": [
+            1308,
+            390
+          ],
+          "rect": [
+            980,
+            280,
+            72,
+            49
+          ],
+          "tag": "Y",
+          "tag_center": [
+            1016,
+            334
+          ]
+        },
+        {
+          "input": "A",
+          "source_center": [
+            1508,
+            389
+          ],
+          "rect": [
+            1125,
+            279,
+            72,
+            49
+          ],
+          "tag": "A",
+          "tag_center": [
+            1161,
+            333
+          ]
+        },
+        {
+          "input": "B",
+          "source_center": [
+            1407,
+            481
+          ],
+          "rect": [
+            1052,
+            357,
+            72,
+            49
+          ],
+          "tag": "B",
+          "tag_center": [
+            1088,
+            411
+          ]
+        },
+        {
+          "input": "Zero",
+          "source_center": [
+            1319,
+            647
+          ],
+          "rect": [
+            973,
+            490,
+            102,
+            63
+          ],
+          "tag": "",
+          "tag_center": [
+            1024,
+            551
+          ]
+        }
+      ]
+    }
+  ]
+}

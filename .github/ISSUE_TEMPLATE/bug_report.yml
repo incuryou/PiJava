@@ -1,0 +1,64 @@
+name: Bug report / 问题反馈
+description: Report a reproducible build, runtime or compatibility problem / 报告可复现问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿上传商业 JAR、游戏素材、RMS、即时存档、密钥或个人信息。
+        Do not attach commercial JARs, game assets, RMS, savestates, keys or personal data.
+        Prefer a minimal MIDlet you wrote yourself. Redact logs before posting.
+  - type: input
+    id: version
+    attributes:
+      label: PiJava version / 版本或提交
+      placeholder: 0.2.114-keyui5 or commit ID
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Device and launch method / 设备与启动方式
+      description: Switch model, system and homebrew launch method; or Linux distribution and command. For build failures, add compiler/JDK/Python and dependency versions.
+    validations:
+      required: true
+  - type: textarea
+    id: game
+    attributes:
+      label: Game identity / 游戏身份
+      description: Name, release/version, logical resolution and JAR SHA-256. Do not upload the JAR. Write N/A for a problem unrelated to a game.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps / 复现步骤
+      description: Start from launch. Include skin, filter, speed target, custom mapping and whether an instant savestate was used.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior / 实际行为
+      description: Distinguish build failure, Linux diagnostics and physical Switch behavior. State the scene reached and whether save/continue/exit was tested.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Minimal redacted log / 最小相关日志
+      description: Paste only relevant lines. Remove personal information and unrelated paths. Never paste keys or save data.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Attachment check / 附件检查
+      options:
+        - label: I have not included commercial JARs, private saves, keys or personal data. / 未附商业 JAR、私人存档、密钥或个人数据。
+          required: true

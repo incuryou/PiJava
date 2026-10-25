@@ -1,0 +1,5 @@
+M3G Java implementation adapted from TASEmulators/freej2me-plus
+https://github.com/TASEmulators/freej2me-plus
+Commit ca8e8e667a8d5da80f12693465da722793e1aaf3
+Original file notices retained. GPL-3.0-or-later; see FreeJ2ME-plus-GPL-3.0.txt.
+Switch adaptations: CLDC collection/array adapters, native target and raster bridges, native zlib inflation, removal of emulator policy overrides and logging.

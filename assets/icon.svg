@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>J2ME VM red and white phone icon</title>
+  <rect width="256" height="256" fill="#d91526"/>
+  <rect x="84" y="30" width="88" height="142" rx="17" fill="#fff"/>
+  <rect x="94" y="48" width="68" height="78" rx="6" fill="#d91526"/>
+  <rect x="115" y="38" width="26" height="3" rx="1.5" fill="#d91526"/>
+  <path d="M116 65H143V98C143 110 137 116 126 116C115 116 109 110 109 99H120C120 104 122 106 126 106C130 106 132 103 132 98V75H116Z" fill="#fff"/>
+  <path d="M105 135H115V143H123V153H115V161H105V153H97V143H105Z" fill="#d91526"/>
+  <circle cx="144" cy="151" r="6" fill="#d91526"/>
+  <circle cx="157" cy="140" r="4" fill="#d91526"/>
+  <g fill="#fff" transform="translate(10 0)">
+    <path d="M48 191H70V216C70 225 65 230 56 230C48 230 43 225 43 217H51C51 221 53 223 56 223C60 223 62 221 62 216V198H48Z"/>
+    <path d="M78 202C78 194 84 190 92 190C100 190 106 194 106 202C106 208 102 212 96 216L88 222H107V229H78V222L91 211C96 207 98 205 98 202C98 199 96 197 92 197C88 197 86 199 86 202Z"/>
+    <path d="M116 229V191H125L136 214L147 191H156V229H148V207L140 224H132L124 207V229Z"/>
+    <path d="M167 191H193V198H175V206H191V213H175V222H193V229H167Z"/>
+  </g>
+</svg>

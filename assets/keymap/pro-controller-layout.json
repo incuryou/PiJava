@@ -1,0 +1,724 @@
+{
+  "source_sha256": "13fe36c0840f19f7c605a7aa1f278d4d711a8bd50a9bf472c3c48ace251f0c21",
+  "rgba_sha256": "de22ce8efdf4e519596e7094a4ae764d107db2c91ab577250b64aebea7c7282e",
+  "source_size": [
+    1508,
+    1043
+  ],
+  "host_image": [
+    748,
+    151,
+    460,
+    318
+  ],
+  "anchors": [
+    {
+      "input": "ZL",
+      "source_center": [
+        385,
+        158
+      ],
+      "host_rect": [
+        831,
+        188,
+        42,
+        22
+      ],
+      "tag_center": [
+        889,
+        199
+      ],
+      "tag": "ZL"
+    },
+    {
+      "input": "L",
+      "source_center": [
+        358,
+        250
+      ],
+      "host_rect": [
+        823,
+        216,
+        42,
+        22
+      ],
+      "tag_center": [
+        881,
+        227
+      ],
+      "tag": "L"
+    },
+    {
+      "input": "Minus",
+      "source_center": [
+        565,
+        307
+      ],
+      "host_rect": [
+        903,
+        229,
+        34,
+        23
+      ],
+      "tag_center": [
+        920,
+        259
+      ],
+      "tag": "-"
+    },
+    {
+      "input": "Menu",
+      "source_center": [
+        338,
+        465
+      ],
+      "host_rect": [
+        831,
+        276,
+        40,
+        24
+      ],
+      "tag_center": [
+        851,
+        307
+      ],
+      "tag": "L3"
+    },
+    {
+      "input": "DUp",
+      "source_center": [
+        499,
+        619
+      ],
+      "host_rect": [
+        887,
+        324,
+        26,
+        23
+      ],
+      "tag_center": [
+        900,
+        354
+      ],
+      "tag": ""
+    },
+    {
+      "input": "DLeft",
+      "source_center": [
+        413,
+        704
+      ],
+      "host_rect": [
+        861,
+        350,
+        26,
+        23
+      ],
+      "tag_center": [
+        874,
+        380
+      ],
+      "tag": ""
+    },
+    {
+      "input": "DRight",
+      "source_center": [
+        582,
+        704
+      ],
+      "host_rect": [
+        913,
+        350,
+        26,
+        23
+      ],
+      "tag_center": [
+        926,
+        380
+      ],
+      "tag": ""
+    },
+    {
+      "input": "DDown",
+      "source_center": [
+        499,
+        789
+      ],
+      "host_rect": [
+        887,
+        376,
+        26,
+        23
+      ],
+      "tag_center": [
+        900,
+        406
+      ],
+      "tag": ""
+    },
+    {
+      "input": "ZR",
+      "source_center": [
+        1115,
+        157
+      ],
+      "host_rect": [
+        1080,
+        188,
+        42,
+        22
+      ],
+      "tag_center": [
+        1064,
+        199
+      ],
+      "tag": "ZR"
+    },
+    {
+      "input": "R",
+      "source_center": [
+        1155,
+        250
+      ],
+      "host_rect": [
+        1092,
+        216,
+        42,
+        22
+      ],
+      "tag_center": [
+        1076,
+        227
+      ],
+      "tag": "R"
+    },
+    {
+      "input": "Plus",
+      "source_center": [
+        940,
+        308
+      ],
+      "host_rect": [
+        1018,
+        229,
+        34,
+        23
+      ],
+      "tag_center": [
+        1035,
+        259
+      ],
+      "tag": "+"
+    },
+    {
+      "input": "X",
+      "source_center": [
+        1167,
+        373
+      ],
+      "host_rect": [
+        1087,
+        249,
+        34,
+        23
+      ],
+      "tag_center": [
+        1104,
+        279
+      ],
+      "tag": "X"
+    },
+    {
+      "input": "Y",
+      "source_center": [
+        1045,
+        477
+      ],
+      "host_rect": [
+        1050,
+        280,
+        34,
+        23
+      ],
+      "tag_center": [
+        1067,
+        310
+      ],
+      "tag": "Y"
+    },
+    {
+      "input": "A",
+      "source_center": [
+        1275,
+        477
+      ],
+      "host_rect": [
+        1120,
+        280,
+        34,
+        23
+      ],
+      "tag_center": [
+        1137,
+        310
+      ],
+      "tag": "A"
+    },
+    {
+      "input": "B",
+      "source_center": [
+        1168,
+        580
+      ],
+      "host_rect": [
+        1087,
+        312,
+        34,
+        23
+      ],
+      "tag_center": [
+        1104,
+        342
+      ],
+      "tag": "B"
+    },
+    {
+      "input": "R3",
+      "source_center": [
+        975,
+        733
+      ],
+      "host_rect": [
+        1025,
+        357,
+        40,
+        24
+      ],
+      "tag_center": [
+        1045,
+        388
+      ],
+      "tag": "R3"
+    }
+  ],
+  "image_faces": [
+    {
+      "input": "ZL",
+      "center": [
+        866,
+        198
+      ],
+      "radii": [
+        39,
+        9
+      ],
+      "phone_inset": [
+        851,
+        192,
+        31,
+        13
+      ],
+      "tag_inset": [
+        885,
+        191,
+        17,
+        11
+      ],
+      "physical": "ZL",
+      "horizontal": true,
+      "tag_side_plane_y": [
+        186,
+        206
+      ]
+    },
+    {
+      "input": "L",
+      "center": [
+        855,
+        226
+      ],
+      "radii": [
+        43,
+        9.5
+      ],
+      "phone_inset": [
+        840,
+        220,
+        31,
+        13
+      ],
+      "tag_inset": [
+        878,
+        217,
+        17,
+        11
+      ],
+      "physical": "L",
+      "horizontal": true,
+      "tag_side_plane_y": [
+        215,
+        229
+      ]
+    },
+    {
+      "input": "Minus",
+      "center": [
+        920,
+        244
+      ],
+      "radii": [
+        10,
+        11
+      ],
+      "phone_inset": [
+        912,
+        235,
+        17,
+        19
+      ],
+      "tag_inset": [
+        912,
+        258,
+        17,
+        13
+      ],
+      "physical": "-",
+      "horizontal": false
+    },
+    {
+      "input": "Menu",
+      "center": [
+        851,
+        293
+      ],
+      "radii": [
+        23,
+        24
+      ],
+      "phone_inset": [
+        830,
+        284,
+        43,
+        14
+      ],
+      "tag_inset": [
+        844,
+        300,
+        15,
+        9
+      ],
+      "physical": "L3",
+      "horizontal": false
+    },
+    {
+      "input": "DUp",
+      "center": [
+        900,
+        340
+      ],
+      "radii": [
+        10.5,
+        10.5
+      ],
+      "phone_inset": [
+        892,
+        332,
+        17,
+        17
+      ],
+      "tag_inset": [
+        892,
+        336,
+        17,
+        13
+      ],
+      "physical": "",
+      "horizontal": false
+    },
+    {
+      "input": "DLeft",
+      "center": [
+        874,
+        366
+      ],
+      "radii": [
+        10.5,
+        11
+      ],
+      "phone_inset": [
+        866,
+        357,
+        17,
+        19
+      ],
+      "tag_inset": [
+        866,
+        362,
+        17,
+        14
+      ],
+      "physical": "",
+      "horizontal": false
+    },
+    {
+      "input": "DRight",
+      "center": [
+        926,
+        366
+      ],
+      "radii": [
+        10.5,
+        11
+      ],
+      "phone_inset": [
+        918,
+        357,
+        17,
+        19
+      ],
+      "tag_inset": [
+        918,
+        362,
+        17,
+        14
+      ],
+      "physical": "",
+      "horizontal": false
+    },
+    {
+      "input": "DDown",
+      "center": [
+        900,
+        392
+      ],
+      "radii": [
+        10.5,
+        10.5
+      ],
+      "phone_inset": [
+        892,
+        384,
+        17,
+        17
+      ],
+      "tag_inset": [
+        892,
+        388,
+        17,
+        13
+      ],
+      "physical": "",
+      "horizontal": false
+    },
+    {
+      "input": "ZR",
+      "center": [
+        1088,
+        198
+      ],
+      "radii": [
+        39,
+        9
+      ],
+      "phone_inset": [
+        1073,
+        192,
+        31,
+        13
+      ],
+      "tag_inset": [
+        1053,
+        191,
+        17,
+        11
+      ],
+      "physical": "ZR",
+      "horizontal": true,
+      "tag_side_plane_y": [
+        186,
+        206
+      ]
+    },
+    {
+      "input": "R",
+      "center": [
+        1100,
+        226
+      ],
+      "radii": [
+        43,
+        9.5
+      ],
+      "phone_inset": [
+        1085,
+        220,
+        31,
+        13
+      ],
+      "tag_inset": [
+        1061,
+        217,
+        17,
+        11
+      ],
+      "physical": "R",
+      "horizontal": true,
+      "tag_side_plane_y": [
+        215,
+        229
+      ]
+    },
+    {
+      "input": "Plus",
+      "center": [
+        1034,
+        244
+      ],
+      "radii": [
+        10,
+        11
+      ],
+      "phone_inset": [
+        1026,
+        235,
+        17,
+        19
+      ],
+      "tag_inset": [
+        1026,
+        258,
+        17,
+        13
+      ],
+      "physical": "+",
+      "horizontal": false
+    },
+    {
+      "input": "X",
+      "center": [
+        1103,
+        264
+      ],
+      "radii": [
+        16,
+        17
+      ],
+      "phone_inset": [
+        1089,
+        252,
+        29,
+        14
+      ],
+      "tag_inset": [
+        1099,
+        268,
+        9,
+        9
+      ],
+      "physical": "X",
+      "horizontal": false
+    },
+    {
+      "input": "Y",
+      "center": [
+        1067,
+        296
+      ],
+      "radii": [
+        16,
+        17
+      ],
+      "phone_inset": [
+        1053,
+        284,
+        29,
+        14
+      ],
+      "tag_inset": [
+        1063,
+        300,
+        9,
+        9
+      ],
+      "physical": "Y",
+      "horizontal": false
+    },
+    {
+      "input": "A",
+      "center": [
+        1138,
+        296
+      ],
+      "radii": [
+        16,
+        17
+      ],
+      "phone_inset": [
+        1124,
+        284,
+        29,
+        13
+      ],
+      "tag_inset": [
+        1134,
+        299,
+        9,
+        9
+      ],
+      "physical": "A",
+      "horizontal": false
+    },
+    {
+      "input": "B",
+      "center": [
+        1103,
+        328
+      ],
+      "radii": [
+        16,
+        17
+      ],
+      "phone_inset": [
+        1089,
+        316,
+        29,
+        14
+      ],
+      "tag_inset": [
+        1099,
+        332,
+        9,
+        9
+      ],
+      "physical": "B",
+      "horizontal": false
+    },
+    {
+      "input": "R3",
+      "center": [
+        1054,
+        372
+      ],
+      "radii": [
+        24,
+        25
+      ],
+      "phone_inset": [
+        1041,
+        363,
+        27,
+        19
+      ],
+      "tag_inset": [
+        1046,
+        380,
+        17,
+        13
+      ],
+      "physical": "R3",
+      "horizontal": false
+    }
+  ],
+  "face_provenance": "Actual interior faces traced on approved 460x318 RGBA; independent test fixture retained separately.",
+  "editor_tag_rule": "ABXY retain fixed prior centers. Shoulder tags are fixed at the side; minus/plus tags are fixed outside below. Physical tag rectangles are independent of phone-face fitting."
+}

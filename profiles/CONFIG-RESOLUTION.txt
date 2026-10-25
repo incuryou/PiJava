@@ -1,0 +1,92 @@
+P1 profile configuration contract (schema 1)
+
+Switch path: sdmc:/switch/j2me/p1-profile.cfg
+Desktop path: J2ME_P1_PROFILE supplies the path to the same file format.
+No environment variable is consumed by the parser itself; host BOOT resolves
+the path and invokes p1::read_profile(path) once per emulator process start.
+
+Installation
+Back up the old reference flags, speed.cfg, menu.cfg and game saves first.
+Fully exit the NRO, copy one supplied profiles/<ID>/p1-profile.cfg file to
+sdmc:/switch/j2me/p1-profile.cfg, then start the NRO again. Returning to the
+emulator menu does not reload this file. The first device run uses P1-R;
+P1-C is the comparison. The M profiles are additional matrix controls.
+Remove/rename p1-profile.cfg and fully restart to restore legacy settings.
+
+Format
+At most 4096 bytes, key=value per line. ASCII keys are case-sensitive. Spaces,
+tabs and CRLF are accepted. A # starts a comment, including after a value.
+A final newline is optional. Quoting, JSON, duplicate keys, unknown keys,
+empty values, control bytes and unrecognized profiles are rejected.
+schema_version=1 is optional; other versions are rejected.
+profile is mandatory and must be P1-R, P1-C, P1-M00, P1-M01, P1-M10 or P1-M11.
+All booleans accept only 0, 1, false or true. The following are optional,
+independent overrides applied after resolving every builtin field:
+geometry_native, host_boundary, completed_handoff, sprite_native,
+prep_native, float_batch, diagnostics.
+
+Fixed P1 controls
+An accepted profile implies texture_native=1, span_native=1, row_native=1,
+jit_requested=0, renderer=cpu and speed=native. These keys may be written
+explicitly only with those values. Conflicting values reject the whole file.
+These fixed controls apply only during P1 mode, including every later game
+launch and menu action. Existing implementations and legacy behavior remain
+available after disabling P1 mode and restarting.
+
+Builtin defaults (no legacy or previous-launch value is inherited)
+ID       geometry boundary handoff sprite prep float diagnostics
+P1-R     1        1        0       0      0    0     1
+P1-C     0        0        1       1      1    1     1
+P1-M00   1        0        0       1      1    1     1
+P1-M01   1        0        1       1      1    1     1
+P1-M10   1        1        0       1      1    1     1
+P1-M11   1        1        1       1      1    1     1
+P1-C is a functional reference, not a claim of byte identity with stage241.
+
+Failure and BOOT evidence
+A missing file returns active=false and error empty; legacy mode continues.
+Malformed, oversize, unreadable or unopenable files return active=false and
+an explicit error with no partially applied fields. BOOT must log the path,
+rejection and resulting legacy mode clearly. A malformed tail never activates
+the valid prefix. All successfully parsed profiles set active=true only after
+full validation. BOOT logs requested/effective/source for each switch, fixed
+renderer/speed/JIT, and the old sources overridden by active P1 mode.
+The parser does not log itself because its caller owns the production sink.
+
+Integration API
+#include "p1_profile.h"
+p1::Profile result = p1::read_profile(path);
+result.active: use P1 flags only when true.
+result.id: accepted builtin ID; result.error: rejection text or empty.
+result.geometry_native, result.host_boundary, result.completed_handoff,
+result.sprite_native, result.prep_native, result.float_batch,
+result.diagnostics: fully resolved effective booleans.
+result.override_mask: explicit-key bits p1::Geometry, Boundary, Handoff,
+Sprite, Prep, Float, Diagnostics. An unset bit means builtin source.
+p1::switch_profile_path is the exact Switch path.
+p1::parse_profile(record) is a pure bounded parser used by standalone tests.
+No Java allocations, VM state changes, exceptions, or unbounded file reads.
+
+Standalone validation
+python3 tools/test_p1_profile.py
+Compiles with -fno-exceptions and warnings as errors, tests every builtin,
+independent fields and B/H/geometry combinations, validates the six supplied
+files, verifies atomic rejection and the exact file-size boundary. These are
+desktop parser checks and do not establish device behavior or performance.
+
+P1 runtime UI enforcement
+Accepted profiles force Native on every normal launch, force CPU presentation
+and suppress renderer/speed UI changes before persistent writes. CONTINUE
+is refused before loading an instant snapshot; normal start remains available.
+No RMS or snapshot files are deleted. Remove profile and restart to return
+to legacy configuration; the P1 scheduler fix remains until source/NRO rollback.
+
+Diagnostic bounds
+Ordinary native details: 512 events/launch, 64 queued1024-byte lines;
+first live-to-zero has one reserved critical event beyond that cap.
+Caught exceptions: separate native32-entry rolling ring, last-N snapshots,
+overwrite count explicit; at most two safe dumps (first live-to-zero and
+final reset/destroy), <=64 caught records/launch. No opcode/Java heap trace.
+Counters continue past detail limits. Abrupt power loss can lose buffered tail.
+Paint histogram emits upper bounds and overflow; p99 upper bound is not an
+exact percentile. Logic FPS is unavailable; underrun unknown.

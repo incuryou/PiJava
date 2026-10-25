@@ -1,0 +1,22 @@
+{
+  "policy": "Legacy donor assets remain unchanged except cjk16.bin: complete CJK rows regenerated from pinned Unifont 16.0.04 to repair clipped top strokes; repertoire and binary record layout retained.",
+  "files": [
+    {
+      "path": "src/font8x8_basic.h",
+      "size": 9605,
+      "sha256": "aa787b8bbb49dca916d7eb5aca8313bc2908954ba0201cda3e27f9310b92134e"
+    },
+    {
+      "path": "romfs/font/cjk16.bin",
+      "size": 728454,
+      "sha256": "c460955edcd8f066022025700cbb4392a1f4fb933729dcbeb5f0a9d4e9b557a5",
+      "provenance": "third_party/unifont/README.txt; tools/rebuild_cjk16.py"
+    },
+    {
+      "path": "src/latin16.h",
+      "size": 12971,
+      "sha256": "bb7e6d8f68685224b078d729d2a59c4bc074fbbfc231bcffe4f9ca5397a415de"
+    }
+  ],
+  "donor_sha256": "c8993bf89b5ca43eb4382e6745272039cbc8d273db02b874b8da21c49ed8595e"
+}

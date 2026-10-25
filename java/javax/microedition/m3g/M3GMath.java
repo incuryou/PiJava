@@ -1,0 +1,310 @@
+/*
+	This file is part of FreeJ2ME.
+
+	FreeJ2ME is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	FreeJ2ME is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with FreeJ2ME.  If not, see http://www.gnu.org/licenses/
+*/
+package javax.microedition.m3g;
+
+public class M3GMath
+{
+	static final float EPSILON = 0.0001f;
+
+	// Faster alternatives to Java's Math library, we don't need the more robust checks.
+
+	public static float sin(float f) { return (float) Math.sin(f); }
+	public static float cos(float f) { return (float) Math.cos(f); }
+	static int numberOfTrailingZeros(int n) { if(n==0) return 32; int count=0; while((n&1)==0) { count++; n >>>= 1; } return count; }
+
+	public static float tan(float a)
+	{
+		final float cosine = cos(a);
+		return cosine != 0.0f ? sin(a) / cosine : (1.0f / 0.0f);
+	}
+
+	// Approximation: acos(a) ~= pi/2 + (ba + ca^3) / (1 + da^2 + ea^4)
+	public static float acos(float a)
+	{
+		float a2 = a * a;
+		float a3 = a2 * a;
+		float a4 = a2 * a2;
+		return (float) (Math.PI * 0.5) +
+			((-0.939115566f * a) + (0.921784152f * a3)) /
+			(1.0f + (-1.284590624f * a2) + (0.295624144f * a4));
+	}
+
+	// Those 'to*' methods are just backported from Java 9
+	public static float toRadians(float angdeg) { return angdeg * 0.017453292f; } // angdeg * (Math.PI/180.0f)
+
+	public static float toDegrees(float angrad) { return angrad * 57.29577951f; } // angdeg * (180.0f / Math.PI)
+
+	// This is Quake's fast inverse sqrt, useful for situations where
+	// performance matters most and lower precision doesn't make much of a
+	// difference, like on lighting.
+	public static float fastInvSqrt(float x)
+	{
+		// 0x5f375a86 = Lomont's magic constant, lower error on 1-pass NR.
+		float y = Float.intBitsToFloat(0x5f375a86 - (Float.floatToRawIntBits(x) >> 1));
+		return y * (1.5f - (0.5f * x * y * y));
+	}
+
+	public static float invSqrt(float x)
+	{
+		float xhalf = 0.5f * x;
+		int i = Float.floatToRawIntBits(x);
+		i = 0x5f375996 - (i >> 1); // Robertson's magic constant, lower error on 2-pass NR.
+		x = Float.intBitsToFloat(i);
+        x = x * (1.5f - (xhalf * x * x));
+        x = x * (1.5f - (xhalf * x * x));
+        return x;
+	}
+
+	public static float sqrt(float x)
+	{
+		return x * invSqrt(x);
+	}
+
+	public static float abs(float value) { return (value < 0) ? -value : value; }
+	public static int abs(int value) { return (value < 0) ? -value : value; }
+
+	public static float max(float a, float b) { return (a > b) ? a : b; }
+	public static int max(int a, int b) { return a - ((a - b) & ((a - b) >> 31)); }
+
+	public static float min(float a, float b) { return (a < b) ? a : b; }
+	public static int min(int a, int b) { return b + ((a - b) & ((a - b) >> 31)); }
+
+	public static double exp(double val)
+	{
+		final long tmp = (long) (1512775 * val + (1072693248 - 60801));
+		return Double.longBitsToDouble(tmp << 32);
+	}
+
+	public static float exp(float val)
+	{
+		final int tmp = (int) (12102203 * val + 1064866805);
+		return Float.intBitsToFloat(tmp);
+	}
+
+	public static int round(float value)
+	{
+		if (value > 0) { return (int) (value + 0.5f); }
+		else { return (int) (value - 0.5f); }
+	}
+
+	// Those are slightly faster than using round() since we know the value will always be positive or negative
+	public static int roundPositive(float value) { return (int) (value + 0.5f); }
+
+	public static int roundNegative(float value) { return (int) (value - 0.5f); }
+
+	// Much faster atan2 approximation heavily based on https://gist.github.com/volkansalma/2972237
+	public static final float atan2(float y, float x)
+	{
+		final float abs_y = abs(y) + 1e-10f;
+		final float r = (x - copySign(abs_y, x)) / (abs_y + abs(x));
+		float angle = (float) (Math.PI * 0.5) - copySign((float) (Math.PI * 0.25), x);
+
+		angle += (0.1963f * r * r - 0.9817f) * r;
+		return copySign(angle, y); // Negate if y is negative
+	}
+
+	// Fast float reciprocal (1 / x) using two Newton-Raphson steps
+	public static final float fastReciprocal(float x)
+	{
+		int i = Float.floatToRawIntBits(x);
+		i = 0x7EF127EA - i;
+		float y = Float.intBitsToFloat(i);
+
+		float e = 1.0f - x * y;
+
+		return y * (1.0f + e) * (1.0f + e * e);
+	}
+
+	// Now we get to stuff specific to M3G
+
+	// Normalize a vector
+	public static final void normalize(float[] vector)
+	{
+		float lengthSq = vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2];
+
+		/*
+		 * Only substitute a fallback vector when the input is degenerate for
+		 * real. Vertex normals are not required to be unit length in M3G (the
+		 * implementation normalizes them), and quantized short/byte normals
+		 * of small magnitude (e.g. +-100 in a short array, ~0.003 after
+		 * dequantization) are perfectly valid: squashing them to (0, 0, 1)
+		 * with a coarse epsilon breaks lighting for such meshes.
+		 */
+		if (lengthSq < 1.0e-30f)
+		{
+			vector[0] = 0.0f;
+			vector[1] = 0.0f;
+			vector[2] = 1.0f;
+			return;
+		}
+
+		float invLength = invSqrt(lengthSq);
+		vector[0] *= invLength;
+		vector[1] *= invLength;
+		vector[2] *= invLength;
+	}
+
+	public static final void scaleVec(float[] vec, float s)
+	{
+		for (int i = 0; i < vec.length; i++) { vec[i] *= s; }
+	}
+
+	// Vector3 / float[3] helpers
+	// For Vector3, the following disposition is used:
+	// [0] = x
+	// [1] = y
+	// [2] = z
+	public static final void lerpVec3(int size, float[] vec, float s, float[] start, float[] end)
+	{
+		float sCompl = 1.f - s;
+		for (int i = 0; i < size; i++) { vec[i] = (sCompl * start[i]) + (s * end[i]); }
+	}
+
+
+	// QVec4 / float[4] helpers
+	// For QVec4, the following disposition is used:
+	// [0] = x
+	// [1] = y
+	// [2] = z
+	// [3] = w
+	// Converts an (angleDegrees, ax, ay, az) angle-axis rotation, as returned by
+	// Transformable.getOrientation, into a unit quaternion.
+	public static final float[] angleAxisToQuat(float angleDeg, float ax, float ay, float az)
+	{
+		float[] quat = new float[4];
+		float axisLenSq = (ax * ax) + (ay * ay) + (az * az);
+
+		if (axisLenSq < EPSILON) { quat[3] = 1.0f; return quat; }
+
+		float halfAngle = toRadians(angleDeg) * 0.5f;
+		float s = sin(halfAngle) * fastReciprocal(sqrt(axisLenSq));
+
+		quat[0] = ax * s;
+		quat[1] = ay * s;
+		quat[2] = az * s;
+		quat[3] = cos(halfAngle);
+
+		return quat;
+	}
+
+	public static final void mulQuat(float[] q1, float[] q2, float[] result)
+	{
+		result[0] = q1[3] * q2[0] + q1[0] * q2[3] + q1[1] * q2[2] - q1[2] * q2[1]; // x
+		result[1] = q1[3] * q2[1] + q1[1] * q2[3] + q1[2] * q2[0] - q1[0] * q2[2]; // y
+		result[2] = q1[3] * q2[2] + q1[2] * q2[3] + q1[0] * q2[1] - q1[1] * q2[0]; // z
+		result[3] = q1[3] * q2[3] - q1[0] * q2[0] - q1[1] * q2[1] - q1[2] * q2[2]; // w
+	}
+
+	public static final float[] normalizeQuat(float[] vec4)
+	{
+		float norm = (vec4[0] * vec4[0] + vec4[1] * vec4[1] + vec4[2] * vec4[2] + vec4[3] * vec4[3]);
+
+		if (norm > EPSILON)
+		{
+			norm = (1.0f * invSqrt(norm));
+			scaleVec(vec4, norm);
+		}
+		else
+		{
+			vec4[0] = 0.0f;
+			vec4[1] = 0.0f;
+			vec4[2] = 0.0f;
+			vec4[3] = 1.0f;
+		}
+
+		return vec4;
+	}
+
+	public static final void slerpQuat(float[] orig, float s, float[] q0, float[] q1)
+	{
+		float cosTheta = q0[0]*q1[0] + q0[1]*q1[1] + q0[2]*q1[2] + q0[3]*q1[3];
+		float q1x = q1[0], q1y = q1[1], q1z = q1[2], q1w = q1[3];
+
+		if (cosTheta < 0.0f)
+		{
+			cosTheta = -cosTheta;
+			q1x = -q1x; q1y = -q1y; q1z = -q1z; q1w = -q1w;
+		}
+
+		float s0, s1;
+		float oneMinusS = 1.0f - s;
+
+		if (cosTheta < (1.0f - EPSILON))
+		{
+			float theta = acos(cosTheta);
+			float invSinTheta = fastReciprocal(sin(theta));
+			s0 = sin(oneMinusS * theta) * invSinTheta;
+			s1 = sin(s * theta) * invSinTheta;
+		}
+		else
+		{
+			s0 = oneMinusS;
+			s1 = s;
+		}
+
+		orig[0] = s0 * q0[0] + s1 * q1x;
+		orig[1] = s0 * q0[1] + s1 * q1y;
+		orig[2] = s0 * q0[2] + s1 * q1z;
+		orig[3] = s0 * q0[3] + s1 * q1w;
+	}
+
+	// Returns the shortest-arc rotation taking srcAxis to targetAxis, as a unit quaternion.
+	// Uses the standard "half-way" construction: q = (srcAxis x targetAxis, |srcAxis||targetAxis| + dot),
+	// normalized. Note that the cross product already carries a sin(angle) factor, so scaling it
+	// by sin(angle/2) (as done previously) yields a non-unit quaternion and a wrong rotation.
+	public static final float[] setQuatRotation(float[] srcAxis, float[] targetAxis)
+	{
+		float[] rot = new float[4];
+		float dot = srcAxis[0] * targetAxis[0] + srcAxis[1] * targetAxis[1] + srcAxis[2] * targetAxis[2];
+
+		rot[0] = srcAxis[1] * targetAxis[2] - srcAxis[2] * targetAxis[1]; // x
+		rot[1] = srcAxis[2] * targetAxis[0] - srcAxis[0] * targetAxis[2]; // y
+		rot[2] = srcAxis[0] * targetAxis[1] - srcAxis[1] * targetAxis[0]; // z
+
+		float srcLenSq = srcAxis[0] * srcAxis[0] + srcAxis[1] * srcAxis[1] + srcAxis[2] * srcAxis[2];
+		float targetLenSq = targetAxis[0] * targetAxis[0] + targetAxis[1] * targetAxis[1] + targetAxis[2] * targetAxis[2];
+
+		// Degenerate axes carry no direction. Return the identity rotation, as per
+		// JSR-184 (coincident target vector maps to the identity rotation).
+		if (srcLenSq < EPSILON || targetLenSq < EPSILON)
+		{
+			rot[0] = 0.0f; rot[1] = 0.0f; rot[2] = 0.0f; rot[3] = 1.0f;
+			return rot;
+		}
+
+		rot[3] = sqrt(srcLenSq * targetLenSq) + dot; // w
+
+		float normSq = rot[0] * rot[0] + rot[1] * rot[1] + rot[2] * rot[2] + rot[3] * rot[3];
+		if (normSq < EPSILON)
+		{
+			// Vectors are (nearly) opposite, the rotation is ambiguous. As per JSR-184,
+			// pick a deterministic result: 180 degrees about any axis perpendicular to srcAxis.
+			if (abs(srcAxis[0]) > abs(srcAxis[2])) { rot[0] = -srcAxis[1]; rot[1] = srcAxis[0]; rot[2] = 0.0f; }
+			else                                   { rot[0] = 0.0f; rot[1] = -srcAxis[2]; rot[2] = srcAxis[1]; }
+			rot[3] = 0.0f;
+		}
+
+		return normalizeQuat(rot);
+	}
+
+	private static float copySign(float magnitude, float sign)
+	{
+	    boolean signBit = (Float.floatToIntBits(sign) & 0x80000000) != 0;
+	    float absVal = Math.abs(magnitude);
+	    return signBit ? -absVal : absVal;
+	}
+}

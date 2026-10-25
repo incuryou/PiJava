@@ -1,0 +1,11 @@
+{
+  "java/util/Hashtable": "a39e611ce5fe0188d08df9ca63cc24e999aca1e6096fa204b7bb902dd1b94dc4",
+  "java/lang/Character": "bbf2f96b9b6354e5304ec05c1a21581098b5e0c2011c1532202c99fa210da7c6",
+  "java/lang/Integer": "7e88b290b881d068b5b2c6777157effd1518d206d569efec7666b3eae980a771",
+  "java/lang/Long": "dcf0d461bfb93307cf8b3bf87809c8333741cb23f63b081e4e8e11b6dcf166e5",
+  "java/lang/Byte": "8bb8c4074178565365ffcc16767c1fe47ebd12acbf5ff9d4cd10ed5b5004899b",
+  "java/lang/Short": "0b61bf365511de78c41e08799861eb3ef70036542194279d344b029622d0097d",
+  "java/lang/Boolean": "c2d970852798f6a1d697ce58945ced7a0a3e735c9b250d847e88d2db492b9ff4",
+  "java/io/ByteArrayInputStream": "b05d2c58812727aaca9899d5ae775e721c508449a0c1072bedebc818f6b76f6c",
+  "java/io/DataInputStream": "db3afac9a529563e2a811b2154ddae8239c3249192399c33f874bb5cf79a64ec"
+}

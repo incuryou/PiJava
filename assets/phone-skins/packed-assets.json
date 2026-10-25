@@ -1,0 +1,98 @@
+{
+  "format": "J2SJ split baseline JPEG",
+  "results": [
+    {
+      "name": "phone-blue",
+      "source_sha256": "62714e27dd6df23c3184dde801bff686b9009282bec3982cb0518e978858d3fa",
+      "source_aperture": [
+        530,
+        37,
+        1137,
+        900
+      ],
+      "source_outer_bounds": [
+        0,
+        0,
+        1672,
+        941
+      ],
+      "viewport": [
+        400,
+        40,
+        480,
+        640
+      ],
+      "bytes": 121985,
+      "sha256": "3f655a57b449e2fe41f266c05c204092ba8c046ca10b0d1c5a7df9a01bca708c",
+      "jpeg_half_bytes": [
+        59277,
+        62688
+      ],
+      "quality": 80,
+      "subsampling": "4:4:4",
+      "packed_game_aperture_all_zero": true
+    },
+    {
+      "name": "phone-black",
+      "source_sha256": "4c4ea4570b60e2911ab206ad56e01b588867c7d3c4e3a469ee86383c4765f4e8",
+      "source_aperture": [
+        548,
+        114,
+        1119,
+        811
+      ],
+      "source_outer_bounds": [
+        25,
+        50,
+        1648,
+        892
+      ],
+      "viewport": [
+        400,
+        40,
+        480,
+        640
+      ],
+      "bytes": 75647,
+      "sha256": "f91a9e7af74ad232f7137e63dca1ceb3f547cbfbfec938846cd2ace221891613",
+      "jpeg_half_bytes": [
+        38243,
+        37384
+      ],
+      "quality": 80,
+      "subsampling": "4:4:4",
+      "packed_game_aperture_all_zero": true
+    },
+    {
+      "name": "phone-ivory",
+      "source_sha256": "d89bdca077a188999e33d844baa162afafadc8dfbe40e80c963be9bfbd4cf78a",
+      "source_aperture": [
+        549,
+        121,
+        1110,
+        817
+      ],
+      "source_outer_bounds": [
+        30,
+        45,
+        1645,
+        898
+      ],
+      "viewport": [
+        400,
+        40,
+        480,
+        640
+      ],
+      "bytes": 86165,
+      "sha256": "ef8c2eb0ab248d30a49801d17f9b2df8c57a971344fd7056a4be9e910c563487",
+      "jpeg_half_bytes": [
+        38537,
+        47608
+      ],
+      "quality": 80,
+      "subsampling": "4:4:4",
+      "packed_game_aperture_all_zero": true
+    }
+  ]
+}

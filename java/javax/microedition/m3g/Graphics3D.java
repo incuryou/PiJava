@@ -1,0 +1,2534 @@
+/*
+	This file is part of FreeJ2ME.
+
+	FreeJ2ME is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	FreeJ2ME is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with FreeJ2ME.  If not, see http://www.gnu.org/licenses/
+*/
+package javax.microedition.m3g;
+
+import java.util.Hashtable;
+
+import javax.microedition.lcdui.Graphics;
+
+
+
+public class Graphics3D
+{
+ private static native int[] _readTarget(Graphics target);
+ private static native int _targetWidth(Graphics target);
+ private static native int _targetHeight(Graphics target);
+ private static native void _writeTarget(Graphics target, int[] pixels, int clipX, int clipY, int clipW, int clipH);
+ private native boolean _clearToTarget(Background background, Image2D image, boolean imageTarget);
+ private static native boolean _applyTexture238(float invPw, int x, int y, int count);
+ private static native boolean _spanEnabled239();
+ private native boolean _rasterSpan239(int index, int x, int y, int count,
+     int defaultColor, int flags, int alphaThreshold,
+     float z, float zStep, float pw, float pwStep, float invPw, float invPwStep,
+     int fog, int fogStep, int fogRB, int fogG);
+ // Return values from the bounded native pixel body: last pixel BEFORE the
+ // caller's for-loop update. These are Java-owned scalars, never heap pointers.
+ float spanZ239, spanPw239, spanInvPw239;
+ int spanFog239;
+ private static native boolean _rowEnabled240();
+    private static native boolean _spriteEnabled241();
+    private native boolean _spriteRow241(Image2D image,int index,int count,int texRow,int left,int width,
+        float u,float du,int z,int flags,int alphaFactor,int threshold,int fogFactor,int fogRB,int fogG);
+ private native boolean _rasterRow240(int index, int x, int y, int count,
+     int defaultColor, int flags, int alphaThreshold,
+     float z, float zStep, float pw, float pwStep, float invPw, float invPwStep,
+     int fog, int fogStep, int fogRB, int fogG, boolean perspective,
+     int fogMode, float fogFarNorm, float invFogDiv, float fogDensity);
+ // POST-row fog state, including the final loop increment (unlike span239).
+ int rowFog240, rowFogStep240;
+
+ private native boolean _drawTriangle(Triangle triangle, Appearance appearance, int defaultColor, boolean hasColors, boolean hasTexture, boolean perspective);
+
+	/*
+	 * Depth buffer clear value: the maximum depth (1.0 in window coordinates)
+	 * mapped to the short-based buffer. Depth writes use a 32200 scale
+	 * for the depth range mapping but are clamped to 32767 to avoid
+	 * overflow when the camera far plane is large (e.g. 80 in
+	 * 3dConstructioCombat). Per JSR-184, clear() always resets to max
+	 * depth 1.0 regardless of the current depth range.
+	 */
+	private static final short DEPTH_CLEAR_VALUE = (short) 32767;
+
+	// Flag values for FJ2ME+ rendering overrides (bilinear, AA, dithering, etc)
+	public static final int MODE_FORCE_DISABLE = 0;
+	public static final int MODE_APP_CONTROLLED = 1;
+	public static final int MODE_FORCE_ENABLE  = 2;
+
+	// Pre-computed 1/N lookup table for span sizes 1 to 32. FreeJ2ME+ will
+	// allow configurable span sizes for piecewise linear perspective correction
+	// from 8 to 32 pixels in the future, so by precalculating these here at
+	// the start, we don't need to keep throwing fastReciprocals on the inner
+	// render loop.
+	private static final float[] INV_SPAN_TABLE = new float[33];
+
+	static
+	{
+		INV_SPAN_TABLE[0] = 0.0f;
+		for (int i = 1; i <= 32; i++)
+		{
+			INV_SPAN_TABLE[i] = M3GMath.fastReciprocal((float) i);
+		}
+	}
+
+	public static final int ANTIALIAS = 2;
+	public static final int DITHER = 4;
+	public static final int OVERWRITE = 16; // This is unused here, as SW rasterization gives us direct control over pixels
+	public static final int TRUE_COLOR = 8; // Also unused here, we always render at true color
+
+	public static final boolean SUPPORT_ANTIALIASING = true;
+	public static final boolean SUPPORT_TRUE_COLOR = true;
+	public static final boolean SUPPORT_DITHERING = true;
+	public static final boolean SUPPORT_MIPMAPPING = true;
+	public static final boolean SUPPORT_PERSPECTIVE_CORRECTION = true;
+	public static final boolean SUPPORT_LOCAL_CAMERA_LIGHTING = true;
+	public static final int MAX_LIGHTS = 32;
+	public static final int MAX_VIEWPORT_WIDTH = 1024;
+	public static final int MAX_VIEWPORT_HEIGHT = 1024;
+	public static final int MAX_VIEWPORT_DIMENSION = 1024;
+	public static final int MAX_TEXTURE_DIMENSION = 2048;
+	public static final int MAX_SPRITE_CROP_DIMENSION = 1024;
+	public static final int MAX_TRANSFORMS_PER_VERTEX = 16;
+	public static final int NUM_TEXTURE_UNITS = 4;
+	private static Hashtable properties;
+
+	// Render target
+	private Object target;
+
+	private static Graphics3D instance = null;
+
+	// Viewport
+	private int viewx;
+	private int viewy;
+	private int vieww;
+	private int viewh;
+
+	/*
+	 * Rendering-target state captured by bindTarget. As per JSR-184, viewport
+	 * coordinates are relative to the Graphics origin in effect when binding, and
+	 * all rendering is clipped against the clip rectangle in effect when binding;
+	 * later changes to the bound Graphics must not affect 3D rendering.
+	 */
+	private int originX, originY;
+	private int targetClipX, targetClipY, targetClipW, targetClipH;
+
+	/*
+	 * The visible part of the viewport (in viewport-local coordinates): its
+	 * intersection with the target clip rectangle. Rendering operations must not
+	 * touch pixels outside of it, but clipping to it must not affect projection.
+	 */
+	private int viewClipL, viewClipT, viewClipR, viewClipB;
+
+	private boolean depthEnabled;
+	private short[] depthBuffer;
+	private float near;
+	private float far;
+
+	private int hints;
+
+	private Camera currCam;
+	private Transform currCamTrans;
+	private Transform currCamTransInv;
+	private M3GVector<Light> currLights;
+	private M3GVector<Transform> currLightTrans;
+	private Transform camTr;
+
+	// Reusable rendering variables
+	static int canvasWidth, canvasHeight, paintPixel;
+	int[] rasterData;
+	final CompositingMode defaultCompositing;
+	Graphics3DPipelines.CompositingBlender compBlender;
+
+	// For Edge AA. This one is always assigned offsets in a cross pattern based
+	// on the target's width, so that AA sampling is more similar to MSAA's
+	// rotated grid sampling. The pattern offset in pixels from the center sample
+	// is as follows: [-1,-1], [1, -1], [-1,1], [1,1].
+	private final short[] AA_SAMPLE_OFFSETS = new short[4];
+
+	// Texturing
+	final Transform texcomptr;
+	final static boolean[] texRepeatS = new boolean[NUM_TEXTURE_UNITS];
+	final static boolean[] texRepeatT = new boolean[NUM_TEXTURE_UNITS];
+	final static float[] curS = new float[NUM_TEXTURE_UNITS];
+	final static float[] curT = new float[NUM_TEXTURE_UNITS];
+	final static float[] stepS = new float[NUM_TEXTURE_UNITS];
+	final static float[] stepT = new float[NUM_TEXTURE_UNITS];
+	final float[] texScaleBias = new float[4];
+	final float[] dsL_dy = new float[NUM_TEXTURE_UNITS];
+	final float[] dtL_dy = new float[NUM_TEXTURE_UNITS];
+	final float[] sL = new float[NUM_TEXTURE_UNITS];
+	final float[] tL = new float[NUM_TEXTURE_UNITS];
+	final float[] sBot = new float[NUM_TEXTURE_UNITS];
+	final float[] tBot = new float[NUM_TEXTURE_UNITS];
+	final float[] sMidL = new float[NUM_TEXTURE_UNITS];
+	final float[] tMidL = new float[NUM_TEXTURE_UNITS];
+	final float[] sMidR = new float[NUM_TEXTURE_UNITS];
+	final float[] tMidR = new float[NUM_TEXTURE_UNITS];
+	final float[] sTop = new float[NUM_TEXTURE_UNITS];
+	final float[] tTop = new float[NUM_TEXTURE_UNITS];
+	final float[][] coS = new float[NUM_TEXTURE_UNITS][3];
+	final float[][] coT = new float[NUM_TEXTURE_UNITS][3];
+	final static float[] sStepX = new float[NUM_TEXTURE_UNITS];
+	final static float[] sStepY = new float[NUM_TEXTURE_UNITS];
+	final static float[] tStepX = new float[NUM_TEXTURE_UNITS];
+	final static float[] tStepY = new float[NUM_TEXTURE_UNITS];
+	final static Graphics3DPipelines.TextureBlender[] texBlenders = new Graphics3DPipelines.TextureBlender[NUM_TEXTURE_UNITS];
+	final static Graphics3DPipelines.TextureWrapper[] texWrappers = new Graphics3DPipelines.TextureWrapper[NUM_TEXTURE_UNITS];
+	final static Graphics3DPipelines.MipmapMode[] mipModes = new Graphics3DPipelines.MipmapMode[NUM_TEXTURE_UNITS];
+	final static TextureFilter[] texFilter = new TextureFilter[NUM_TEXTURE_UNITS];
+	TexturingMode texMode;
+
+	final float[][] texVerts = new float[NUM_TEXTURE_UNITS][];
+	final Transform[] textr = new Transform[NUM_TEXTURE_UNITS];
+	static final Texture2D[] textures = new Texture2D[NUM_TEXTURE_UNITS];
+
+	// 3D rendering variables
+	static byte ACTIVE_TEXTURE_UNITS;
+	final Transform normalMatrix;
+	final Transform tr;
+	final Transform modelViewTr;
+	int yStart, yEnd;
+	float[] vertClip = null;
+	float[] eyePos = null;
+	float[] lightEyePos = null;
+	float[] lightEyeDir = null;
+	final float[] lightVec = new float[4];
+	final float[] coX = new float[3];
+	final float[] coZ = new float[3];
+	final float[] coW = new float[3];
+	float xTop, yTop, zTop;
+	float xMidL, yMid, zMidL;
+	float xBot, yBot, zBot;
+	float rHorizon, xMidR, zMidR;
+	float pwTop, pwMidL, pwBot, pwMidR;
+	static float dwdx, dwdy;
+
+	float rStepX = 0, gStepX = 0, bStepX = 0, aStepX = 0;
+	float rStepY = 0, gStepY = 0, bStepY = 0, aStepY = 0;
+	int deltaR = 0, deltaG = 0, deltaB = 0, deltaA = 0;
+	int stepA = 0, stepR = 0, stepG = 0, stepB = 0;
+
+	final float[] scaleBias = new float[4];
+
+	final Transform projectionMatrix = new Transform();
+	final int[] renderableTriangles = {0}; // Counter for visible triangles
+
+	// Retained mode temp variables, for layer (and blend) sorted renderOps. We
+	// start off with support for up to 64 objects, but grow as needed.
+
+	// [layer, blended?, scope] per op
+	private int[] renderIntData = new int[64 * 3];
+	// [geom/sprite, triangles, appearance, transform] per op
+	private Object[] renderObjData = new Object[64 * 4];
+	// Indirect sort index pointer array
+	private int[] renderIndices = new int[64];
+
+	/*
+	 * Effective alpha factor per queued render op, in 0-256 fixed point, and the
+	 * one currently being rasterized. JSR-184: "This can be used to fade groups
+	 * of meshes and sprites in and out", and getAlphaFactor() is explicitly the
+	 * local factor with "the alpha factors of any ancestors ... not multiplied
+	 * in", so the effective value is the product down the scene graph branch.
+	 */
+	private int[] renderAlphaData = new int[64];
+	private int currAlphaFactor = 256;
+	private int renderOpCount = 0;
+
+	public Graphics3D()
+	{
+		/*
+		 * The default depth range used is that of window coordinates, so 0 to near, and 1 to far
+		 * JSR-184 specifies that Normalized Device Coordinates (NDC) can also be used, which ranges from -1 to 1.
+		 */
+		this.defaultCompositing = new CompositingMode();
+		this.near = 0f;
+		this.far = 1f;
+		this.currCam = null;
+		this.currCamTrans = new Transform();
+		this.currCamTransInv = new Transform();
+		this.currLights = new M3GVector<Light>();
+		this.currLightTrans = new M3GVector<Transform>();
+		camTr = new Transform();
+		tr = new Transform();
+		modelViewTr = new Transform();
+		normalMatrix = new Transform();
+		texcomptr = new Transform();
+		for(int i = 0; i < NUM_TEXTURE_UNITS; i++) { textr[i] = new Transform(); }
+	}
+
+
+	public int addLight(Light light, Transform transform)
+	{
+		/* As per JSR-184, addLight() must throw a NullPointerException if no light is given */
+		if (light == null) { throw new NullPointerException("addLight() was called but no light object was provided."); }
+
+		// We specify a limit, but only because its required,
+		// and i really doubt any app will use more than 32
+		// lights per mesh. SO even if they do, just accept
+		// silently as it doesn't result in such a massive
+		// increase to runtime due to when they're calculated.
+		this.currLights.add(light);
+		this.currLightTrans.add(transform == null ? new Transform() : new Transform(transform));
+		return this.currLights.size() - 1;
+	}
+
+	public void bindTarget(Object target)
+	{
+		/* Calls the method below specifying the depth buffer as enabled, and no render hints, as per JSR-184. */
+		this.bindTarget(target, true, 0);
+	}
+
+	public void bindTarget(Object target, boolean depthBuffer, int hints)
+	{
+		/*
+		 * As per JSR-184, this function returns:
+		 * NullPointerException: If no render target is received as argument
+		 * IllegalStateException: If the current Graphics3D Object already has a render target
+		 */
+		if (target == null) { throw new NullPointerException("bindTarget() was called but no render target was provided."); }
+		if (this.target != null) { throw new IllegalStateException("This Graphics3D object already has a render target."); }
+
+		/* The target can be an Image2D Object, or a Graphics Object. */
+		if (target instanceof Image2D)
+		{
+			Image2D i2d = (Image2D) target;
+
+			/* JSR-184 specifies that Image2D render targets can only have RGB or RGBA format. */
+			if (i2d.getFormat() != Image2D.RGB && i2d.getFormat() != Image2D.RGBA)
+			{ throw new IllegalArgumentException("Received a 2D render target with invalid internal format"); }
+
+			/* It's a 2D image: the origin is its top-left corner, and the clip rectangle
+			 * comprises all of its pixels, as per JSR-184. */
+			canvasWidth = i2d.getWidth();
+			canvasHeight = i2d.getHeight();
+			rasterData = i2d.image;
+			originX = 0;
+			originY = 0;
+			targetClipX = 0;
+			targetClipY = 0;
+			targetClipW = canvasWidth;
+			targetClipH = canvasHeight;
+			this.viewx = 0;
+			this.viewy = 0;
+			this.vieww = canvasWidth;
+			this.viewh = canvasHeight;
+		}
+		else if (target instanceof Graphics)
+		{
+			Graphics pgrp = (Graphics) target;
+			// We can get the framebuffer directly from PlatformGraphics for less memory pressure
+			rasterData = _readTarget(pgrp);
+			canvasWidth = _targetWidth(pgrp);
+			canvasHeight = _targetHeight(pgrp);
+
+			/*
+			 * As per JSR-184, the viewport position is relative to the Graphics origin
+			 * in effect when calling bindTarget, and rendering is clipped against the
+			 * Graphics clip rectangle in effect at that same time. Capture both here.
+			 * The clip rectangle is stored in physical target pixels, limited to the
+			 * target's bounds.
+			 */
+			originX = pgrp.getTranslateX();
+			originY = pgrp.getTranslateY();
+			targetClipX = M3GMath.max(0, pgrp.getClipX() + originX);
+			targetClipY = M3GMath.max(0, pgrp.getClipY() + originY);
+			targetClipW = M3GMath.min(canvasWidth, pgrp.getClipX() + originX + pgrp.getClipWidth()) - targetClipX;
+			targetClipH = M3GMath.min(canvasHeight, pgrp.getClipY() + originY + pgrp.getClipHeight()) - targetClipY;
+
+			/* The default viewport covers the target clip rectangle. */
+			this.viewx = targetClipX - originX;
+			this.viewy = targetClipY - originY;
+			this.vieww = M3GMath.max(1, targetClipW);
+			this.viewh = M3GMath.max(1, targetClipH);
+		} else
+		{
+			/* If it is neither of those, throw an IllegalArgumentException as per JSR-184. */
+			throw new IllegalArgumentException("Received render target is neither an instance of Image2D nor Graphics");
+		}
+
+		/*
+		 * The final check performed before binding throws IllegalArgumentException if:
+		 * 1 - The render target's width is larger than the max supported.
+		 * 2 - The render target's height is taller than the max supported.
+		 * 3 - The render hint is an OR bitmask that matches with one or more of [ANTIALIAS, DITHER, TRUE_COLOR, OVERWRITE], or not zero.
+		 */
+		if (this.vieww > MAX_VIEWPORT_WIDTH || this.viewh > MAX_VIEWPORT_HEIGHT || (hints & ~(ANTIALIAS | DITHER | TRUE_COLOR | OVERWRITE)) != 0)
+			{ throw new IllegalArgumentException("Render target either has larger dimensions than supported, or the render hint is invalid"); }
+
+		this.target = target;
+		updateViewportClip();
+
+		// This is cheap enough to keep allocated for AA always:
+		AA_SAMPLE_OFFSETS[0] = (short) (-canvasWidth - 1); // Top-Left
+		AA_SAMPLE_OFFSETS[1] = (short) (-canvasWidth + 1); // Top-Right
+		AA_SAMPLE_OFFSETS[2] = (short) (canvasWidth - 1); // Bottom-Left
+		AA_SAMPLE_OFFSETS[3] = (short) (canvasWidth + 1); // Bottom-Right
+
+		/*
+		 * Depth values belong to physical render-target pixels and are indexed just
+		 * like the color buffer. JSR-184 allows the viewport to be freely repositioned
+		 * between bind and release (e.g. portal renderers narrowing the viewport per
+		 * room), and the depth of a pixel must survive those changes, so the viewport
+		 * dimensions must never determine the buffer's size or row stride.
+		 */
+		if (this.depthBuffer == null || this.depthBuffer.length < canvasWidth * canvasHeight)
+			{ this.depthBuffer = new short[canvasWidth * canvasHeight]; }
+		// Per JSR-184 (clear), the depth buffer clears to the maximum depth value
+		// (1.0) in window coordinates; the current depth range does not affect it.
+		M3GArrays.fill(this.depthBuffer, DEPTH_CLEAR_VALUE);
+		this.depthEnabled = depthBuffer;
+		this.hints = hints;
+	}
+
+	public void clear(Background background)
+	{
+		/*
+		 * As per JSR-184, this should throw IllegalStateException if this Graphics3D object does not
+		 * have a render target. However, some games and demos were written against lenient phone
+		 * implementations that treated clear() without a bound target as a silent no-op, and calling
+		 * it mid-paint would abort the whole frame here, so just warn and ignore the call instead.
+		 */
+		if (this.target == null)
+		{
+			;
+			return;
+		}
+
+		final int color = (background != null) ? background.getColor() : 0x00000000;
+		final boolean clearColor = (background == null) || background.isColorClearEnabled();
+		final boolean clearDepth = (background == null) || background.isDepthClearEnabled();
+
+		/*
+		 * If the background object is null:
+		 * Color buffer is cleared to transparent black
+		 * Depth buffer is cleared to the max depth value, 1.0.
+		 */
+
+		if (clearColor)
+		{
+			final Image2D bgImg = (background != null) ? background.getImage() : null;
+
+			if (this.target instanceof Graphics)
+			{
+				/*
+				 * As per JSR-184, clear() affects the visible part of the viewport: fill it
+				 * with the background color first. The Background crop rectangle is a sampling
+				 * window into the background image, NOT the destination rectangle. Painting
+				 * the framebuffer directly keeps this independent from any origin or clip
+				 * changes made to the bound Graphics after bindTarget.
+				 */
+				final int paintColor = 0xFF000000 | color;
+				for (int py = viewClipT; py < viewClipB; py++)
+				{
+					final int rowStart = (originY + viewy + py) * canvasWidth + originX + viewx + viewClipL;
+					M3GArrays.fill(rasterData, rowStart, rowStart + (viewClipR - viewClipL), paintColor);
+				}
+
+				if (bgImg != null) { clearToTarget(background, bgImg, false); }
+			}
+			else if (this.target instanceof Image2D)
+			{
+				Image2D i2d = (Image2D) this.target;
+
+				if(bgImg != null && bgImg.getFormat() != i2d.getFormat())
+					{ throw new IllegalArgumentException("The background image to be cleared does not have the same format as the render target."); }
+
+				// Clear with color first
+				for (int py = viewClipT; py < viewClipB; py++)
+				{
+					int screenY = py + viewy;
+					for (int px = viewClipL; px < viewClipR; px++)
+					{
+						i2d.setPixel(px + viewx, screenY, color);
+					}
+				}
+
+				if (bgImg != null) { clearToTarget(background, bgImg, true); }
+			}
+		}
+
+		/* The depth buffer is likewise cleared only inside the visible viewport. */
+		if (clearDepth)
+		{
+			// Per JSR-184, the depth buffer always clears to the maximum depth
+			// value (1.0); the current depth range does not affect the clear.
+			final short farDepth = DEPTH_CLEAR_VALUE;
+			for (int py = viewClipT; py < viewClipB; py++)
+			{
+				final int rowStart = (originY + viewy + py) * canvasWidth + originX + viewx + viewClipL;
+				M3GArrays.fill(this.depthBuffer, rowStart, rowStart + (viewClipR - viewClipL), farDepth);
+			}
+		}
+	}
+
+	public Camera getCamera(Transform transform)
+	{
+		if (transform != null) { transform.set(this.currCamTrans); }
+		return this.currCam;
+	}
+
+	public float getDepthRangeFar() { return far; }
+
+	public float getDepthRangeNear() { return near;}
+
+	public int getHints() { return hints; }
+
+	public static Graphics3D getInstance()
+	{
+		if( instance == null) { instance = new Graphics3D(); }
+		return instance;
+	}
+
+	public Light getLight(int index, Transform transform)
+	{
+		/* As per JSR-184, throw IndexOutOfBoundsException if the requested light index is out of bounds. */
+		if (index < 0 || index > this.currLights.size()) { throw new IndexOutOfBoundsException("The received light index is out of bounds."); }
+
+		/* If a transform variable is received, use it to store the requested light's transform. */
+		if (transform != null) { transform.set(this.currLightTrans.get(index)); }
+
+		return this.currLights.get(index);
+	}
+
+	/* This is supposed to include nulls, so just return the size */
+	public int getLightCount() { return this.currLights.size(); }
+
+	public static Hashtable getProperties()
+	{
+		if (Graphics3D.properties != null)
+			return Graphics3D.properties;
+
+		Hashtable p = new Hashtable();
+		p.put("supportAntialiasing", SUPPORT_ANTIALIASING);
+		p.put("supportTrueColor", SUPPORT_TRUE_COLOR);
+		p.put("supportDithering", SUPPORT_DITHERING);
+		p.put("supportMipmapping", SUPPORT_MIPMAPPING);
+		p.put("supportPerspectiveCorrection", SUPPORT_PERSPECTIVE_CORRECTION);
+		p.put("supportLocalCameraLighting", SUPPORT_LOCAL_CAMERA_LIGHTING);
+		p.put("maxLights", MAX_LIGHTS);
+		p.put("maxViewportWidth", MAX_VIEWPORT_WIDTH);
+		p.put("maxViewportHeight", MAX_VIEWPORT_HEIGHT);
+		p.put("maxViewportDimension", MAX_VIEWPORT_DIMENSION);
+		p.put("maxTextureDimension", MAX_TEXTURE_DIMENSION);
+		p.put("maxSpriteCropDimension", MAX_SPRITE_CROP_DIMENSION);
+		p.put("maxTransformsPerVertex", MAX_TRANSFORMS_PER_VERTEX);
+		p.put("numTextureUnits", NUM_TEXTURE_UNITS);
+		Graphics3D.properties = p;
+
+		return Graphics3D.properties;
+	}
+
+	public static int getTextureUnitCount() { return NUM_TEXTURE_UNITS; }
+
+	public Object getTarget() { return this.target; }
+
+	public int getViewportHeight() { return viewh; }
+
+	public int getViewportWidth() { return vieww; }
+
+	public int getViewportX() { return viewx; }
+
+	public int getViewportY() { return viewy; }
+
+	public boolean isDepthBufferEnabled() { return this.depthEnabled; }
+
+	public void releaseTarget()
+	{
+		/* Ignore the call if no render target is bound. */
+		if(this.target != null)
+		{
+			/* If there is a render target, release it */
+			if(this.target instanceof Graphics) _writeTarget((Graphics)this.target, rasterData, targetClipX, targetClipY, targetClipW, targetClipH);
+			this.target = null;
+		}
+	}
+
+	public void render(World world)
+	{
+		/* As per JSR-184, throw NullPointerException if the received world is null. */
+		if (world == null) { throw new NullPointerException("render(world) was called but no world was provided."); }
+
+		/*
+		 * Also per JSR-184, this should throw IllegalStateException when there's no render target
+		 * yet. Lenient no-op instead (see the comment in clear() for the rationale).
+		 */
+		if (this.target == null)
+		{
+			;
+			return;
+		}
+
+		Camera worldCamera = world.getActiveCamera();
+
+		if(worldCamera == null) { throw new IllegalStateException("Cannot render a world that has no active camera."); }
+
+		camTr.setIdentity();
+		if(!worldCamera.getTransformTo(world, camTr)) { throw new IllegalStateException("Active camera is not in world."); }
+
+		/* Clear the background first */
+		clear(world.getBackground());
+
+		setCamera(worldCamera, camTr);
+		resetLights();
+		positionLights(world, world);
+
+		render((Group) world, null);
+	}
+
+	public void render(Node node, Transform transform)
+	{
+		/* As per JSR-184, throw NullPointerException if no node is received. */
+		if(node == null) { throw new NullPointerException("render() was called but no node was provided."); }
+
+		/*
+		 * Also per JSR-184, this should throw IllegalStateException when there's no camera or render
+		 * target available. Lenient no-op instead (see the comment in clear() for the rationale).
+		 */
+		if (this.target == null || this.currCam == null)
+		{
+			;
+			return;
+		}
+
+		/* Also per JSR-184, throw IllegalStateException if if node is not a Sprite3D, Mesh, or Group Object. */
+		if (!(node instanceof Mesh || node instanceof Sprite3D || node instanceof Group)) { throw new IllegalArgumentException("Node is not an instance of any of the following: Sprite3D, Mesh, Group"); }
+
+		renderOpCount = 0;
+		queueNode(node, transform, 256);
+		flushRenderQueue();
+	}
+
+	public void render(VertexBuffer vertices, IndexBuffer triangles, Appearance appearance, Transform transform)
+	{ this.render(vertices, triangles, appearance, transform, -1); }
+
+	public void render(VertexBuffer vertices, IndexBuffer triangles, Appearance appearance, Transform transform, int scope)
+	{ renderSubmesh(vertices, triangles, appearance, transform, scope, 256); }
+
+	private void renderSubmesh(VertexBuffer vertices, IndexBuffer triangles, Appearance appearance, Transform transform, int scope, int alphaFactor)
+	{
+		this.currAlphaFactor = alphaFactor;
+
+		/* As per JSR-184, if vertices, triangles or appearence are null, throw a NullPointerException. */
+		if (vertices == null || triangles == null || appearance == null) { throw new NullPointerException("Tried to render a submesh with incomplete info."); }
+
+		/*
+		 * Also per JSR-184, this should throw IllegalStateException if the application tries to render
+		 * without having set up a render target or camera beforehand. Lenient no-op instead (see the
+		 * comment in clear() for the rationale).
+		 */
+		if (this.target == null || this.currCam == null)
+		{
+			;
+			return;
+		}
+
+		/*
+		 * JSR-184 scope culling: geometry is only rendered if its scope intersects the
+		 * camera's scope. Games hide nodes by calling setScope(0) on them (e.g. pooled
+		 * objects parked inside a Group), so ignoring this draws them all at the origin.
+		 */
+		if ((scope & this.currCam.getScope()) == 0) { return; }
+
+		final int projType = this.currCam.getProjection((float []) null);
+
+		final CompositingMode compositingMode = appearance.getCompositingMode() != null ? appearance.getCompositingMode() : this.defaultCompositing;
+		compBlender = getCompositingBlender(compositingMode.getBlending());
+		final Material material = appearance.getMaterial();
+		final PolygonMode pmode = appearance.getPolygonMode();
+		final int shadingMode = (pmode != null) ? pmode.getShading() : PolygonMode.SHADE_SMOOTH;
+		final int cullingMode = (pmode != null) ? pmode.getCulling() : PolygonMode.CULL_BACK;
+		final int windingOrder = (pmode != null) ? pmode.getWinding() : PolygonMode.WINDING_CCW;
+		final boolean twoSidedLighting = (pmode != null) && pmode.isTwoSidedLightingEnabled();
+		final boolean localCameraLight = (pmode != null) && pmode.isLocalCameraLightingEnabled();
+		// these ones can be overridden by FJ2ME+
+		boolean doAntiAlias = (this.hints & ANTIALIAS) != 0;
+		boolean perspectiveCorrection = (pmode != null) && pmode.isPerspectiveCorrectionEnabled();
+
+		// Set up fog properties
+		final Fog fog = appearance.getFog();
+		final float invFogDiv = fog != null ? M3GMath.fastReciprocal(fog.getFarDistance() - fog.getNearDistance()) : 0.0f;
+
+		perspectiveCorrection = fog != null || (perspectiveCorrection && (projType != Camera.PARALLEL)); // fog usage enables it
+
+
+		// We'll need the projection matrix for the next transformations
+		this.currCam.getProjection(projectionMatrix);
+
+		// This one is also used by all position calculations
+		final VertexArray vertPos = vertices.getPositions(scaleBias);
+		final int vertLen = vertPos.getVertexCount() << 2; // 4 * vertexCount.
+
+		// Setup texture units first, if we have to use any. Texturing is done
+		// by layer, with each texture unit blending on top of another.
+		boolean hasTexture = false;
+
+		ACTIVE_TEXTURE_UNITS = 0;
+		if (true)
+		{
+			for (int i = 0; i < NUM_TEXTURE_UNITS; i++)
+			{
+				Texture2D t = appearance.getTexture(i);
+				VertexArray texCoords = (t != null) ? vertices.getTexCoords(i, texScaleBias) : null;
+
+				if (t != null && texCoords != null)
+				{
+					// We have at least one texture, so texturing must be done.
+					hasTexture = true;
+
+					// joint-increment ACTIVE_TEXTURE_UNITS alongside assignment.
+					int unit = ACTIVE_TEXTURE_UNITS++;
+					textures[unit] = t;
+					texRepeatS[unit] = (t.getWrappingS() == Texture2D.WRAP_REPEAT);
+					texRepeatT[unit] = (t.getWrappingT() == Texture2D.WRAP_REPEAT);
+
+					textr[unit].setIdentity();
+					if (t.getImage() != null)
+					{
+						textr[unit].postScale(t.getImage().getWidth(), t.getImage().getHeight(), 1.0f);
+					}
+
+					texcomptr.setIdentity();
+					t.getCompositeTransform(texcomptr);
+					textr[unit].postMultiply(texcomptr);
+
+					textr[unit].postTranslate(texScaleBias[1], texScaleBias[2], texScaleBias[3]);
+					textr[unit].postScale(texScaleBias[0], texScaleBias[0], texScaleBias[0]);
+
+					if (texVerts[unit] == null || vertLen > texVerts[unit].length)
+						{ texVerts[unit] = new float[vertLen]; }
+
+					// Transform texture coordinates into NDC
+					textr[unit].transform(texCoords, texVerts[unit], true);
+
+					mipModes[unit] = getMipmapMode(t.getLevelFilter());
+
+					// Cache the texture blend and wrapping mode here as well.
+					texBlenders[unit] = getTextureBlender(((textures[unit].getBlending() & 7) << 3) |
+						(textures[unit].getImage().getFormat() & 7));
+
+					texWrappers[unit] = getCoordWrapper(t.getImage().getWidth(), t.getImage().getHeight(),
+						texRepeatS[unit], texRepeatT[unit], t.isNPOT());
+				}
+			}
+		}
+		for (int unit = ACTIVE_TEXTURE_UNITS; unit < NUM_TEXTURE_UNITS; unit++) { textures[unit] = null; texVerts[unit] = null; }
+		// Texturing mode we'll use per-pixel, saves some really complex
+		// branching in there, depending on the case.
+		texMode = getTexturingMode();
+
+		// Done with texture transforms, next up is preparing normals for
+		// lighting calculations
+
+		final VertexArray vertNorms = vertices.getNormals();
+
+		modelViewTr.setIdentity();
+
+		// Apply the inverse of the camera's transform to the mesh (Eye/View Space)
+		if (this.currCamTransInv != null) { modelViewTr.postMultiply(this.currCamTransInv); }
+
+		// Transform mesh from local space to world space
+		// Receiving a null "transform" indicates that the identity matrix must
+		// be used, which just means we don't need to postMultiply.
+		if (transform != null) { modelViewTr.postMultiply(transform); }
+
+		if (vertNorms != null && material != null)
+		{
+			normalMatrix.set(modelViewTr);
+
+			/*
+			 * JSR-184 states that lighting is undefined for a non-invertible
+			 * local-to-camera transform, and since undefined means we can treat
+			 * this any way we want, we'll set the matrix as the identity and
+			 * soldier onwards.
+			 */
+			try
+			{
+				normalMatrix.invert();
+				normalMatrix.transpose();
+			}
+			catch (ArithmeticException ae)
+			{
+				;
+				normalMatrix.setIdentity();
+			}
+
+			tr.set(modelViewTr);
+			tr.postTranslate(scaleBias[1], scaleBias[2], scaleBias[3]);
+			tr.postScale(scaleBias[0], scaleBias[0], scaleBias[0]);
+
+			if (eyePos == null || vertLen > eyePos.length)
+				{ eyePos = new float[vertLen]; }
+
+			tr.transform(vertPos, eyePos, true);
+		}
+
+		// Normals done, so set up the lights.
+		final int numLights = (this.currLights != null) ? this.currLights.size() : 0;
+
+		if (lightEyePos == null || lightEyePos.length < (numLights << 2))
+		{
+			lightEyePos = new float[numLights << 2];
+			lightEyeDir = new float[numLights << 2];
+		}
+
+		for (int i = 0; i < numLights; i++)
+		{
+			Light light = this.currLights.get(i);
+			Transform lightTrans = this.currLightTrans.get(i);
+
+			// Compute Light World-to-Eye Transform
+			tr.setIdentity();
+			if (this.currCamTransInv != null) { tr.postMultiply(this.currCamTransInv); }
+			if (lightTrans != null) { tr.postMultiply(lightTrans); }
+
+			// Light Position in Eye Space
+			lightVec[0] = 0.0f;
+			lightVec[1] = 0.0f;
+			lightVec[2] = 0.0f;
+			lightVec[3] = 1.0f;
+			tr.transform(lightVec);
+			System.arraycopy(lightVec, 0, lightEyePos, i << 2, 4);
+
+			// Light Direction in Eye Space (M3G's default direction is
+			// [0, 0, -1, 0] due to negative Z)
+			lightVec[0] = 0.0f;
+			lightVec[1] = 0.0f;
+			lightVec[2] = -1.0f;
+			lightVec[3] = 0.0f;
+			tr.transform(lightVec);
+
+			// We also need to normalize the light direction vector.
+			float dirLen = M3GMath.fastInvSqrt(lightVec[0]*lightVec[0] + lightVec[1]*lightVec[1] +
+				lightVec[2]*lightVec[2]);
+			if (dirLen > 0.0f)
+			{
+				lightVec[0] *= dirLen;
+				lightVec[1] *= dirLen;
+				lightVec[2] *= dirLen;
+			}
+			lightVec[3] = 0.0f;
+			System.arraycopy(lightVec, 0, lightEyeDir, i << 2, 4);
+		}
+
+
+		// Now that we're done with textures, normals, and lights we transform
+		// the vertices and build the triangles themselves. Follows most of the
+		// same transforms as the normal step, except this time we go all the
+		// way to screen space and account for scaling.
+
+		tr.setIdentity();
+
+		// Apply projection matrix (Clip space)
+		tr.postMultiply(projectionMatrix);
+
+		// Transform mesh from local space to world space
+		// Receiving a null "transform" indicates that the identity matrix must
+		// be used, which just means we don't need to postMultiply.
+		tr.postMultiply(modelViewTr);
+
+		// Scale and translate mesh (P = (S * V) + B) in local space
+		tr.postTranslate(scaleBias[1], scaleBias[2], scaleBias[3]);
+		tr.postScale(scaleBias[0], scaleBias[0], scaleBias[0]);
+
+		// Transform vertex positions
+		if(vertClip == null || vertLen > vertClip.length)
+			{ vertClip = new float[vertLen]; }
+		tr.transform(vertPos, vertClip, true);
+
+		// Now with texture and vertex coordinates transformed, we generate the
+		// actual geometry, clip/cull it, and move it to NDC.
+
+
+		// Create Triangle objects (fromVertAndTris already does culling and clipping)
+		final Triangle[] trisScreen = Triangle.fromVertAndTris(
+			// Position and texture vertex data
+			vertClip, texVerts,
+			// Material and shading
+			material, shadingMode, twoSidedLighting, localCameraLight,
+			// Normal data
+			eyePos, vertNorms, normalMatrix,
+			// Lights
+			this.currLights, lightEyePos, lightEyeDir, scope,
+			// IndexArray, clipping, winding order and perspectiveCorrection
+			triangles.getIndexArray(), renderableTriangles, cullingMode, vertices,
+			windingOrder == PolygonMode.WINDING_CW, perspectiveCorrection, doAntiAlias);
+
+		// At this point the triangles in `trisScreen` are actually
+		// projected to Normalized Device Coordinates, but they will be tranformed
+		// to Screen space in-place, hence the name.
+
+		// Reset transform
+		tr.setIdentity();
+
+		for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++) { textr[i].setIdentity(); }
+
+
+		// Fit to viewport. Notice that Z is scaled slightly below the max limits
+		// for shorts (which is -32768, 32767), this is to make sure the
+		// multiplied Z values will always be in range and never overflow,
+		// saving us the need to clamp it for every pixel draw.
+		//
+		// Depth follows JSR-184 setDepthRange: zw = 0.5*(far-near)*(zndc+1) + near,
+		// scaled by 32200 into the short depth buffer. Getting this mapping right
+		// matters: games split the depth buffer into disjoint bands (e.g. portal
+		// renderers giving the world and each portal view their own range), and
+		// that only works if both the scale AND the near offset are applied.
+		final float zScale = 0.5f * (this.far - this.near) * 32200.0f;
+		if (zScale != 0.0f)
+		{
+			tr.postScale(vieww * 0.5f, -viewh * 0.5f, zScale);
+			tr.postTranslate(1f, -1f, 1f + (this.near * 32200.0f) / zScale);
+		}
+		else
+		{
+			// Degenerate range (near == far): depth collapses to a constant.
+			tr.postScale(vieww * 0.5f, -viewh * 0.5f, 1.0f);
+			tr.postTranslate(1f, -1f, this.near * 32200.0f);
+		}
+
+		// -> Screen space
+
+		// Perform viewport transform only on renderable triangles (saves an Arrays.copyOf call)
+		Triangle.transform(trisScreen, renderableTriangles[0], tr, textr, hasTexture);
+
+		if (renderableTriangles[0] == 0) { return; }
+		boolean hasColors = trisScreen[0].hasVertexColors(); // If one triangle has colors, all will have.
+
+		final boolean usesDepth = this.depthEnabled && compositingMode.isDepthTestEnabled() && isDepthBufferEnabled();
+		final boolean usesDepthWrite = usesDepth && compositingMode.isDepthWriteEnabled();
+		final float depthUnits = compositingMode.getDepthOffsetUnits();
+		final float depthFactor = compositingMode.getDepthOffsetFactor();
+		final boolean hasDepthOffset = usesDepth && (depthFactor != 0.0f || depthUnits != 0.0f);
+		float depthOffset = 0.0f;
+		final int defVertColor = vertices.getDefaultColor();
+
+		final boolean colorEnabled = compositingMode.isColorWriteEnabled();
+		final int alphaThreshold = (int) (compositingMode.getAlphaThreshold() * 255);
+
+		if (hasTexture)
+		{
+			for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+			{
+				texFilter[i] = getTextureFilter(textures[i].getImageFilter() == Texture2D.FILTER_LINEAR);
+			}
+		}
+
+		for (int tri_id = 0; tri_id < renderableTriangles[0]; tri_id++)
+		{
+			final Triangle tri = trisScreen[tri_id];
+			if (_drawTriangle(tri, appearance, defVertColor, hasColors, hasTexture, perspectiveCorrection)) { continue; }
+
+			final float xA = tri.xA(), xB = tri.xB(), xC = tri.xC();
+			final float yA = tri.yA(), yB = tri.yB(), yC = tri.yC();
+
+			final float dxB = xB - xA, dyB = yB - yA;
+			final float dxC = xC - xA, dyC = yC - yA;
+			final float denominator = dxB * dyC - dxC * dyB;
+
+			// Degenerate triangle? Skip it.
+			if (denominator > -1e-6f && denominator < 1e-6f) { continue; }
+
+
+			// Check for zero height triangles or out of bounds ones before
+			// doing any of the more expensive math below.
+			int top = 0, mid = 1, bot = 2;
+			yTop = yA; yMid = yB; yBot = yC;
+
+			if (yMid < yTop) { int t = top; top = mid; mid = t; float yt = yTop; yTop = yMid; yMid = yt; }
+			if (yBot < yTop) { int t = top; top = bot; bot = t; float yt = yTop; yTop = yBot; yBot = yt; }
+			if (yBot < yMid) { int t = mid; mid = bot; bot = t; float yt = yMid; yMid = yBot; yBot = yt; }
+
+			if ((yBot - yTop) < 1e-6f || yBot < viewClipT || yTop > viewClipB) { continue; }
+
+			// Survived the check above? Proceed to depth and DDA setups.
+			coX[0] = xA; coX[1] = xB; coX[2] = xC;
+			coZ[0] = tri.zA();  coZ[1] = tri.zB();  coZ[2] = tri.zC();
+			coW[0] = tri.iwA(); coW[1] = tri.iwB(); coW[2] = tri.iwC();
+
+			final float invDet = M3GMath.fastReciprocal(denominator);
+
+			if (hasDepthOffset)
+			{
+				final float dz10 = coZ[1] - coZ[0];
+				final float dz20 = coZ[2] - coZ[0];
+
+				final float dzdx = (dz10 * dyC - dz20 * dyB) * invDet;
+				final float dzdy = (dxB * dz20 - dxC * dz10) * invDet;
+
+				final float m = M3GMath.sqrt(dzdx * dzdx + dzdy * dzdy);
+				depthOffset = (depthFactor * m) + (depthUnits * 1e-7f);
+			}
+
+			// Let's precalculate uv derivatives for mipmapping. Skips having
+			// to do expensive calculations inside the inner render loops.
+			if (hasTexture)
+			{
+				for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+				{
+					coS[i][0] = tri.sA(i); coS[i][1] = tri.sB(i); coS[i][2] = tri.sC(i);
+					coT[i][0] = tri.tA(i); coT[i][1] = tri.tB(i); coT[i][2] = tri.tC(i);
+				}
+
+				dwdx = 0.0f;
+				dwdy = 0.0f;
+
+				if (perspectiveCorrection)
+				{
+					final float dwB = coW[1] - coW[0];
+					final float dwC = coW[2] - coW[0];
+
+					dwdx = (dwB * dyC - dwC * dyB) * invDet;
+					dwdy = (dwC * dxB - dwB * dxC) * invDet;
+
+					// For perspective correction, we need the actual W of
+					// each vertex as well.
+					final float wA = tri.wA(), wB = tri.wB(), wC = tri.wC();
+
+					for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+					{
+						final float swA = coS[i][0] * wA, swB = coS[i][1] * wB, swC = coS[i][2] * wC;
+						final float twA = coT[i][0] * wA, twB = coT[i][1] * wB, twC = coT[i][2] * wC;
+
+						final float dswB = swB - swA, dswC = swC - swA;
+						final float dtwB = twB - twA, dtwC = twC - twA;
+
+						sStepX[i] = (dswB * dyC - dswC * dyB) * invDet; // d(s/w)/dx
+						tStepX[i] = (dtwB * dyC - dtwC * dyB) * invDet; // d(t/w)/dx
+
+						sStepY[i] = (dswC * dxB - dswB * dxC) * invDet; // d(s/w)/dy
+						tStepY[i] = (dtwC * dxB - dtwB * dxC) * invDet; // d(t/w)/dy
+					}
+				}
+				else
+				{
+					for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+					{
+						final float dsB = coS[i][1] - coS[i][0], dsC = coS[i][2] - coS[i][0];
+						final float dtB = coT[i][1] - coT[i][0], dtC = coT[i][2] - coT[i][0];
+
+						sStepX[i] = (dsB * dyC - dsC * dyB) * invDet; // ds/dx
+						tStepX[i] = (dtB * dyC - dtC * dyB) * invDet; // dt/dx
+
+						sStepY[i] = (dsC * dxB - dsB * dxC) * invDet; // ds/dy
+						tStepY[i] = (dtC * dxB - dtB * dxC) * invDet; // dt/dy
+					}
+				}
+			}
+
+			// Calculate the starting vertex color with the barycentric of the
+			// triangle. Then at each scanline we only need to determine the
+			// left and right color spans with quick add and mult operations, and
+			// at the inner pixel loop, all we need is a simple addition.
+			if (hasColors)
+			{
+				final int colorA = tri.colorA();
+				final int colorB = tri.colorB();
+				final int colorC = tri.colorC();
+
+				// To properly use additions in the triangle render loops
+				// below, we need to calculate the derivatives for each
+				// color channel, on each axis.
+				final float dR_B = ((colorB >> 16) & 0xFF) - ((colorA >> 16) & 0xFF);
+				final float dR_C = ((colorC >> 16) & 0xFF) - ((colorA >> 16) & 0xFF);
+				final float dG_B = ((colorB >> 8) & 0xFF)  - ((colorA >> 8) & 0xFF);
+				final float dG_C = ((colorC >> 8) & 0xFF)  - ((colorA >> 8) & 0xFF);
+				final float dB_B = (colorB & 0xFF)         - (colorA & 0xFF);
+				final float dB_C = (colorC & 0xFF)         - (colorA & 0xFF);
+				final float dA_B = ((colorB >>> 24) & 0xFF) - ((colorA >>> 24) & 0xFF);
+				final float dA_C = ((colorC >>> 24) & 0xFF) - ((colorA >>> 24) & 0xFF);
+
+				rStepX = (dR_B * dyC - dR_C * dyB) * invDet;
+				gStepX = (dG_B * dyC - dG_C * dyB) * invDet;
+				bStepX = (dB_B * dyC - dB_C * dyB) * invDet;
+				aStepX = (dA_B * dyC - dA_C * dyB) * invDet;
+
+				rStepY = (dR_C * dxB - dR_B * dxC) * invDet;
+				gStepY = (dG_C * dxB - dG_B * dxC) * invDet;
+				bStepY = (dB_C * dxB - dB_B * dxC) * invDet;
+				aStepY = (dA_C * dxB - dA_B * dxC) * invDet;
+
+				stepA = (int) (aStepX * 65536.0f);
+				stepR = (int) (rStepX * 65536.0f);
+				stepG = (int) (gStepX * 65536.0f);
+				stepB = (int) (bStepX * 65536.0f);
+			}
+
+			// Assign ordered vertex attributes based on their determined order
+			xTop = coX[top]; xMidL = coX[mid]; xBot = coX[bot];
+			zTop = coZ[top]; zMidL = coZ[mid]; zBot = coZ[bot];
+			pwTop = coW[top]; pwMidL = coW[mid]; pwBot = coW[bot];
+
+			if (hasTexture)
+			{
+				for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+				{
+					sTop[i] = coS[i][top]; sMidL[i] = coS[i][mid]; sBot[i] = coS[i][bot];
+					tTop[i] = coT[i][top]; tMidL[i] = coT[i][mid]; tBot[i] = coT[i][bot];
+				}
+			}
+
+			// Calculate Triangle's right horizon midpoints
+			rHorizon = (yMid - yTop) * M3GMath.fastReciprocal(yBot - yTop);
+			xMidR = xTop + rHorizon * (xBot - xTop);
+			zMidR = zTop + rHorizon * (zBot - zTop);
+			pwMidR = pwTop + rHorizon * (pwBot - pwTop);
+
+			if (hasTexture)
+			{
+				for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+				{
+					sMidR[i] = sTop[i] + rHorizon * (sBot[i] - sTop[i]);
+					tMidR[i] = tTop[i] + rHorizon * (tBot[i] - tTop[i]);
+				}
+			}
+
+			// Swap Midpoints if triangle left > triangle right
+			if (xMidL > xMidR)
+			{
+				float temp;
+				temp = xMidL; xMidL = xMidR; xMidR = temp;
+				temp = zMidL; zMidL = zMidR; zMidR = temp;
+				temp = pwMidL; pwMidL = pwMidR; pwMidR = temp;
+
+				if (hasTexture)
+				{
+					for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+					{
+						temp = sMidL[i]; sMidL[i] = sMidR[i]; sMidR[i] = temp;
+						temp = tMidL[i]; tMidL[i] = tMidR[i]; tMidR[i] = temp;
+					}
+				}
+			}
+
+			// 0 width triangles get skipped entirely too.
+			if (xMidR - xMidL < M3GMath.EPSILON) { continue; }
+
+			float invMidSpan = M3GMath.fastReciprocal(xMidR - xMidL);
+
+			// Draw both halves of the triangle, starting with the top one. The scanline
+			// range is clamped to the visible viewport, which discards clipped pixels
+			// without changing the viewport mapping.
+			yStart = M3GMath.max((int) (yTop + 0.999999f), viewClipT);
+			yEnd = M3GMath.min((int) (yMid + 0.999999f), viewClipB);
+
+			if (yStart < yEnd)
+			{
+				renderTriangleHalf(defVertColor, 0, yStart, yEnd, tri, hasColors, hasTexture, fog, invFogDiv,
+					alphaThreshold, usesDepth, usesDepthWrite, colorEnabled, depthOffset,
+					perspectiveCorrection, invMidSpan);
+			}
+
+			yStart = M3GMath.max((int) (yMid + 0.999999f), viewClipT);
+			yEnd = M3GMath.min((int) (yBot + 0.999999f), viewClipB);
+
+			if (yStart < yEnd)
+			{
+				renderTriangleHalf(defVertColor, 1, yStart, yEnd, tri, hasColors, hasTexture, fog, invFogDiv,
+					alphaThreshold, usesDepth, usesDepthWrite, colorEnabled, depthOffset,
+					perspectiveCorrection, invMidSpan);
+			}
+		}
+
+		if (doAntiAlias)
+		{
+			for (int tri_id = 0; tri_id < renderableTriangles[0]; tri_id++)
+			{
+				final Triangle tri = trisScreen[tri_id];
+			if (_drawTriangle(tri, appearance, defVertColor, hasColors, hasTexture, perspectiveCorrection)) { continue; }
+
+				// TODO: Edge deduplication here. Right now this iterates
+				// on ALL edges, even shared ones (we could use the index buffer
+				// for this).
+				final float xA = tri.xA(), xB = tri.xB(), xC = tri.xC();
+				final float yA = tri.yA(), yB = tri.yB(), yC = tri.yC();
+
+				// Skip degenerate triangles
+				final float dxB = xB - xA, dyB = yB - yA;
+				final float dxC = xC - xA, dyC = yC - yA;
+				final float denominator = dxB * dyC - dxC * dyB;
+				if (denominator > -1e-6f && denominator < 1e-6f) { continue; }
+
+				final float zA = tri.zA(), zB = tri.zB(), zC = tri.zC();
+
+				if (tri.edgeABBoundary) { drawAALine(xA, yA, zA, xB, yB, zB, usesDepth); }
+				if (tri.edgeBCBoundary) { drawAALine(xB, yB, zB, xC, yC, zC, usesDepth); }
+				if (tri.edgeCABoundary) { drawAALine(xC, yC, zC, xA, yA, zA, usesDepth); }
+			}
+		}
+	}
+
+	private void positionLights(World world, Group group)
+	{
+		for (int i = 0; i < group.getChildCount(); ++i)
+		{
+			tr.setIdentity();
+			Node node = group.getChild(i);
+
+			try
+			{
+				if (node instanceof Light && node.getTransformTo(world, tr))
+					{ addLight((Light) node, tr); }
+				else if (node instanceof Group)
+					{ positionLights(world, (Group) node);}
+				else if (node instanceof SkinnedMesh)
+					/* A SkinnedMesh skeleton can hold lights in its own branch. */
+					{ positionLights(world, ((SkinnedMesh) node).getSkeleton()); }
+			}
+			catch (ArithmeticException ae)
+			{
+				// JSR-184: lighting is undefined for a non-invertible
+				// local-to-camera transform. For lights, a non-invertible
+				// world transform can happen if the node chain contains a
+				// degenerate scale. Treat it as identity so the light still
+				// contributes instead of disappearing (which would make the
+				// mesh fall back to the white defaultColor).
+				if (node instanceof Light)
+				{
+					tr.setIdentity();
+					addLight((Light) node, tr);
+				}
+				else if (node instanceof Group)
+					{ positionLights(world, (Group) node);}
+				else if (node instanceof SkinnedMesh)
+					{ positionLights(world, ((SkinnedMesh) node).getSkeleton()); }
+			}
+		}
+	}
+
+	public void resetLights()
+	{
+		this.currLights.clear();
+		this.currLightTrans.clear();
+	}
+
+	public void setCamera(Camera camera, Transform transform)
+	{
+		this.currCam = camera;
+
+		/* If no transform is given, the identity matrix is used as per JSR-184. */
+		if (transform == null)
+		{
+			this.currCamTrans.setIdentity();
+			this.currCamTransInv.setIdentity();
+		}
+		else /* Else, set the transform and its inverse accordingly. */
+		{
+			this.currCamTrans.set(transform);
+			this.currCamTransInv.set(transform);
+		}
+		this.currCamTransInv.invert(); /* This one will execute regardless of the given transform above. */
+	}
+
+	public void setDepthRange(float near, float far)
+	{
+		/* As per JSR-184, throw IllegalArgumentException if the received near and/or far planes have unsupported values. */
+		if (near < 0 || far < 0 || 1 < near || 1 < far) { throw new IllegalArgumentException("The requested Depth Range values are invalid."); }
+		else
+		{
+			this.near=near;
+			this.far=far;
+		}
+	}
+
+	public void setLight(int index, Light light, Transform transform)
+	{
+		/* As per JSR-184, throw IndexOutOfBoundsException if index < 0 or index > CurrentAmountOfLights. */
+		if (index < 0 || index >= MAX_LIGHTS) { throw new IndexOutOfBoundsException("Tried to modify a Light on an out-of-bounds index."); }
+
+		/* If no transform is received, use the identity matrix. */
+		if (transform == null) { transform = new Transform(); }
+
+		// Indices are NOT supposed to change here,
+		// so we're simply updating the arrays at the index,
+		// even if any new value is null.
+		this.currLights.set(index, light);
+		this.currLightTrans.set(index, transform);
+	}
+
+	public void setViewport(int x, int y, int width, int height)
+	{
+		/* As per JSR-184, throw IllegalArgumentException if the received width and height are < 0, or beyond the max allowed. */
+		if (width <= 0 || height <= 0 || width > MAX_VIEWPORT_WIDTH || height > MAX_VIEWPORT_HEIGHT)
+			{ throw new IllegalArgumentException("Tried to set a viewport of unsupported size."); }
+
+		this.viewx = x;
+		this.viewy = y;
+		this.vieww = width;
+		this.viewh = height;
+
+		/*
+		 * As per JSR-184, the viewport can be freely repositioned relative to the
+		 * rendering target without rebinding; parts outside the target clip rectangle
+		 * are silently clipped off without affecting projection. The depth buffer is
+		 * indexed by physical target pixel, so it survives this unchanged.
+		 */
+		if (this.target != null) { updateViewportClip(); }
+	}
+
+
+	/* Helper Methods */
+
+	/*
+	 * Recomputes the visible part of the viewport: its intersection with the target
+	 * clip rectangle, expressed in viewport-local coordinates. Rasterization clamps
+	 * its loops to these bounds, which discards clipped pixels without altering the
+	 * viewport-to-screen mapping (and therefore the projection), as per JSR-184.
+	 */
+	private void updateViewportClip()
+	{
+		final int viewOriginX = originX + viewx, viewOriginY = originY + viewy;
+		viewClipL = M3GMath.max(0, M3GMath.min(vieww, targetClipX - viewOriginX));
+		viewClipT = M3GMath.max(0, M3GMath.min(viewh, targetClipY - viewOriginY));
+		viewClipR = M3GMath.max(viewClipL, M3GMath.min(vieww, targetClipX + targetClipW - viewOriginX));
+		viewClipB = M3GMath.max(viewClipT, M3GMath.min(viewh, targetClipY + targetClipH - viewOriginY));
+	}
+
+	/*
+	 * Renders a Sprite3D as a screen-aligned textured rectangle, following the same
+	 * math as the JSR-184 Reference Implementation (m3g_sprite.c, m3gGetSpriteCoordinates):
+	 * the node origin and half-unit axis vectors are measured in eye space, re-aligned
+	 * to the screen axes, projected, and the resulting NDC quad is rasterized directly
+	 * with the sprite's crop as texture source.
+	 */
+	private void renderSprite(Sprite3D sprite, Transform transform, int alphaFactor)
+	{
+		final Image2D spr = sprite.getImage();
+		final Appearance appearance = sprite.getAppearance();
+
+		// As per JSR-184, a Sprite3D with no appearance (or no image) is not rendered.
+		if (spr == null || appearance == null) { return; }
+
+		// JSR-184 scope culling, same rule as for meshes.
+		if ((sprite.getScope() & this.currCam.getScope()) == 0) { return; }
+
+		// The crop rectangle keeps its sign; negative dimensions flip the image on that axis.
+		final int cropX = sprite.getCropX(), cropY = sprite.getCropY();
+		int cropW = sprite.getCropWidth(), cropH = sprite.getCropHeight();
+		final boolean flipX = cropW < 0, flipY = cropH < 0;
+		if (flipX) { cropW = -cropW; }
+		if (flipY) { cropH = -cropH; }
+		if (cropW == 0 || cropH == 0) { return; }
+
+		// Intersect the crop rectangle with the image rectangle; nothing to render without overlap.
+		final int isectX = M3GMath.max(cropX, 0), isectY = M3GMath.max(cropY, 0);
+		final int isectW = M3GMath.min(cropX + cropW, spr.getWidth()) - isectX;
+		final int isectH = M3GMath.min(cropY + cropH, spr.getHeight()) - isectY;
+		if (isectW <= 0 || isectH <= 0) { return; }
+
+		// Model-view: the sprite's rotation/scale only affect its size, never its screen alignment.
+		tr.set(this.currCamTransInv);
+		if (transform != null) { tr.postMultiply(transform); }
+
+		// Origin and half-unit axis points in eye space (affine transform, w stays 1).
+		final float[] eye = { 0,0,0,1,  0.5f,0,0,1,  0,0.5f,0,1 };
+		tr.transform(eye);
+		final float ox = eye[0]/eye[3], oy = eye[1]/eye[3], oz = eye[2]/eye[3];
+		final float dx0 = eye[4]/eye[7] - ox, dy0 = eye[5]/eye[7] - oy, dz0 = eye[6]/eye[7] - oz;
+		final float dx1 = eye[8]/eye[11] - ox, dy1 = eye[9]/eye[11] - oy, dz1 = eye[10]/eye[11] - oz;
+		final float halfUnitX = M3GMath.sqrt(dx0*dx0 + dy0*dy0 + dz0*dz0);
+		final float halfUnitY = M3GMath.sqrt(dx1*dx1 + dy1*dy1 + dz1*dz1);
+
+		// Project the origin plus screen-aligned extent points.
+		this.currCam.getProjection(projectionMatrix);
+		final float[] clip = { ox,oy,oz,1,  ox+halfUnitX,oy,oz,1,  ox,oy+halfUnitY,oz,1 };
+		projectionMatrix.transform(clip);
+		if (clip[3] <= 0f || clip[7] <= 0f || clip[11] <= 0f) { return; }
+
+		float ndcX = clip[0]/clip[3], ndcY = clip[1]/clip[3];
+
+		// Our depth buffer is now comprised of short values, so ndcZ has to be
+		// mapped by the JSR-184 depth range equation, zw = 0.5*(far-near)*(zndc+1)
+		// + near, and then scaled by the same factor used by the buffer, with a
+		// small margin for safety, just like when rendering meshes.
+		short ndcZ = (short) ((0.5f * (this.far - this.near) * (clip[2]/clip[3] + 1.0f) + this.near) * 32200.0f);
+
+		float halfW = M3GMath.abs(clip[4]/clip[7] - ndcX);
+		float halfH = M3GMath.abs(clip[9]/clip[11] - ndcY);
+
+		if (sprite.isScaled())
+		{
+			// Adjust the position and size according to the (possibly partly outside) crop rectangle.
+			final float unitX = halfW / (float) cropW, unitY = halfH / (float) cropH;
+			ndcX -= (2*cropX + cropW - 2*isectX - isectW) * unitX;
+			ndcY += (2*cropY + cropH - 2*isectY - isectH) * unitY;
+			halfW = unitX * isectW;
+			halfH = unitY * isectH;
+		}
+		else
+		{
+			// Non-scaled sprites take their size in pixels from the crop rectangle.
+			ndcX -= (float)(2*cropX + cropW - 2*isectX - isectW) / (float) vieww;
+			ndcY += (float)(2*cropY + cropH - 2*isectY - isectH) / (float) viewh;
+			halfW = (float) isectW / (float) vieww;
+			halfH = (float) isectH / (float) viewh;
+		}
+
+		// NDC -> viewport-relative pixels (same mapping as the triangle rasterizer).
+		final float sx0 = (ndcX - halfW + 1f) * vieww * 0.5f;
+		final float sx1 = (ndcX + halfW + 1f) * vieww * 0.5f;
+		final float sy0 = (1f - (ndcY + halfH)) * viewh * 0.5f;
+		final float sy1 = (1f - (ndcY - halfH)) * viewh * 0.5f;
+		final float spanX = sx1 - sx0, spanY = sy1 - sy0;
+		if (spanX <= 0f || spanY <= 0f) { return; }
+
+		final int pixL = M3GMath.max(M3GMath.roundPositive(sx0), viewClipL);
+		final int pixR = M3GMath.min(M3GMath.roundPositive(sx1), viewClipR);
+		final int pixT = M3GMath.max(M3GMath.roundPositive(sy0), viewClipT);
+		final int pixB = M3GMath.min(M3GMath.roundPositive(sy1), viewClipB);
+		if (pixL >= pixR || pixT >= pixB) { return; }
+
+		final CompositingMode compositingMode = appearance.getCompositingMode() != null ? appearance.getCompositingMode() : new CompositingMode();
+		final Fog fog = appearance.getFog();
+		final int alphaThreshold = (int) (compositingMode.getAlphaThreshold() * 255);
+		final boolean depthTest = compositingMode.isDepthTestEnabled() && isDepthBufferEnabled();
+		final boolean depthWrite = depthTest && compositingMode.isDepthWriteEnabled();
+		float fogFactor = 255.0f;
+		int intFogFactor = 255;
+		final int fogRB = fog != null ? fog.getColor() & 0x00FF00FF : 0;
+		final int fogG = fog != null ? (fog.getColor() >> 8) & 0xFF : 0;
+		compBlender = getCompositingBlender(compositingMode.getBlending());
+
+		// fixed point alpha factor, so we don't need a float mult and int cast
+		// in the innermost loop.
+
+		// The Sprite3D has the same depth for its entire area, so we only need
+		// to calculate fog once.
+		if (fog != null)
+		{
+			// Distance in eye space along the camera's viewing axis
+			final float zEye = -oz;
+			final float invFogDiv = M3GMath.fastReciprocal(fog.getFarDistance() - fog.getNearDistance());
+
+			if (fog.getMode() == Fog.LINEAR)
+			{
+				fogFactor = M3GMath.max(0, M3GMath.min(1, (fog.getFarDistance() - zEye) * invFogDiv));
+			}
+			else { fogFactor = M3GMath.exp(-fog.getDensity() * zEye); }
+
+			intFogFactor = (int) M3GMath.min(255.0f, fogFactor * 256.0f);
+		}
+
+		// Take divisions out of the inner loops. Multiply by reciprocal instead
+		final float invSpanX = M3GMath.fastReciprocal(spanX);
+		final float invSpanY = M3GMath.fastReciprocal(spanY);
+
+		// Use DDA on the inner loop to reduce heavy float math per-pixel.
+		float uStep = isectW * invSpanX;
+		float uStart = (pixL + 0.5f - sx0) * invSpanX * isectW;
+
+		if (flipX)
+		{
+			uStart = isectW - uStart;
+			uStep = -uStep;
+		}
+
+        final boolean nativeSprite = _spriteEnabled241();
+        final int spriteFlags = (depthTest?1:0)|(depthWrite?2:0)|(fog!=null?4:0);
+        for (int y = pixT; y < pixB; y++)
+		{
+			// Odd scanlines just copy from even ones in half res mode.
+			if(false && (y & 1) != 0)
+			{
+				if (y > viewClipT && viewClipR > viewClipL)
+				{
+					System.arraycopy(rasterData, (originY + viewy + (y - 1)) * canvasWidth + originX + viewx + viewClipL,
+						rasterData, (originY + viewy + y) * canvasWidth + originX + viewx + viewClipL, viewClipR - viewClipL);
+				}
+				continue;
+			}
+
+			final float v = (y + 0.5f - sy0) * invSpanY;
+			int texY = isectY + (int) ((flipY ? 1f - v : v) * isectH);
+			if (texY < isectY) { texY = isectY; } else if (texY >= isectY + isectH) { texY = isectY + isectH - 1; }
+			texY = spr.isPOT ? (texY << spr.widthShift) : (texY * spr.width);
+
+			final int rasterIdxY = (originY + viewy + y) * canvasWidth + originX + viewx;
+			int rasterIdx = rasterIdxY + pixL;
+            float u = uStart;
+            if (nativeSprite && _spriteRow241(spr,rasterIdx,pixR-pixL,texY,isectX,isectW,
+                    u,uStep,ndcZ,spriteFlags,alphaFactor,alphaThreshold,intFogFactor,fogRB,fogG)) continue;
+
+            for (int x = pixL; x < pixR; x++, rasterIdx++, u += uStep)
+			{
+				// Depth test against the same buffer, index and convention used by triangles.
+				if (depthTest && this.depthBuffer[rasterIdx] < ndcZ) { continue; }
+
+				int texX = isectX + (int) u;
+				if (texX < isectX) { texX = isectX; } else if (texX >= isectX + isectW) { texX = isectX + isectW - 1; }
+
+				paintPixel = spr.image[texY + texX];
+				int alpha = (((paintPixel >>> 24) * alphaFactor) >> 8);
+
+				if (alpha < alphaThreshold || alpha == 0) { continue; }
+
+				if (fog != null)
+				{
+					int pixRB = paintPixel & 0x00FF00FF;
+					int pixG  = (paintPixel >> 8) & 0xFF;
+
+					int outRB = (fogRB + (((pixRB - fogRB) * intFogFactor) >> 8)) & 0x00FF00FF;
+					int outG  = fogG + (((pixG - fogG) * intFogFactor) >> 8);
+
+					paintPixel = (paintPixel & 0xFF000000) | outRB | (outG << 8);
+				}
+
+				rasterData[rasterIdx] = compBlender == null ? paintPixel : compBlender.blend(rasterData[rasterIdx], paintPixel, alpha);
+
+				if (depthWrite) { this.depthBuffer[rasterIdx] = ndcZ; }
+			}
+		}
+	}
+
+	private void renderTriangleHalf(int defVertColor, int half, int yStart, int yEnd,
+		Triangle triScreen, boolean hasColors, boolean hasTexture, Fog fog, float invFogDiv,
+		int alphaThreshold, boolean usesDepth, boolean usesDepthWrite,
+		boolean colorEnabled, float depthOffset, boolean doPerspective, float invMidSpan)
+	{
+		// Prepare the flags that can be overridden by the UI.
+		boolean doDither = (this.hints & DITHER) != 0;
+
+		final boolean hasFog = fog != null;
+
+		final float fogFarNorm = hasFog ? fog.getFarDistance() * invFogDiv : 0.0f;
+		final float fogNearNorm = hasFog ? fog.getNearDistance() * invFogDiv : 0.0f;
+		final float fogDensity = hasFog ? fog.getDensity() : 0.0f;
+		final int fogMode = hasFog ? fog.getMode() : 0;
+		final int fogRB = hasFog ? fog.getColor() & 0x00FF00FF : 0;
+		final int fogG  = hasFog ? (fog.getColor() >> 8) & 0xFF : 0;
+		int fogFactor = 65535;
+		int stepFogFactor = 0;
+
+		// Stage239 changes only the pixel body. Java still owns scan conversion,
+		// the eight-pixel perspective/fog setup, and the fallback pixel path.
+		final boolean nativeSpans239 = _spanEnabled239();
+		final boolean nativeRows240 = _rowEnabled240();
+		final int spanFlags239 = (hasColors ? 1 : 0) | (hasTexture ? 2 : 0) |
+			(usesDepthWrite ? 4 : 0) | (colorEnabled ? 8 : 0) |
+			(doDither ? 16 : 0) | (hasFog ? 32 : 0);
+
+		// Get into the render loop proper.
+
+		float zStep  = usesDepth ? (zMidR - zMidL) * invMidSpan : 0;
+		float pwStep = doPerspective ? (pwMidR - pwMidL) * invMidSpan : 0;
+
+		float yDiv = half == 0 ? M3GMath.fastReciprocal(yMid - yTop) : M3GMath.fastReciprocal(yBot - yMid);
+
+		float subY = yStart - (half == 0 ? yTop : yMid);
+
+		float dxL_dy  = (half == 0 ? xMidL - xTop : xBot - xMidL) * yDiv;
+		float dxR_dy  = (half == 0 ? xMidR - xTop : xBot - xMidR) * yDiv;
+		float dzL_dy  = (half == 0 ? zMidL - zTop  : zBot - zMidL)  * yDiv;
+		float dpwL_dy = (half == 0 ? pwMidL - pwTop : pwBot - pwMidL) * yDiv;
+
+		if (hasTexture)
+		{
+			for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+			{
+				stepS[i] = (sMidR[i] - sMidL[i]) * invMidSpan;
+				stepT[i] = (tMidR[i] - tMidL[i]) * invMidSpan;
+
+				dsL_dy[i] = (half == 0 ? sMidL[i] - sTop[i] : sBot[i] - sMidL[i]) * yDiv;
+				dtL_dy[i] = (half == 0 ? tMidL[i] - tTop[i] : tBot[i] - tMidL[i]) * yDiv;
+
+				sL[i] = (half == 0 ? sTop[i] : sMidL[i]) + subY * dsL_dy[i];
+				tL[i] = (half == 0 ? tTop[i] : tMidL[i]) + subY * dtL_dy[i];
+			}
+		}
+
+		float xL  = (half == 0 ? xTop  : xMidL)  + subY * dxL_dy;
+		float xR  = (half == 0 ? xTop  : xMidR)  + subY * dxR_dy;
+		float zL  = (half == 0 ? zTop  : zMidL)  + subY * dzL_dy;
+		float pwL = (half == 0 ? pwTop : pwMidL) + subY * dpwL_dy;
+
+		int rowIdx = (originY + viewy + yStart) * canvasWidth + originX + viewx;
+
+		for (int y = yStart; y < yEnd; y++, xL += dxL_dy, xR += dxR_dy, zL += dzL_dy, pwL += dpwL_dy, rowIdx += canvasWidth)
+		{
+			// Odd scanlines just copy from even ones in half res mode.
+			if(false && (y & 1) != 0)
+			{
+				if (y > viewClipT && viewClipR > viewClipL)
+				{
+					System.arraycopy(rasterData, (originY + viewy + (y - 1)) * canvasWidth + originX + viewx + viewClipL,
+						rasterData, (originY + viewy + y) * canvasWidth + originX + viewx + viewClipL, viewClipR - viewClipL);
+				}
+
+				if (hasTexture)
+				{
+					for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+					{
+						sL[i] += dsL_dy[i];
+						tL[i] += dtL_dy[i];
+					}
+				}
+				continue;
+			}
+
+			int ixL = (int) (xL + 0.999999f);
+			int ixR = (int) (xR + 0.999999f);
+
+			if (ixL < viewClipL) { ixL = viewClipL; }
+			if (ixR > viewClipR) { ixR = viewClipR; }
+
+			if (ixL >= ixR)
+			{
+				if (hasTexture)
+				{
+					for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+					{
+						sL[i] += dsL_dy[i];
+						tL[i] += dtL_dy[i];
+					}
+				}
+				continue;
+			}
+
+			// Do we have vertex colors? If so, get the span edges' colors here,
+			// that way, the inner loop only needs to do a simple addition.
+			if (hasColors)
+			{
+				final int colorA = triScreen.colorA();
+				final float dx = ixL - triScreen.xA();
+				final float dy = y - triScreen.yA();
+
+				// Everyone goes to 16.16 fixed point, innermost X loop can get colors right away
+				// with this.
+				deltaA = (int) ((((colorA >> 24) & 0xFF) + dx * aStepX + dy * aStepY) * 65536.0f);
+				deltaR = (int) ((((colorA >> 16) & 0xFF) + dx * rStepX + dy * rStepY) * 65536.0f);
+				deltaG = (int) ((((colorA >> 8)  & 0xFF) + dx * gStepX + dy * gStepY) * 65536.0f);
+				deltaB = (int) (((colorA & 0xFF)         + dx * bStepX + dy * bStepY) * 65536.0f);
+			}
+
+			// Color and depth share the same physical render-target index.
+			int rasterIdx = rowIdx + ixL;
+
+			final float diffX = ixL - xL;
+			float pw = doPerspective ? pwL + (diffX) * pwStep : 0.0f;
+			float invPw = doPerspective ? M3GMath.fastReciprocal(pw) : 1.0f;
+			float stepInvPw = 0.0f;
+			float z  = usesDepth ? zL  + (diffX) * zStep + depthOffset : -32768.0f;
+
+			if (hasTexture)
+			{
+				// We'll use DDA for texturing as well, saves many multiply and
+				// add operations for each textured pixel.
+				for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+				{
+					curS[i] = (sL[i]) + (diffX * stepS[i]);
+					curT[i] = (tL[i]) + (diffX * stepT[i]);
+
+					sL[i] += dsL_dy[i];
+					tL[i] += dtL_dy[i];
+				}
+			}
+
+			// Stage240 batches this bounded row, retaining eight-pixel perspective/fog
+			// subspans. On refusal no native outputs are committed; the unchanged
+			// stage239/Java pixel loops below perform the original work.
+			if (nativeRows240 && _rasterRow240(rasterIdx, ixL, y, ixR - ixL,
+				defVertColor, spanFlags239, alphaThreshold, z, zStep, pw, pwStep,
+				invPw, stepInvPw, fogFactor, stepFogFactor, fogRB, fogG,
+				doPerspective, fogMode, fogFarNorm, invFogDiv, fogDensity))
+			{
+				fogFactor = rowFog240; stepFogFactor = rowFogStep240;
+				continue;
+			}
+
+			// If we don't do perspective correction, this will basically always
+			// evaluate to false below (screens with higher horizontal res bigger
+			// than Integer.MAX_VALUE don't even exist).
+			int perspX = doPerspective ? ixL : Integer.MAX_VALUE;
+
+			// Draw the pixels for the current y-coordinate
+			for (int x = ixL; x < ixR; x++, z += zStep, pw += pwStep, invPw += stepInvPw, fogFactor += stepFogFactor, rasterIdx++)
+			{
+				// Subsampling block. A.K.A, where we calculate anything that
+				// is too expensive to run per-pixel but cannot be done only once
+				// for the whole triangle Y scanline due to large precision loss.
+				if (x == perspX)
+				{
+					int maxSpan = (7 + 1) -
+						(x & 7);
+					int spanLen = (ixR - x < maxSpan) ? ixR - x : maxSpan;
+					float invSpanLen = INV_SPAN_TABLE[spanLen];
+
+					// Calling M3GMath.fastReciprocal() in here was deemed
+					// too expensive by the profiler, so we'll be inlining an
+					// even simpler alternative in here instead
+					// (single Newton-Raphson step)).
+					float denom = pw * (pw + pwStep * spanLen);
+					float invDenom = Float.intBitsToFloat(0x7EF127EA - Float.floatToRawIntBits(denom));
+					invDenom = invDenom * (2.0f - denom * invDenom);
+
+					stepInvPw = -pwStep * invDenom;
+
+					// Compute start and end fog factors for this 16-pixel span
+					if (hasFog)
+					{
+						float zEyeStart = invPw;
+						float zEyeEnd = invPw + stepInvPw * spanLen;
+
+						float fStart, fEnd;
+						if (fogMode == Fog.LINEAR)
+						{
+							fStart = (fogFarNorm - zEyeStart * invFogDiv) * 256.0f;
+							fEnd   = (fogFarNorm - zEyeEnd   * invFogDiv) * 256.0f;
+						}
+						else
+						{
+							fStart = M3GMath.exp(-fogDensity * zEyeStart) * 256.0f;
+							fEnd   = M3GMath.exp(-fogDensity * zEyeEnd)   * 256.0f;
+						}
+
+						fogFactor = (int) ((fStart < 0.0f ? 0.0f : (fStart > 255.0f ? 255.0f : fStart)) * 256.0f);
+						// This one bears a bit of explanation as we aren't just clamping and multiplying
+						// by 256 to use fixed point:
+						// The stepping factor is calculated by unscaling the start factor (0.00390625f is 1/256), then
+						// scaling by delta (invSpanLen * 256).
+						stepFogFactor = (int) (((fEnd < 0.0f ? 0.0f : (fEnd > 255.0f ? 255.0f : fEnd)) - (fogFactor * 0.00390625f)) * invSpanLen * 256.0f);
+					}
+
+					// perspX now moves to the next span.
+					perspX += spanLen;
+				}
+
+				// Attempt exactly once per aligned span. A decline leaves all Java
+				// state intact; the original pixel loop then runs for this span.
+				if (nativeSpans239 && (x == ixL || (x & 7) == 0))
+				{
+					int nativeLen239 = ixR - x;
+					if (nativeLen239 > 8 - (x & 7)) { nativeLen239 = 8 - (x & 7); }
+					if (_rasterSpan239(rasterIdx, x, y, nativeLen239, defVertColor,
+						spanFlags239, alphaThreshold, z, zStep, pw, pwStep, invPw, stepInvPw,
+						fogFactor, stepFogFactor, fogRB, fogG))
+					{
+						z = spanZ239; pw = spanPw239; invPw = spanInvPw239; fogFactor = spanFog239;
+						x += nativeLen239 - 1; rasterIdx += nativeLen239 - 1;
+						continue; // The for-loop performs the final scalar advance.
+					}
+				}
+
+				// Only depth test if the compositingMode has the feature enabled. If
+				// compositingMode is not set, check if this target has depthBuffer enabled.
+				if(this.depthBuffer[rasterIdx] < (short) z)
+				{
+					// We need to increment the color and texture deltas even when discarding
+					// by depth, otherwise color and texturing spans on objects partially
+					// occluded by others won't be correct.
+					if (hasColors) { deltaA += stepA; deltaR += stepR; deltaG += stepG; deltaB += stepB; }
+					if(hasTexture)
+					{
+						for (byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++) { curS[i] += stepS[i]; curT[i] += stepT[i]; }
+					}
+					continue;
+				}
+
+				// We have to do texture blending if we have vertex colors, as any available texture goes on top of them
+				if (hasColors)
+				{
+					// Interpolate from xL to xR based on current pixel xy coordinate.
+					// No need to calculate barycentric coords on every pixel.
+
+					// We could call M3GMath.max/min here, but a simple & to
+					// clamp these to [0,255] range is faster and should not
+					// cause overflow
+					paintPixel = ((deltaA >> 16 & 0xFF) << 24) |
+						((deltaR >> 16 & 0xFF) << 16) |
+						((deltaG >> 16 & 0xFF) << 8)  |
+						(deltaB >> 16 & 0xFF);
+
+					deltaA += stepA; deltaR += stepR; deltaG += stepG; deltaB += stepB;
+				}
+				// Otherwise, we just use the default vertex color for this triangle
+				else { paintPixel = defVertColor; }
+
+				texMode.applyTexture(invPw, x, y);
+
+				/*
+				 * Alpha test BEFORE any depth write: transparent fragments must not
+				 * occlude geometry drawn later (games rely on this — e.g. tree canopies
+				 * with alpha cutouts drawn before the ground). The depth buffer is only
+				 * updated by fragments that survive this test.
+				 */
+				final int alpha = ((paintPixel >>> 24) * currAlphaFactor) >> 8;
+
+				if (alpha < alphaThreshold) { continue; }
+
+				/*
+				 * Yes, this is back. Now there's a bunch of apps that rely on
+				 * this. Namely, 3D Constructo Combat and some versions of Tower
+				 * Bloxx Deluxe 3D.
+				 */
+				if(alpha == 0) { paintPixel |= 0xFF000000; }
+
+				// Update the depth buffer if depth write is enabled (alpha pixels do not write Z)
+				if (usesDepthWrite) { this.depthBuffer[rasterIdx] = (short) z; }
+
+				// Only write to the screen if color write is enabled.
+				if(!colorEnabled) { continue; }
+
+				// Blend the fog, all important calculations were done prior.
+				if (hasFog)
+				{
+					/*
+					 * M3G specifies that, the smaller the fogFactor value, the more we
+					 * should blend the fog color into the received color... which means
+					 * that the fog's contribution to the resulting color should be
+					 * 1 - fogFactor;
+					 */
+					final int fAmount = fogFactor >> 8;
+					
+					int pixRB = paintPixel & 0x00FF00FF;
+					int pixG  = (paintPixel >> 8) & 0xFF;
+
+					int outRB = (fogRB + (((pixRB - fogRB) * fAmount) >> 8)) & 0x00FF00FF;
+					int outG  = fogG + (((pixG - fogG) * fAmount) >> 8);
+
+					paintPixel = (paintPixel & 0xFF000000) | outRB | (outG << 8);
+				}
+
+				if (doDither)
+				{
+					int dither = (((x ^ y) & 1) << 3) | ((y & 1) << 2) | (((x ^ y) & 2) << 1) | ((y & 2) >> 1);
+
+					int r = ((paintPixel >> 16) & 0xFF) + dither;
+					int g = ((paintPixel >>  8) & 0xFF) + dither;
+					int b =  (paintPixel        & 0xFF) + dither;
+
+					r = (r | ((255 - r) >> 31)) & 0xFF;
+					g = (g | ((255 - g) >> 31)) & 0xFF;
+					b = (b | ((255 - b) >> 31)) & 0xFF;
+
+					paintPixel = (paintPixel & 0xFF000000) | (r << 16) | (g << 8) | b;
+				}
+
+				rasterData[rasterIdx] = compBlender == null ? paintPixel : compBlender.blend(rasterData[rasterIdx],
+					paintPixel, alpha);
+			}
+		}
+	}
+
+	private void clearToTarget(Background background, Image2D bgImg, boolean isImageTarget)
+	{
+		if (_clearToTarget(background, bgImg, isImageTarget)) { return; }
+		final int cropX = background.getCropX(), cropY = background.getCropY();
+		int cropW = background.getCropWidth(), cropH = background.getCropHeight();
+		if (cropW <= 0) { cropW = bgImg.getWidth(); }
+		if (cropH <= 0) { cropH = bgImg.getHeight(); }
+
+		final boolean repeatX = background.getImageModeX() == Background.REPEAT;
+		final boolean repeatY = background.getImageModeY() == Background.REPEAT;
+		final boolean doDither = (this.hints & DITHER) != 0;
+
+		final int bgW = bgImg.getWidth();
+		final int bgH = bgImg.getHeight();
+		final boolean isNPOT = !(bgImg.isPowerOfTwo(bgW) && bgImg.isPowerOfTwo(bgH));
+		texWrappers[0] = getCoordWrapper(bgW, bgH, repeatX, repeatY, isNPOT);
+
+		int stepX = (cropW << 16) / vieww;
+		int stepY = (cropH << 16) / viewh;
+
+		Image2D destImg = isImageTarget ? (Image2D) this.target : null;
+
+		/*
+		 * The crop-to-viewport mapping always spans the full viewport; only the rows
+		 * and columns inside the visible part of it are actually painted.
+		 */
+		for (int py = viewClipT; py < viewClipB; py++)
+		{
+			int currY = (cropY << 16) + py * stepY;
+			int currX = (cropX << 16) + viewClipL * stepX;
+			int screenY = py + viewy;
+			int rowOffset = (originY + viewy + py) * canvasWidth + originX + viewx;
+
+			for (int px = viewClipL; px < viewClipR; px++)
+			{
+				final int texX = currX >> 16;
+				final int texY = currY >> 16;
+
+				// In BORDER mode, out-of-bounds pixels stay as the clear color.
+				// And since we already filled rasterData with paintColor in
+				// clear(Background), we simply skip overwriting it here.
+				boolean outOfBounds = (!repeatX && (texX < 0 || texX >= bgW)) ||
+					(!repeatY && (texY < 0 || texY >= bgH));
+
+				if (outOfBounds)
+				{
+					currX += stepX;
+					continue;
+				}
+
+				final int texCoord = texWrappers[0].wrap(texX, texY, bgW, bgH);
+
+				int paintPixel = bgImg.image[bgImg.isPOT ?
+					((texCoord >>> 16) << bgImg.widthShift) + (texCoord & 0xFFFF) :
+					((texCoord >>> 16) * bgImg.width) + (texCoord & 0xFFFF)];
+
+				if (doDither)
+				{
+					int dither = (((px ^ py) & 1) << 3) | ((py & 1) << 2) | (((px ^ py) & 2) << 1) | ((py & 2) >> 1);
+
+					int r = ((paintPixel >> 16) & 0xFF) + dither;
+					int g = ((paintPixel >>  8) & 0xFF) + dither;
+					int b =  (paintPixel        & 0xFF) + dither;
+
+					r = (r | ((255 - r) >> 31)) & 0xFF;
+					g = (g | ((255 - g) >> 31)) & 0xFF;
+					b = (b | ((255 - b) >> 31)) & 0xFF;
+
+					paintPixel = (paintPixel & 0xFF000000) | (r << 16) | (g << 8) | b;
+				}
+
+				int screenX = px + viewx;
+
+				// Both are actually rather similar due to how FreeJ2ME+ implements these
+				if (isImageTarget)
+				{
+					destImg.image[destImg.isPOT ? (screenY << destImg.widthShift) + screenX :
+						(screenY * destImg.width) + screenX] = paintPixel;
+				}
+				else { rasterData[rowOffset + px] = paintPixel; }
+				currX += stepX;
+			}
+		}
+	}
+
+	// Antialiasing here is done by just drawing antialiased lines over the
+	// already drawn geometry. This one is pretty much just Wu's line drawing
+	// algorithm, but modified to handle depth, and sample pixels around the
+	// center one to be drawn.
+	private final void drawAALine(float x0, float y0, float z0, float x1, float y1, float z1, boolean usesDepth)
+	{
+		float dx = x1 - x0;
+		float dy = y1 - y0;
+
+		// If it's a steep line, that means AA must shift from horizontal to
+		// vertical stepping.
+		boolean steep = (dy < 0 ? -dy : dy) > (dx < 0 ? -dx : dx);
+
+		if (steep)
+		{
+			float tmp = x0; x0 = y0; y0 = tmp;
+			tmp = x1; x1 = y1; y1 = tmp;
+			dx = x1 - x0;
+			dy = y1 - y0;
+		}
+
+		if (x0 > x1)
+		{
+			float tmp = x0; x0 = x1; x1 = tmp;
+			tmp = y0; y0 = y1; y1 = tmp;
+			tmp = z0; z0 = z1; z1 = tmp;
+			dx = -dx;
+			dy = -dy;
+		}
+
+		// No sense in trying to AA lines that are just a dot.
+		if (dx == 0.0f) { return; }
+
+		float invDx = M3GMath.fastReciprocal(dx);
+		int xStart = (int)(x0 + 0.5f);
+		int xEnd = (int)(x1 + 0.5f);
+		
+		int yGradient = (int)((dy * invDx) * 65536.0f);
+		int yGrad = (int)((y0 + (dy * invDx) * (xStart - x0)) * 65536.0f + 0.5f);
+
+		float zStep = (z1 - z0) * invDx;
+		int zGradient = (int)(zStep * 65536.0f);
+		int zGrad = (int)((z0 + zStep * (xStart - x0)) * 65536.0f + 0.5f);
+
+		// Main interpolation loop
+		for (int x = xStart; x < xEnd; x++)
+		{
+			final int yInt = yGrad >> 16;
+			final int frac = (yGrad >> 8) & 0xFF;
+
+			if(usesDepth)
+			{
+				if (steep)
+				{
+					plotAALinePixel(yInt,     x, zGrad >> 16, 255 - frac, usesDepth);
+					plotAALinePixel(yInt + 1, x, zGrad >> 16, frac,    usesDepth);
+				}
+				else
+				{
+					plotAALinePixel(x, yInt,     zGrad >> 16, 255 - frac, usesDepth);
+					plotAALinePixel(x, yInt + 1, zGrad >> 16, frac,    usesDepth);
+				}
+			}
+			else
+			{
+				if (steep)
+				{
+					plotAALinePixel(yInt + 1, x, zGrad >> 16, frac,    usesDepth);
+				}
+				else
+				{
+					plotAALinePixel(x, yInt + 1, zGrad >> 16, frac,    usesDepth);
+				}
+			}
+
+			zGrad += zGradient;
+			yGrad += yGradient;
+		}
+	}
+
+	// Z can be an int here, removes the need to cast stuff to short above and we
+	// know values will be in short range for comparison anyway.
+	private final void plotAALinePixel(int x, int y, int z, int alpha, boolean usesDepth)
+	{
+		// Pixels that are going to be nearly invisible may as well be ignored.
+		if (alpha <= 10) { return; }
+
+		// Bound checks are a bit more lenient, as we do sample a grid around the center pixel.
+		if (x < viewClipL + 1 || x >= viewClipR - 1 || y < viewClipT + 1 || y >= viewClipB - 1) { return; }
+
+		final int rasterIdx = (originY + viewy + y) * canvasWidth + originX + viewx + x;
+		final short[] zBuffer = this.depthBuffer;
+		final int[] rData = this.rasterData;
+		final int bg = rData[rasterIdx];
+
+		int fgIdx = -1;
+
+		if (usesDepth)
+		{
+			short currentZ = zBuffer[rasterIdx];
+
+			// Is occluded? DO NOT AA! This improves performance and also
+			// prevents occluded geometry from drawing ghosts.
+			if (currentZ < (z - 4)) { return; }
+
+			int AAsum = 0, nIdx = rasterIdx + AA_SAMPLE_OFFSETS[0];
+			// We trigger AA on any edge that doesn't resolve to the same
+			// depth as its immediately connected pixels.
+			short zN = zBuffer[nIdx];
+			AAsum |= (zN - z);
+			if (zN < currentZ) { fgIdx = nIdx; }
+			
+			nIdx = rasterIdx + AA_SAMPLE_OFFSETS[1];
+			zN = zBuffer[nIdx];
+			AAsum |= (zN - z);
+			if (zN < currentZ) { fgIdx = nIdx; }
+			
+			nIdx = rasterIdx + AA_SAMPLE_OFFSETS[2];
+			zN = zBuffer[nIdx];
+			AAsum |= (zN - z);
+			if (zN < currentZ) { fgIdx = nIdx; }
+			
+			nIdx = rasterIdx + AA_SAMPLE_OFFSETS[3];
+			zN = zBuffer[nIdx];
+			AAsum |= (zN - z);
+			if (zN < currentZ) { fgIdx = nIdx; }
+
+			// We must only antialias silhouettes, this is to prevent
+			// the line algorithm from over-blurring connected geometry.
+			if (AAsum == 0) { return; }
+		}
+		else
+		{
+			// If we don't have depth, we fallback to simple color checks on
+			// neighbor pixels for AA.
+		   for (int i = 0; i < 4; i++)
+			{
+				int nIdx = rasterIdx + AA_SAMPLE_OFFSETS[i];
+				if (rData[nIdx] != bg)
+				{
+					fgIdx = nIdx;
+					break;
+				}
+			}
+		}
+
+		if (fgIdx == -1) { return; }
+
+		// If we're on an outer pixel, we sample the foreground object's
+		// texture color, otherwise may as well just reuse the current bg pixel
+		int fg = rData[fgIdx];
+
+		// If fg and bg are identical in color
+		// (e.g. a flat, coplanar surface), no AA is needed at all.
+		if (fg == bg) { return; }
+
+		// We don't need any complex blending here, just make sure the coverage
+		// is properly smoothed out with some alpha modulation.
+		int bgRB = bg & 0x00FF00FF;
+		int fgRB = fg & 0x00FF00FF;
+		int outRB = ((fgRB * alpha + bgRB * (255 - alpha)) >> 8) & 0x00FF00FF;
+
+		int bgAG = (bg >>> 8) & 0x00FF00FF;
+		int fgAG = (fg >>> 8) & 0x00FF00FF;
+		int outAG = ((fgAG * alpha + bgAG * (255 - alpha)) >> 8) & 0x00FF00FF;
+
+		rData[rasterIdx] = outRB | (outAG << 8);
+	}
+
+	// Retained mode render order helpers.
+
+	private void checkRenderOpQueueSize(int minCapacity)
+	{
+		if (minCapacity > renderIndices.length)
+		{
+			int newCapacity = renderIndices.length * 2;
+			if (newCapacity < minCapacity) { newCapacity = minCapacity; }
+			renderIndices = new int[newCapacity];
+			renderIntData = new int[newCapacity * 3];
+			renderObjData = new Object[newCapacity * 4];
+			renderAlphaData = new int[newCapacity];
+		}
+	}
+
+	// What we do when queuing things up for rendering is that we just
+	// store their references in global arrays, and sort their drawing order,
+	// that way, no extra memory is used for this functionality.
+	private void queueNode(Node node, Transform transform, int parentAlpha)
+	{
+		// Node not renderable? Skip it and its children.
+		if (!node.isRenderingEnabled()) { return; }
+
+		// Effective alpha factor: ancestors multiplied in, see renderAlphaData.
+		final int alphaFactor = (parentAlpha * (int) (node.getAlphaFactor() * 256.0f)) >> 8;
+
+		if (node instanceof Mesh)
+		{
+			Mesh mesh = (Mesh) node;
+			int subMeshes = mesh.getSubmeshCount();
+			// Posed buffer: skinning/morphing results are internal, see Mesh.getPosedVertexBuffer()
+			VertexBuffer vertices = mesh.getPosedVertexBuffer();
+			for (int i = 0; i < subMeshes; i++)
+			{
+				if (mesh.getAppearance(i) != null)
+				{
+					// Queue the submesh for rendering
+					queueRenderOp(vertices, mesh.getIndexBuffer(i), mesh.getAppearance(i), transform, node.getScope(), alphaFactor);
+				}
+			}
+
+			/*
+			 * Per JSR-184, the skeleton group of a SkinnedMesh is a regular
+			 * scene graph branch: it is traversed just like any other branch
+			 * during rendering. This is what allows, for example, a character
+			 * to render a separate weapon mesh attached to its hand bone.
+			 */
+			if (node instanceof SkinnedMesh)
+			{
+				Group skeleton = ((SkinnedMesh) node).getSkeleton();
+				if (skeleton != null)
+				{
+					Transform sktr = new Transform();
+					skeleton.getCompositeTransform(sktr);
+					if (transform != null) { sktr.preMultiply(transform); }
+					queueNode(skeleton, sktr, alphaFactor);
+				}
+			}
+		}
+		else if (node instanceof Sprite3D)
+		{
+			Sprite3D sprite = (Sprite3D) node;
+			// Sprites with no appearance are ignored per specification
+			if (sprite.getAppearance() != null)
+			{
+				// Queue the Sprite3D for rendering
+				queueRenderOp(sprite, null, sprite.getAppearance(), transform, sprite.getScope(), alphaFactor);
+			}
+		}
+		else if (node instanceof Group)
+		{
+			Node child = ((Group) node).firstChild;
+			if (child != null)
+			{
+				do
+				{
+					if (child instanceof Sprite3D || child instanceof Mesh || child instanceof Group)
+					{
+						Transform nodetr = new Transform();
+						child.getCompositeTransform(nodetr);
+						if (transform != null) { nodetr.preMultiply(transform); }
+
+						queueNode(child, nodetr, alphaFactor);
+					}
+					child = child.right;
+				}
+				while (child != ((Group) node).firstChild);
+			}
+		}
+	}
+
+	private void queueRenderOp(Object geomOrSprite, IndexBuffer triangles, Appearance appearance, Transform transform, int scope, int alphaFactor)
+	{
+		checkRenderOpQueueSize(renderOpCount + 1);
+
+		final CompositingMode cm = appearance.getCompositingMode();
+		final boolean blended = (cm != null) && (cm.getBlending() != CompositingMode.REPLACE);
+
+		// Store primitive int data: layer, blended flag, scope
+		final int intIdx = renderOpCount * 3;
+		renderIntData[intIdx + 0] = appearance.getLayer();
+		renderIntData[intIdx + 1] = blended ? 1 : 0;
+		renderIntData[intIdx + 2] = scope;
+		renderAlphaData[renderOpCount] = alphaFactor;
+
+		// Then its object data that's used for rendering:
+		// Order: [VertexBuffer / Sprite3D], [IndexBuffer / null], Appearance, Transform
+		final int objIdx = renderOpCount * 4;
+		renderObjData[objIdx + 0] = geomOrSprite;
+		renderObjData[objIdx + 1] = triangles;
+		renderObjData[objIdx + 2] = appearance;
+
+		// And copy the transform data to prevent corruptions caused by data
+		// reuse (Node getting a transform from another for example)
+		Transform tr = (Transform) renderObjData[objIdx + 3];
+		if (tr == null)
+		{
+			tr = new Transform();
+			renderObjData[objIdx + 3] = tr;
+		}
+
+		if (transform != null) { tr.set(transform); }
+		else { tr.setIdentity(); }
+
+		renderIndices[renderOpCount] = renderOpCount;
+		renderOpCount++;
+	}
+
+	// Insertion sort here just like in Triangle.java: Minimal space complexity,
+	// and i doubt this will ever amount to a measurable runtime impact.
+	// Triangle sorting takes <0.1% already and we'll often have far less
+	// objects in a scene than triangles for a single mesh.
+	private void flushRenderQueue()
+	{
+		if (renderOpCount <= 0) { return; }
+
+		for (int i = 1; i < renderOpCount; i++)
+		{
+			int keyIndex = renderIndices[i];
+			int keyIntIdx = keyIndex * 3;
+
+			// The sorting key is (layerIdx << 1) | blended
+			int keySortValue = ((renderIntData[keyIntIdx + 0] + 63) << 1) | renderIntData[keyIntIdx + 1];
+
+			int j = i - 1;
+			while (j >= 0)
+			{
+				int curIndex = renderIndices[j];
+				int curIntIdx = curIndex * 3;
+				int curSortValue = ((renderIntData[curIntIdx + 0] + 63) << 1) | renderIntData[curIntIdx + 1];
+
+				// We use ">" instead of ">=" to ensure the sort remains stable,
+				// otherwise flickering could occur by having identical object
+				// layer/blending values have them swap orders between renders.
+				if (curSortValue > keySortValue)
+				{
+					renderIndices[j + 1] = renderIndices[j];
+					j--;
+				}
+				else { break; }
+			}
+			renderIndices[j + 1] = keyIndex;
+		}
+
+		// Objects are sorted, so just draw them out.
+		for (int i = 0; i < renderOpCount; i++)
+		{
+			int op = renderIndices[i];
+			int objIdx = op * 4;
+
+			Object obj = renderObjData[objIdx + 0];
+			Appearance appearance = (Appearance) renderObjData[objIdx + 2];
+			Transform transform = (Transform) renderObjData[objIdx + 3];
+			int scope = renderIntData[op * 3 + 2];
+
+			// We do not draw objects with null data. This may happen during
+			// reordering.
+			if (obj == null || appearance == null) { continue; }
+
+			final int alphaFactor = renderAlphaData[op];
+
+			if (obj instanceof Sprite3D) { renderSprite((Sprite3D) obj, transform, alphaFactor); }
+			else { renderSubmesh((VertexBuffer) obj, (IndexBuffer) renderObjData[objIdx + 1], appearance, transform, scope, alphaFactor); }
+		}
+		renderOpCount = 0;
+	}
+
+	// Gets a specific compositing mode blender for use in rendering operations.
+	// Doing it this way instead of the prior "blendCompositing" method with a
+	// switch-case provides a noticeable performance boost, as now we only
+	// need to call this ONCE for each triangle, rather than per-pixel.
+	private final Graphics3DPipelines.CompositingBlender getCompositingBlender(int blendMode)
+	{
+		switch (blendMode)
+		{
+			case CompositingMode.REPLACE:
+				return null; // Fast path, set pixel directly in render methods.
+				//return Graphics3DPipelines.CompositingBlenders.REPLACE;
+			case CompositingMode.ALPHA:
+				return Graphics3DPipelines.CompositingBlenders.ALPHA;
+			case CompositingMode.ALPHA_ADD:
+				return Graphics3DPipelines.CompositingBlenders.ALPHA_ADD;
+			case CompositingMode.MODULATE:
+				return Graphics3DPipelines.CompositingBlenders.MODULATE;
+			case CompositingMode.MODULATE_X2:
+				return Graphics3DPipelines.CompositingBlenders.MODULATE_X2;
+			default:
+				return Graphics3DPipelines.CompositingBlenders.PASSTHROUGH;
+		}
+	}
+
+	// Gets a specific texture blender for use in rendering operations.
+	// Doing it this way instead of the prior "blendTexture" method with a
+	// massive switch-case provides a major performance boost, as now we only
+	// need to call this ONCE for each triangle, rather than per-pixel.
+	private final Graphics3DPipelines.TextureBlender getTextureBlender(int funcMode)
+	{
+		switch (funcMode)
+		{
+			// RGB and LUMINANCE are opaque by default, so REPLACE and
+			// DECAL may also return them outright.
+			case ((Texture2D.FUNC_REPLACE & 7) << 3) | (Image2D.RGB & 7):
+			case ((Texture2D.FUNC_DECAL & 7) << 3)   | (Image2D.RGB & 7):
+			case ((Texture2D.FUNC_REPLACE & 7) << 3) | (Image2D.LUMINANCE & 7):
+			case ((Texture2D.FUNC_REPLACE & 7) << 3) | (Image2D.RGBA & 7):
+			case ((Texture2D.FUNC_REPLACE & 7) << 3) | (Image2D.LUMINANCE_ALPHA & 7):
+				return null; // Fast path, set pixel directly in render methods.
+				//return TextureBlenders.REPLACE_FG;
+
+			case ((Texture2D.FUNC_REPLACE & 7) << 3) | (Image2D.ALPHA & 7):
+				return Graphics3DPipelines.TextureBlenders.REPLACE_ALPHA;
+
+			case ((Texture2D.FUNC_ADD & 7) << 3) | (Image2D.RGB & 7):
+			case ((Texture2D.FUNC_ADD & 7) << 3) | (Image2D.LUMINANCE & 7):
+				return Graphics3DPipelines.TextureBlenders.ADD_RGB;
+
+			case ((Texture2D.FUNC_ADD & 7) << 3) | (Image2D.RGBA & 7):
+			case ((Texture2D.FUNC_ADD & 7) << 3) | (Image2D.LUMINANCE_ALPHA & 7):
+				return Graphics3DPipelines.TextureBlenders.ADD_RGBA;
+
+			case ((Texture2D.FUNC_ADD & 7) << 3) | (Image2D.ALPHA & 7):
+			case ((Texture2D.FUNC_BLEND & 7) << 3) | (Image2D.ALPHA & 7):
+			case ((Texture2D.FUNC_MODULATE & 7) << 3) | (Image2D.ALPHA & 7):
+				return Graphics3DPipelines.TextureBlenders.ALPHA_MUL;
+
+			case ((Texture2D.FUNC_BLEND & 7) << 3) | (Image2D.RGBA & 7):
+			case ((Texture2D.FUNC_BLEND & 7) << 3) | (Image2D.LUMINANCE_ALPHA & 7):
+				return Graphics3DPipelines.TextureBlenders.BLEND_RGBA;
+
+			case ((Texture2D.FUNC_BLEND & 7) << 3) | (Image2D.RGB & 7):
+			case ((Texture2D.FUNC_BLEND & 7) << 3) | (Image2D.LUMINANCE & 7):
+				return Graphics3DPipelines.TextureBlenders.BLEND_RGB;
+
+			case ((Texture2D.FUNC_DECAL & 7) << 3) | (Image2D.RGBA & 7):
+				return Graphics3DPipelines.TextureBlenders.DECAL_RGBA;
+
+			case ((Texture2D.FUNC_MODULATE & 7) << 3) | (Image2D.RGBA & 7):
+			case ((Texture2D.FUNC_MODULATE & 7) << 3) | (Image2D.LUMINANCE_ALPHA & 7):
+				return Graphics3DPipelines.TextureBlenders.MODULATE_RGBA;
+
+			case ((Texture2D.FUNC_MODULATE & 7) << 3) | (Image2D.RGB & 7):
+			case ((Texture2D.FUNC_MODULATE & 7) << 3) | (Image2D.LUMINANCE & 7):
+				return Graphics3DPipelines.TextureBlenders.MODULATE_RGB;
+
+			default:
+				return Graphics3DPipelines.TextureBlenders.PASSTHROUGH;
+		}
+	}
+
+	// Same reasoning as the ones above
+	public Graphics3DPipelines.TextureWrapper getCoordWrapper(int w, int h,
+		boolean repeatS, boolean repeatT, boolean isNPOT)
+	{
+		if (!repeatS && !repeatT) { return Graphics3DPipelines.TextureWrappers.CLAMP; }
+		if (!isNPOT) { return Graphics3DPipelines.TextureWrappers.POT_REPEAT; }
+		return Graphics3DPipelines.TextureWrappers.NPOT_REPEAT;
+	}
+
+	public Graphics3DPipelines.MipmapMode getMipmapMode(int levelFilter)
+	{
+		if (levelFilter == Texture2D.FILTER_BASE_LEVEL) { return null; }
+		if (levelFilter == Texture2D.FILTER_NEAREST) { return Graphics3DPipelines.MipmapModes.NEAREST; }
+		return Graphics3DPipelines.MipmapModes.LINEAR;
+	}
+
+	public TexturingMode getTexturingMode()
+	{
+		if (ACTIVE_TEXTURE_UNITS == 0) { return TexturingModes.NO_UNIT; }
+		if (ACTIVE_TEXTURE_UNITS == 1) { return TexturingModes.SINGLE_UNIT; }
+		return TexturingModes.MULTI_UNIT;
+	}
+
+	public TextureFilter getTextureFilter(boolean bilinear)
+	{
+		if (!bilinear) { return TextureFilters.NEAREST; }
+		return TextureFilters.BILINEAR;
+	}
+
+
+	// This part of the pipeline is much faster by staying here, otherwise the
+	// amount of variables we'd need to pass into these calls on
+	// Graphics3DPipelins would destroy any performance gain of separating
+	// these texturing modes.
+	interface TexturingMode { void applyTexture(float invPw, int x, int y); }
+
+	static class TexturingModes
+	{
+		static final TexturingMode NO_UNIT = new TexturingMode()
+		{
+
+			public void applyTexture(float invPw, int x, int y) { /* NO-OP */ }
+		};
+
+		static final TexturingMode SINGLE_UNIT = new TexturingMode()
+		{
+
+			public void applyTexture(float invPw, int x, int y)
+			{
+				if (_applyTexture238(invPw, x, y, 1)) { return; }
+				float s = curS[0] * invPw;
+				float t = curT[0] * invPw;
+
+				Image2D targetImage = textures[0].getImage();
+
+				// Mipmapping support was requested.
+				if(mipModes[0] != null)
+				{
+					targetImage = mipModes[0].selectLevel(textures[0], s, t,
+						sStepX[0], tStepX[0], sStepY[0], tStepY[0],
+						dwdx, dwdy, invPw, x, y);
+
+					// POT textures coming in with another fast path: Just shift
+					// right by the difference in width between base level and
+					// target one!
+					int targetLevel = textures[0].getImage().widthShift - targetImage.widthShift;
+
+					s = (float) ((int) s >> targetLevel);
+					t = (float) ((int) t >> targetLevel);
+				}
+
+				texFilter[0].filterTexture(s, t, 0, targetImage);
+
+				curS[0] += stepS[0];
+				curT[0] += stepT[0];
+			}
+		};
+
+		static final TexturingMode MULTI_UNIT = new TexturingMode()
+		{
+
+			public void applyTexture(float invPw, int x, int y)
+			{
+				if (_applyTexture238(invPw, x, y, ACTIVE_TEXTURE_UNITS)) { return; }
+				for(byte i = 0; i < ACTIVE_TEXTURE_UNITS; i++)
+				{
+					float s = curS[i] * invPw;
+					float t = curT[i] * invPw;
+
+					Image2D targetImage = textures[i].getImage();
+
+					// Mipmapping support was requested.
+					if(mipModes[i] != null)
+					{
+						targetImage = mipModes[i].selectLevel(textures[i], s, t,
+							sStepX[i], tStepX[i], sStepY[i], tStepY[i],
+							dwdx, dwdy, invPw, x, y);
+
+						// POT textures coming in with another fast path: Just shift
+						// right by the difference in width between base level and
+						// target one!
+						int targetLevel = textures[i].getImage().widthShift - targetImage.widthShift;
+
+						s = (float) ((int) s >> targetLevel);
+						t = (float) ((int) t >> targetLevel);
+					}
+
+					texFilter[i].filterTexture(s, t, i, targetImage);
+
+					curS[i] += stepS[i];
+					curT[i] += stepT[i];
+				}
+			}
+		};
+	}
+
+
+	// This one is also faster staying here.
+	interface TextureFilter { void filterTexture(float s, float t, int unitIdx, Image2D targetImage); }
+
+	static class TextureFilters
+	{
+		static final TextureFilter NEAREST = new TextureFilter()
+		{
+
+			public void filterTexture(float s, float t, int unitIdx, Image2D targetImage)
+			{
+				final int texCoord = texWrappers[unitIdx].wrap((int) (s + 32768.0f) - 32768,
+					(int) (t + 32768.0f) - 32768, targetImage.getWidth(), targetImage.getHeight());
+
+				final int pixel = targetImage.image[targetImage.isPOT ?
+					((texCoord >>> 16) << targetImage.widthShift) + (texCoord & 0xFFFF) :
+					((texCoord >>> 16) * targetImage.width) + (texCoord & 0xFFFF)];
+
+				paintPixel = texBlenders[unitIdx] == null ? pixel :
+					texBlenders[unitIdx].blend(paintPixel, pixel, textures[unitIdx].getBlendColor());
+			}
+		};
+
+		static final TextureFilter BILINEAR = new TextureFilter()
+		{
+
+			public void filterTexture(float s, float t, int unitIdx, Image2D targetImage)
+			{
+				final int texW = targetImage.getWidth();
+				final int texH = targetImage.getHeight();
+				// Shift s and t by 0.5 on the texel center for OpenGL-like filtering,
+				final int sFixed = (int) (s * 256.0f) - 128;
+				final int tFixed = (int) (t * 256.0f) - 128;
+		
+				final int xy0 = texWrappers[unitIdx].wrap(sFixed >> 8, tFixed >> 8,
+					texW, texH);
+				final int x0 = xy0 & 0xFFFF;
+				final int y0 = xy0 >>> 16;
+		
+				final int x1 = (x0 + 1 < texW) ? x0 + 1 : (texRepeatS[unitIdx] ? 0 : x0);
+				final int y1 = (y0 + 1 < texH) ? y0 + 1 : (texRepeatT[unitIdx] ? 0 : y0);
+		
+				final int baseY0 = targetImage.isPOT ? (y0 << targetImage.widthShift) : (y0 * texW);
+				final int baseY1 = targetImage.isPOT ? (y1 << targetImage.widthShift) : (y1 * texW);
+				
+				final int[] img = targetImage.image;
+				final int c00 = img[baseY0 + x0];
+				final int c10 = img[baseY0 + x1];
+				final int c01 = img[baseY1 + x0];
+				final int c11 = img[baseY1 + x1];
+
+				// Fractional components
+				final int fx = sFixed & 0xFF;
+				final int fy = tFixed & 0xFF;
+				final int invFx = 256 - fx;
+				final int invFy = 256 - fy;
+				
+				final int rbTop = (((c00 & 0x00FF00FF) * invFx + (c10 & 0x00FF00FF) * fx) >>> 8) & 0x00FF00FF;
+				final int agTop = ((((c00 >>> 8) & 0x00FF00FF) * invFx + ((c10 >>> 8) & 0x00FF00FF) * fx) >>> 8) & 0x00FF00FF;
+				
+				final int rbBot = (((c01 & 0x00FF00FF) * invFx + (c11 & 0x00FF00FF) * fx) >>> 8) & 0x00FF00FF;
+				final int agBot = ((((c01 >>> 8) & 0x00FF00FF) * invFx + ((c11 >>> 8) & 0x00FF00FF) * fx) >>> 8) & 0x00FF00FF;
+				
+				final int rb = ((rbTop * invFy + rbBot * fy) >>> 8) & 0x00FF00FF;
+				final int ag = ((agTop * invFy + agBot * fy) >>> 8) & 0x00FF00FF;
+				
+				paintPixel = texBlenders[unitIdx] == null ? (ag << 8) | rb 
+					: texBlenders[unitIdx].blend(paintPixel, (ag << 8) | rb, textures[unitIdx].getBlendColor());
+			}
+		};
+	}
+}

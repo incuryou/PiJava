@@ -1,0 +1,62 @@
+#pragma once
+#include "host_keymap.h"
+#include <array>
+namespace host_controller {
+struct Anchor {int input,x,y,w,h,tag_x,tag_y;const char* tag;};
+inline constexpr std::array<std::array<Anchor,16>,3> layouts = {{
+    {{ // ivory
+        {host_keymap::ZL,152,44,96,36,259,62,"ZL"},
+        {host_keymap::L,133,104,96,35,240,122,"L"},
+        {host_keymap::Minus,298,141,48,42,322,206,"-"},
+        {host_keymap::InputCount,135,248,104,64,187,309,""},
+        {host_keymap::DUp,207,398,63,50,238,453,""},
+        {host_keymap::DLeft,147,462,63,50,178,517,""},
+        {host_keymap::DRight,263,462,63,50,294,517,""},
+        {host_keymap::DDown,207,527,63,50,238,581,""},
+        {host_keymap::ZR,1032,44,96,36,1021,62,"ZR"},
+        {host_keymap::R,1054,104,95,35,1042,122,"R"},
+        {host_keymap::Plus,933,143,48,42,957,208,"+"},
+        {host_keymap::X,1048,202,74,49,1085,256,"X"},
+        {host_keymap::Y,976,279,74,49,1013,333,"Y"},
+        {host_keymap::A,1122,277,73,49,1159,331,"A"},
+        {host_keymap::B,1047,357,73,48,1084,411,"B"},
+        {host_keymap::InputCount+1,973,486,103,63,1024,547,""},
+    }},
+    {{ // blue
+        {host_keymap::ZL,146,57,92,33,249,74,"ZL"},
+        {host_keymap::L,127,118,93,33,231,135,"L"},
+        {host_keymap::Minus,285,163,46,40,308,224,"-"},
+        {host_keymap::InputCount,143,261,100,58,193,317,""},
+        {host_keymap::DUp,204,399,60,47,234,450,""},
+        {host_keymap::DLeft,144,464,61,47,174,515,""},
+        {host_keymap::DRight,264,465,61,47,295,516,""},
+        {host_keymap::DDown,205,532,61,46,236,582,""},
+        {host_keymap::ZR,1044,59,93,33,1033,75,"ZR"},
+        {host_keymap::R,1061,119,93,33,1050,135,"R"},
+        {host_keymap::Plus,949,163,46,40,972,224,"+"},
+        {host_keymap::X,1053,220,71,45,1088,270,"X"},
+        {host_keymap::Y,978,288,71,45,1013,338,"Y"},
+        {host_keymap::A,1127,286,71,45,1162,336,"A"},
+        {host_keymap::B,1053,360,72,45,1089,410,"B"},
+        {host_keymap::InputCount+1,981,487,100,58,1031,543,""},
+    }},
+    {{ // black
+        {host_keymap::ZL,148,42,94,35,253,59,"ZL"},
+        {host_keymap::L,128,105,94,36,233,123,"L"},
+        {host_keymap::Minus,288,147,47,42,312,212,"-"},
+        {host_keymap::InputCount,133,251,101,64,183,313,""},
+        {host_keymap::DUp,202,399,61,51,233,454,""},
+        {host_keymap::DLeft,142,462,62,51,173,517,""},
+        {host_keymap::DRight,258,463,61,51,288,518,""},
+        {host_keymap::DDown,203,528,61,51,233,583,""},
+        {host_keymap::ZR,1039,47,95,35,1029,65,"ZR"},
+        {host_keymap::R,1058,106,94,36,1047,124,"R"},
+        {host_keymap::Plus,940,147,47,42,963,212,"+"},
+        {host_keymap::X,1052,203,72,49,1088,258,"X"},
+        {host_keymap::Y,980,280,72,49,1016,334,"Y"},
+        {host_keymap::A,1125,279,72,49,1161,333,"A"},
+        {host_keymap::B,1052,357,72,49,1088,411,"B"},
+        {host_keymap::InputCount+1,973,490,102,63,1024,551,""},
+    }},
+}};
+}
