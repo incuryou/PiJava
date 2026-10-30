@@ -64,6 +64,7 @@ static void wait_to_blocked(JavaThreadContext& t) {
 }
 static void refresh_thread(JavaThreadContext& t) {
     const bool was_sleeping=t.state==ThreadState::Sleeping;
+    const bool diagnostic_wait=was_sleeping||t.state==ThreadState::Joining;
     int64_t now=monotonic_ms();
     if(t.state==ThreadState::Initializing && VMS_CL(g_classes)[t.init_wait].init_state!=1) {t.init_wait=-1;t.state=ThreadState::Runnable;}
     if(t.state==ThreadState::Sleeping && t.wake_us) {
@@ -89,12 +90,31 @@ static void refresh_thread(JavaThreadContext& t) {
         }
     }
     if(was_sleeping && t.state==ThreadState::Runnable)t.frame_prep.woke(paint_clock_us());
+    if(diagnostic_wait&&t.state==ThreadState::Runnable)diag_sleep_ready(t);
 }
 static bool monitor_enter(int ref) {
     auto& t=current_context(); auto& m=VMS_EXEC(g_monitors)[ref];
     if(!m.owner || m.owner==&t) { m.owner=&t; ++m.depth; return true; }
     t.state=ThreadState::Blocked; t.monitor=ref; t.restore_depth=1; t.reacquire=false;
     return false;
+}
+// A worker can be pumped while a native event callback is sleeping or at an
+// instruction budget. Entering its synchronous paint here can wait for a
+// monitor owned by that suspended event (including locks inside collections).
+// Leave the original serviceRepaints invoke pending until event delivery has
+// returned or the request has been serviced. The event's own serviceRepaints
+// keeps the MIDP synchronous exception.
+static bool service_repaints_pending(int target){
+    return target>0&&target==VMS_RS(g_current)&&VMS_RS(g_repaint);
+}
+static bool service_repaints_wait_event(const Method* native,int target){
+    auto* event=VMS_EXEC(g_exec_ctx).event_callback_owner;
+    if(!event||event==&current_context()||!VMS_EXEC(g_can_suspend)||VMS_RS(g_paint_depth)||
+       !service_repaints_pending(target)||!native||
+       native->name!="serviceRepaints"||native->desc!="()V"||
+       VMS_CL(g_classes)[native->class_id].name!="javax/microedition/lcdui/Canvas")return false;
+    current_context().service_repaints_deferred=true;
+    return true;
 }
 // A resumable worker must wait BEFORE entering a nonserializable native paint
 // continuation when paint's first action necessarily acquires this Canvas.
@@ -136,6 +156,7 @@ static void release_frame_monitor(Frame& fr) {
     auto& t=current_context();
     if(t.wait_frame.method==fr.method)speed_frame_wait_cancel_request(t);
     if(t.compensated_sleep.method==fr.method)t.compensated_sleep.cancel();
+    if(t.event_frame_sleep.method==fr.method)t.event_frame_sleep.cancel();
     if(t.cached_elapsed.method==fr.method)t.cached_elapsed.cancel();
     if(t.residual_sleep.method==fr.method)t.residual_sleep.cancel();
     if(t.rechecked_deadline.method==fr.method)t.rechecked_deadline.cancel();
@@ -156,9 +177,12 @@ static void update_thread_live() {
     for(auto& t:VMS_EXEC(g_threads)) if(t.state!=ThreadState::Terminated) { VMS_EXEC(g_thread_live)=true; break; }
 }
 static void finish_thread(JavaThreadContext& t) {
+    t.service_repaints_deferred=false;
+    diag_sleep_cancel(t,runtime_cause::CancelReason::Terminated);
     speed_timer_block(t);
     t.residual_sleep.reset();t.rechecked_deadline.reset();
     t.compensated_sleep.reset();t.cached_elapsed.reset();
+    t.event_frame_sleep.reset();
     t.field_gate_anchor.reset();
     speed_frame_wait_cancel_request(t);t.wait_frame.reset();
     p1_thread_end(t);
@@ -193,6 +217,18 @@ static bool pump_one_thread() {
         auto& t=*cursor;
         if(++cursor==VMS_EXEC(g_threads).end())cursor=VMS_EXEC(g_threads).begin();
         if(t.executing || t.state!=ThreadState::Runnable)continue;
+        if(t.service_repaints_deferred){
+            // A request may have been consumed by the event or the host. It
+            // is complete only after paint returns; unrelated producers can
+            // still run while that paint explicitly yields.
+            const int target=t.frames.empty()||t.frames.back().stack.empty()?0:t.frames.back().stack.back().ref;
+            if(VMS_RS(g_paint_depth)&&(target==VMS_EXEC(g_exec_ctx).active_paint_canvas||
+               service_repaints_pending(target)))continue;
+            auto* event=VMS_EXEC(g_exec_ctx).event_callback_owner;
+            if(event&&event!=&t&&service_repaints_pending(target))continue;
+            t.service_repaints_deferred=false;
+        }
+        diag_sleep_dispatch(t);
         if(t.sleep_sample_due) {VMS_EXEC(g_wake_stats).dispatched(t.sleep_sample_due,monotonic_ms());t.sleep_sample_due=0;}
         VMS_EXEC(g_round_robin)=(index+1)%count;
         const ExecutionContext::ThreadSlice saved_slice=VMS_EXEC(g_exec_ctx).save_slice();  // whole per-thread slice
@@ -218,6 +254,7 @@ static void suspend_current(bool run_others) {
     auto& t=current_context();
     const bool timer_wait=t.state==ThreadState::Waiting&&t.timer.queue_wait&&t.monitor==t.timer.draw.queue;
     if(t.state!=ThreadState::Runnable)t.residual_sleep.cancel();
+    if(t.state!=ThreadState::Runnable)t.event_frame_sleep.cancel();
     t.timer.queue_wait=false;
     if(t.state!=ThreadState::Runnable&&!(t.state==ThreadState::Waiting&&(t.wait_frame.paced||t.wait_frame.awaiting_paint)))speed_frame_wait_cancel_request(t);
     if(t.state!=ThreadState::Runnable&&!timer_wait)speed_timer_block(t);
@@ -236,6 +273,7 @@ static void suspend_current(bool run_others) {
             { P7_SCOPE(Idle); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
         }
     }
+    if(t.state==ThreadState::Runnable)diag_sleep_dispatch(t);
     deliver_interrupt();
     city_wait.end(t.state==ThreadState::Terminated?"terminated":"resumed");
 }
@@ -269,7 +307,9 @@ static void thread_native(Method* method,Frame& fr) {
     if(name=="interrupt") {
         int ref=arg(0).ref;auto* t=thread_context(ref);
         if(!t)return;
+        diag_sleep_cancel(*t,runtime_cause::CancelReason::Interrupted);
         t->frame_prep.reset();speed_frame_wait_cancel_request(*t);t->residual_sleep.cancel();t->compensated_sleep.cancel();speed_timer_block(*t);
+        t->event_frame_sleep.cancel();
         if(t->frame_sleep_bridge)speed_invalidate_group(*t);
         set_interrupted(ref,true);
         if(t->state==ThreadState::Waiting || (t->state==ThreadState::Blocked&&t->reacquire)) {
@@ -281,6 +321,7 @@ static void thread_native(Method* method,Frame& fr) {
     }
     if(name=="yield") {
         auto& t=current_context();const auto& s=t.wait_frame;
+        t.event_frame_sleep.cancel();
         const auto* stack=VMS_EXEC(g_active_stack);
         // This exact common-tail yield follows remainder wait or overtime;
         // it is not a repeated busy-poll yield. Keep all existing learner
@@ -294,11 +335,14 @@ static void thread_native(Method* method,Frame& fr) {
     }
     if(name=="sleep" || name=="join") {
         bool join=name=="join";int64_t ms=as_long(arg(join?1:0));const int64_t p84_req_ms=ms;
+        if(join||ms<=0)current_context().event_frame_sleep.cancel();
+        auto diagnostic_route=join?runtime_cause::Route::Join:ms>120?runtime_cause::Route::LongUnpaced:runtime_cause::Route::Unpaced;
         if(ms<0){throw_new("java/lang/IllegalArgumentException","negative timeout");return;}
         if(join&&!thread_alive(arg(0).ref))return;
         int ref=current_thread_ref();
-        if(thread_interrupted(ref)){current_context().frame_prep.reset();set_interrupted(ref,false);throw_new("java/lang/InterruptedException","interrupted");return;}
+        if(thread_interrupted(ref)){current_context().event_frame_sleep.cancel();current_context().frame_prep.reset();set_interrupted(ref,false);throw_new("java/lang/InterruptedException","interrupted");return;}
         auto& t=current_context();
+        const bool diagnostic_owned=t.frame_due_us!=0; // Same earned-deadline test used by speed_frame_wake_us.
         speed_timer_block(t);
         if(join)t.frame_prep.reset();
         if(!join) {
@@ -319,10 +363,16 @@ static void thread_native(Method* method,Frame& fr) {
         t.sleep_request = 0;
         if (!r4::state.active && !join && ms > 0) {
             speed_compensated_sleep_begin(ms);
-            const int64_t checked=speed_rechecked_sleep_wake_us(ms);
-            const int64_t cached=checked?0:speed_cached_elapsed_sleep_wake_us(ms);
-            const int64_t residual=(checked||cached)?0:(ms<8?speed_residual_sleep_wake_us(ms):0);
-            const int64_t due = checked?checked:cached?cached:residual?residual:speed_frame_wake_us(ms);
+            const int64_t event=speed_event_frame_sleep_wake_us(ms);
+            const int64_t checked=event?0:speed_rechecked_sleep_wake_us(ms);
+            const int64_t cached=(event||checked)?0:speed_cached_elapsed_sleep_wake_us(ms);
+            const int64_t residual=(event||checked||cached)?0:(ms<8?speed_residual_sleep_wake_us(ms):0);
+            const int64_t due = event?event:checked?checked:cached?cached:residual?residual:speed_frame_wake_us(ms);
+            if(event)diagnostic_route=runtime_cause::Route::EventFrame;
+            else if(checked)diagnostic_route=runtime_cause::Route::Checked;
+            else if(cached)diagnostic_route=runtime_cause::Route::Cached;
+            else if(residual)diagnostic_route=runtime_cause::Route::Residual;
+            else if(due)diagnostic_route=runtime_cause::Route::Frame;
             if (due < 0) ms = 0;
             else if (due > 0) {
                 t.wake_us = due;
@@ -336,6 +386,7 @@ static void thread_native(Method* method,Frame& fr) {
         t.wake=join&&ms==0?0:thread_deadline(ms);
         t.state=join?ThreadState::Joining:(ms?ThreadState::Sleeping:ThreadState::Runnable);
         t.join_target=join?arg(0).ref:0;
+        diag_sleep_start(t,p84_req_ms,ms,r4::state.active?runtime_cause::Route::Virtual:diagnostic_route,diagnostic_owned);
         suspend_current(ms==0);return;
     }
     die("native Thread."+name);
@@ -358,6 +409,7 @@ static void object_monitor_native(Method* method,Frame& fr) {
         return;
     }
     int self=current_thread_ref();
+    t.event_frame_sleep.cancel();
     if(thread_interrupted(self)){t.frame_prep.reset();speed_frame_wait_cancel_request(t);set_interrupted(self,false);throw_new("java/lang/InterruptedException","interrupted");return;}
     t.wake_us=0;
     if(timeout)timeout=speed_timer_wait_ms(ref,timeout,t);

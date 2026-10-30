@@ -1,3 +1,5 @@
+> Latest release: **Fit30 / KeyUI7 / GPUF5**. [Download](https://github.com/incuryou/PiJava/releases/tag/v0.2.114-keyui7-gpuf5-fit30) · [Fit30 validation](docs/FIT30.md) · [Screenshots](README.md#运行画面). The masked screenshots come from a user video; the game-only screenshots are host VM replays, not physical Switch evidence.
+
 # Pi Java Emulator / Pi Java模拟器
 
 <img src="assets/icon.png" width="128" alt="Pi Java logo">

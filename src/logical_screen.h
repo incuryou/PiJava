@@ -5,7 +5,13 @@
 #include <string>
 // Java canvas dimensions are independent of the fixed 480x640 host viewport.
 namespace logical_screen {
-inline bool valid(int w,int h) { return w>=16&&h>=16&&w<=640&&h<=640; }
+constexpr int min_axis=16,max_axis=800,max_pixels=640*640;
+// Share the same bounded pixel budget with presentation. The low-level
+// presenter also accepts thin contract fixtures; Java canvases retain min16.
+inline bool valid_extent(int w,int h) {
+    return w>=1&&h>=1&&w<=max_axis&&h<=max_axis&&int64_t(w)*h<=max_pixels;
+}
+inline bool valid(int w,int h) { return w>=min_axis&&h>=min_axis&&valid_extent(w,h); }
 inline bool parse(std::string text,int& w,int& h) {
     if(text.size()>32)return false;
     if(!text.empty()&&text.back()=='\n')text.pop_back();
@@ -15,7 +21,7 @@ inline bool parse(std::string text,int& w,int& h) {
     for(size_t i=0;i<text.size();++i) {
         if(i==x)continue;
         if(text[i]<'0'||text[i]>'9')return false;
-        int& n=i<x?a:b;n=n*10+(text[i]-'0');if(n>640)return false;
+        int& n=i<x?a:b;n=n*10+(text[i]-'0');if(n>max_axis)return false;
     }
     if(!valid(a,b))return false;w=a;h=b;return true;
 }
@@ -23,7 +29,11 @@ inline bool parse(std::string text,int& w,int& h) {
 inline int sidecar(const std::string& jar,int& w,int& h) {
     w=240;h=320;if(jar.empty())return 0;
     const std::string path=jar+".screen";FILE* f=std::fopen(path.c_str(),"rb");
-    if(!f)return errno==ENOENT?0:-1;
+    if(!f){
+        if(errno!=ENOENT)return -1;
+        f=std::fopen((path+".previous").c_str(),"rb");
+        if(!f)return errno==ENOENT?0:-1;
+    }
     char bytes[33];size_t n=std::fread(bytes,1,sizeof(bytes),f);bool ok=!std::ferror(f);ok=std::fclose(f)==0&&ok;
     return ok&&n<=32&&parse(std::string(bytes,n),w,h)?1:-1;
 }

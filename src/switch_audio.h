@@ -198,11 +198,13 @@ public:
         if (skipRenderIfQueuedAtLeast >= 0 && queued >= (size_t)skipRenderIfQueuedAtLeast) return 0;
         return fillAndStart(&engine, maxNew);
     }
-    // Gameplay frame: at most one 21 ms block, and only when fewer than two
-    // blocks remain. Startup, suspend and reset still fill the whole queue.
-    Result pumpFrame(Engine& engine) { return pump(engine, 1, 2); }
-    // At least two known queued blocks cover >42 ms. Cache ownership for at
-    // most 1 ms; do not spin on IPC thousands of times between block releases.
+    // Refill the bounded queue when at most two blocks remain. A late frame
+    // can consume more than one 21 ms block; replenishing only one leaves
+    // the next late frame underfed. Three queued blocks still skip mixing.
+    Result pumpFrame(Engine& engine) { return pump(engine, -1, 3); }
+    // With at least two known queued descriptors, cache ownership for at
+    // most 1 ms; one descriptor may already be partly played. Avoid spinning
+    // on IPC thousands of times between block releases.
     // Lifecycle operations invalidate pumpClockValid_. Clock rollback forces
     // a real collection; raw pump()/pumpFrame() remain available for callers.
     Result pumpThrottled(Engine& engine, bool frame = false) {
@@ -245,6 +247,7 @@ public:
         return count;
     }
     const Stats& metrics() const { return stats_; }
+    uint64_t lastServiceUs() const { return pumpClockValid_?lastPumpUs_:0; } // Owner-only diagnostic read; no IPC/fence.
     Stats takeStats() {
         const Stats result = stats_;
         stats_ = Stats{};

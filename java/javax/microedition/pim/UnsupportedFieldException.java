@@ -1,0 +1,11 @@
+package javax.microedition.pim;
+
+/** JSR-75 field failure retaining the affected field identifier. */
+public class UnsupportedFieldException extends RuntimeException {
+    private final int field;
+
+    public UnsupportedFieldException() { field = 0; }
+    public UnsupportedFieldException(String message) { super(message); field = 0; }
+    public UnsupportedFieldException(String message, int field) { super(message); this.field = field; }
+    public int getField() { return field; }
+}

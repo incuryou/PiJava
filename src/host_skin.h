@@ -108,8 +108,9 @@ public:
     // Call only when clearing the framebuffer ring. A repeated game start or
     // its three buffers reuses the active texture, including a failed attempt.
     bool select(int bezel, const Logger& log = Logger{}, const Loader& loader = load_file) {
-        if (bezel == attempted_) return !pixels_.empty();
-        attempted_ = bezel;
+        const int asset = bezel;
+        if (asset == attempted_) return !pixels_.empty();
+        attempted_ = asset;
         release(pixels_);
         const char* filename = path(bezel);
         if (!filename) return false;
@@ -117,7 +118,8 @@ public:
         if (!loader(filename, pixels_, error) || pixels_.size() != pixel_count) {
             release(pixels_);
             if (log) log("SKIN load failed path=" + std::string(filename) + " reason=" +
-                         (error.empty() ? "invalid decoded size" : error) + " fallback=native");
+                         (error.empty() ? "invalid decoded size" : error) +
+                         (bezel == j2me_present::adaptive_bezel ? " fallback=black" : " fallback=native"));
             return false;
         }
         return true;

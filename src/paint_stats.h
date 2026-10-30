@@ -1,10 +1,12 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
+#include "frame_metrics.h"
 
 // Canvas callback timings; GameCanvas flushes are counted separately because
 // draw_end() also runs for flushGraphics(), which supplies no paint duration.
 struct PaintStatsWindow {
+    DurationHistogram paint_durations; // Callback wall time, not draw intervals.
     int64_t elapsed_us = 0, paint_us = 0, paint_max_us = 0, worker_us = 0;
     uint64_t canvas_paints = 0, gamecanvas_flushes = 0, over_60hz = 0, over_30hz = 0;
     double canvas_fps() const { return elapsed_us > 0 ? canvas_paints * 1000000.0 / elapsed_us : 0; }
@@ -22,6 +24,7 @@ struct CanvasPaintStats {
     void completed(int64_t duration_us) {
         duration_us = std::max<int64_t>(0, duration_us);
         ++pending.canvas_paints;
+        pending.paint_durations.add(uint64_t(duration_us));
         pending.paint_us += duration_us;
         pending.paint_max_us = std::max(pending.paint_max_us, duration_us);
         // Exact 1/60 and 1/30 second budgets, without millisecond rounding.

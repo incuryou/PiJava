@@ -19,6 +19,13 @@ public class Display {
         alert.returnScreen = next;
         setCurrent0(alert, alert.getTimeout(), next);
     }
+    public void setCurrentItem(Item item) {
+        if (item == null) throw new NullPointerException();
+        if (!(item.owner instanceof Form)) throw new IllegalStateException();
+        Form form = (Form)item.owner;
+        form.focusItem(item);
+        setCurrent(form);
+    }
     public native Displayable getCurrent();
     public boolean vibrate(int millis) { if (millis < 0) throw new IllegalArgumentException(); return false; }
     public int numColors() { return 65536; }

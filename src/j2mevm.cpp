@@ -21,6 +21,7 @@
 #include "latin16.h"
 #include "logical_screen.h"
 #include "canvas_resolution.h"
+#include "canvas_declared_size.h"
 #include "raster_region.h"
 #include "raster_primitives.h"
 #include "pixel_compat236.h"
@@ -38,10 +39,12 @@
 #include "pace.h"
 #include "frame_prep.h"
 #include "cached_elapsed_gate.h"
+#include "cooperative_poll.h"
 #include "wait_frame.h"
 #include "residual_sleep.h"
 #include "rechecked_deadline_gate.h"
 #include "compensated_sleep.h"
+#include "event_frame_sleep.h"
 #include "auto_fps.h"
 #include "timer_pacing.h"
 #include "poll_gate.h"
@@ -140,6 +143,7 @@ static void lifecycle_destroy(bool notify_only = false);
 static void runtime_early_repaint_handoff() {++VMS_EXEC(g_runtime_profile).pending.early_repaint_handoffs;}
 static void reset_runtime_stats();
 static uint64_t g_stat_present_seen=0;   // 0.2.113 F4: g_present_frames at the start of the current STAT window
+static uint64_t g_stat_jit_ops_seen=0;   // Diagnostic window baseline, never serialized.
  VMS_PLAT_ACCESSOR(g_present_stats, PresentStats)
 #if defined(__SWITCH__) && defined(J2ME_ENABLE_DEKO3D)
  VMS_PLAT_ACCESSOR(g_gpu_active, bool) // Renderer diagnostics precede the host module.
@@ -187,6 +191,8 @@ static void speed_compensated_clock(const Frame&,int64_t);
 static void speed_compensated_sleep_begin(int64_t);
 static void speed_compensated_sleep_retimed(int64_t,int64_t);
 static int64_t speed_compensated_subtract(const Frame&,int64_t,int64_t,int64_t);
+static void speed_event_frame_clock(Frame&,int64_t,QuickSite&);
+static int64_t speed_event_frame_sleep_wake_us(int64_t);
 static int64_t speed_residual_sleep_wake_us(int64_t requested_ms);
 static int64_t speed_frame_wait_wake_us(int ref,int64_t requested_ms,JavaThreadContext& t);
 static void speed_frame_wait_repaint(int canvas);
@@ -231,6 +237,7 @@ static bool g_die_catch = false;
 
 #include "runtime/value.h"
 #include "array_storage.h"
+VMS_HEAP_ACCESSOR(g_primitive_buffers, PrimitiveBufferPool)
 
 #include "runtime/object_model.inc"
 
@@ -266,6 +273,8 @@ struct JavaThreadContext {
     FramePrepBudget frame_prep;
     ResidualSleepState residual_sleep;
     CompensatedSleepState compensated_sleep;
+    EventFrameSleepState event_frame_sleep;
+    uint64_t event_frame_generation=0; // transient cycle identity; never a Java/save field
     RecheckedDeadlineState rechecked_deadline;
     FrameWaitState wait_frame;
     bool sleep_paced = false;
@@ -273,6 +282,8 @@ struct JavaThreadContext {
     int64_t frame_group_started_us = 0;
     AutoFpsLearner auto_fps;
     PollGateState poll_gate;
+    NativeDeadlineEvidence native_deadline;
+    uint64_t native_deadline_generation = 0;
     CachedElapsedState cached_elapsed;
     FieldGateAnchor field_gate_anchor;
     GateRecovery gate_recovery;
@@ -280,6 +291,7 @@ struct JavaThreadContext {
     int sleep_request = 0;
     int monitor = 0, restore_depth = 0, join_target = 0, unhandled = 0, init_wait = -1;
     bool reacquire = false, interrupt_exception = false, executing = false, begun = false;
+    bool service_repaints_deferred = false; // pending original invoke, never a saved callback
 };
 static JavaThreadContext* g_timer_clock_owner=nullptr;
 struct Monitor { JavaThreadContext* owner = nullptr; int depth = 0; std::deque<JavaThreadContext*> waiters; };
@@ -325,6 +337,7 @@ static bool speed_ahead();
 static void speed_cached_elapsed_clock(const Frame&,int64_t,QuickSite&);
 static bool speed_cached_elapsed_branch(Frame&,int,int);
 static int64_t speed_cached_elapsed_sleep_wake_us(int64_t);
+static void cooperative_poll_clock(Frame&,int64_t&,QuickSite&,bool,int64_t);
 static int64_t speed_begin_frame(JavaThreadContext* owner = nullptr);
 static bool speed_group_helper(JavaThreadContext* owner);
 static bool speed_pending_group();
@@ -352,10 +365,14 @@ static void speed_reset_learning() {
     VMS_EXEC(g_repaint_yield_method)=nullptr;VMS_EXEC(g_repaint_yield_pc)=-1;
     VMS_EXEC(g_speed_budget_owner)=nullptr;
     VMS_EXEC(g_main_thread).auto_fps.reset(); VMS_EXEC(g_main_thread).gate_recovery.reset(); VMS_EXEC(g_main_thread).poll_gate.reset(); VMS_EXEC(g_main_thread).field_gate_anchor.reset(); VMS_EXEC(g_main_thread).owned_draws=0;
+    VMS_EXEC(g_main_thread).native_deadline.reset();
     VMS_EXEC(g_main_thread).frame_due_us=0; VMS_EXEC(g_main_thread).timer={}; VMS_EXEC(g_main_thread).sleep_paced=false; VMS_EXEC(g_main_thread).frame_sleep_bridge=VMS_EXEC(g_main_thread).mixed_wait=false; VMS_EXEC(g_main_thread).frame_group_started_us=0;
+    VMS_EXEC(g_main_thread).event_frame_sleep.reset();
     VMS_EXEC(g_main_thread).compensated_sleep.reset();VMS_EXEC(g_main_thread).cached_elapsed.reset();VMS_EXEC(g_main_thread).frame_prep.reset();VMS_EXEC(g_main_thread).wait_frame.reset();VMS_EXEC(g_main_thread).residual_sleep.reset();VMS_EXEC(g_main_thread).rechecked_deadline.reset();
     for(auto& t:VMS_EXEC(g_threads)) {
         t.auto_fps.reset(); t.gate_recovery.reset(); t.poll_gate.reset(); t.field_gate_anchor.reset(); t.owned_draws=0; t.frame_due_us=0; t.timer={}; t.sleep_paced=false; t.frame_sleep_bridge=t.mixed_wait=false; t.frame_group_started_us=0;
+        t.native_deadline.reset();
+        t.event_frame_sleep.reset();
         t.compensated_sleep.reset();t.cached_elapsed.reset();t.frame_prep.reset();t.wait_frame.reset();t.residual_sleep.reset();t.rechecked_deadline.reset();
     }
 }
@@ -400,6 +417,38 @@ static void speed_invalidate_group(JavaThreadContext& owner,bool transient_timeo
     }
 }
 // P8.7: async durable log (see async_log.inc). Main thread enqueues; writer thread flushes in batches.
+#include "runtime_diagnostics.h"
+#include "causal_diagnostics.h"
+struct DeviceDiagnostics {
+    runtime_diag::Flight flight;runtime_diag::Labels labels;runtime_diag::Live live;
+    runtime_diag::LiveSnapshot owner;runtime_diag::WindowDetector detector;runtime_diag::IncidentGate gate;
+    runtime_diag::AudioLive audio;
+    runtime_cause::Allocations allocations;runtime_cause::Sleeps sleeps;
+    uint64_t sleep_reported=0,jit_creates_seen=0,jit_failures_seen=0,jit_create_us_seen=0;
+    uint64_t incidents=0,throw_count=0,caught_count=0,windows=0;
+    int64_t last_point_note=0;bool reporting=false;
+};
+static DeviceDiagnostics g_device_diag;
+struct DiagnosticNativeToken {runtime_diag::LiveSnapshot previous;int64_t began=0;uint32_t method=0;runtime_diag::Phase phase=runtime_diag::Phase::Native;};
+static void diag_watchdog_tick();
+static void diag_fault(const char* reason,const char* detail,bool force=true);
+static void diag_exception(int ref);
+static void diag_caught(const Frame&,int handler);
+static void diag_host(bool active,bool paused);
+static void diag_checkpoint(const std::vector<Frame>&);
+static void diag_launch(const std::string&,const std::string&);
+static DiagnosticNativeToken diag_native_enter(Method*);
+static DiagnosticNativeToken diag_phase_enter(runtime_diag::Phase);
+static void diag_native_leave(const DiagnosticNativeToken&);
+static void diag_window(int64_t,const PaintStatsWindow&,const RuntimeProfileWindow&,uint64_t);
+static void diag_alloc(const std::string&,size_t,uint64_t);
+static void diag_sleep_start(JavaThreadContext&,int64_t,int64_t,runtime_cause::Route,bool);
+static void diag_sleep_ready(JavaThreadContext&);
+static void diag_sleep_dispatch(JavaThreadContext&);
+static void diag_sleep_cancel(JavaThreadContext&,runtime_cause::CancelReason reason=runtime_cause::CancelReason::Manual);
+static void diag_causal_reset();
+static void diag_causal_window(int64_t);
+static void diag_causal_snapshot();
 #include "async_log.inc"
 static void log_open(const char* path,bool truncate){
     j2melog::shutdown(); // join previous writer if any (suite relaunch)
@@ -407,6 +456,10 @@ static void log_open(const char* path,bool truncate){
     VMS_PLAT(g_log).clear();
     j2melog::g_path=path; j2melog::g_bytes=0; j2melog::g_shed=0; j2melog::g_shed_reported=0; j2melog::g_drops=0; j2melog::g_drops_reported=0;
     j2melog::g_main_us.store(0,std::memory_order_relaxed);
+    j2melog::g_io_uncertain=false;j2melog::g_key_drops=0;j2melog::g_hf_drops=0;j2melog::g_fault_drops=0;
+    g_device_diag.owner.session=uint64_t(paint_clock_us());
+    g_device_diag.owner.active=false;g_device_diag.live.publish(g_device_diag.owner);
+    j2melog::g_tick=&diag_watchdog_tick;
     VMS_PLAT(g_log).open(path,truncate?std::ios::out|std::ios::trunc:std::ios::out|std::ios::app);
     j2melog::g_fault_at=0;
     if(const char* f=std::getenv("J2ME_LOG_FAULT_AT"))j2melog::g_fault_at=std::strtoull(f,nullptr,10);
@@ -438,14 +491,17 @@ static void log_line(const std::string& m) {
             j2melog::g_shed_reported = j2melog::g_shed;
         }
         if (is_key && j2melog::g_drops != j2melog::g_drops_reported) {
-            j2melog::enqueue("[" + std::to_string(t) + "] LOGDROP queue_shed=" + std::to_string(j2melog::g_drops) + " cap=" + std::to_string(j2melog::kQueueCap), true);
+            j2melog::enqueue("[" + std::to_string(t) + "] LOGDROP queue_shed=" + std::to_string(j2melog::g_drops) + " key_lost="+std::to_string(j2melog::g_key_drops)+" hf_lost="+std::to_string(j2melog::g_hf_drops)+" fault_lost="+std::to_string(j2melog::g_fault_drops)+" cap=" + std::to_string(j2melog::kQueueCap), true);
             j2melog::g_drops_reported = j2melog::g_drops;
         }
         j2melog::enqueue(std::move(line), is_key);
     }
     j2melog::g_main_us.fetch_add(uint64_t(std::max<int64_t>(0,paint_clock_us()-t0)),std::memory_order_relaxed);
 }
-static void log_drain(){ j2melog::drain(); }
+static void log_drain(){
+    if(j2melog::drain())return;
+    log_line("LOGDRAIN result=timeout_or_uncertain io_uncertain="+std::to_string(j2melog::g_io_uncertain.load())+" io_failures="+std::to_string(j2melog::g_failures.load())+" key_lost="+std::to_string(j2melog::g_key_drops.load()));
+}
 static void log_shutdown(){ j2melog::shutdown(); }
 // Startup-only breadcrumbs also reach the host debugger independently of SD
 // logging, so a stalled logger cannot hide an audio/JIT/reset boundary.
@@ -485,6 +541,7 @@ static void speed_certified_gate(JavaThreadContext& context,Method* method,int p
 }
 static void audio_event(const std::string& message) {
     const int64_t now=monotonic_ms();
+    g_device_diag.flight.note(paint_clock_us(),"audio",message.c_str());
     if(now-VMS_PLAT(g_audio_event_window)>=1000) {VMS_PLAT(g_audio_event_window)=now;VMS_PLAT(g_audio_event_count)=0;}
     if(VMS_PLAT(g_audio_event_count)++<24)log_line("AUDIO "+message);
     else ++VMS_PLAT(g_audio_event_suppressed);
@@ -494,6 +551,7 @@ static void audio_event(const std::string& message) {
     p7audio::fence();p7::pool().shutdown();r4::finish("INCOMPLETE",reason);std::exit(70);
 }
 static void die(const std::string& m) {
+    diag_fault("VM_FATAL",m.c_str()); // Before longjmp, cleanup or frame destruction.
     if(r4::state.active){log_line("EX "+m);log_drain();r4_abort("VM_FATAL");}
     VMS_EXEC(g_error) = m;
     log_line("EX " + m);
@@ -509,6 +567,16 @@ static uint32_t ru32le(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[
 static int ensure_class(const std::string& name);
 static int load_class_file(const std::string& name, bool fatal = true);
 static Value run(Method* entry, const std::vector<Value>& args);
+static Value run_event_callback(Method* entry, const std::vector<Value>& args) {
+    struct EventScope {
+        JavaThreadContext* previous;
+        EventScope():previous(VMS_EXEC(g_exec_ctx).event_callback_owner) {
+            VMS_EXEC(g_exec_ctx).event_callback_owner=&current_context();
+        }
+        ~EventScope(){VMS_EXEC(g_exec_ctx).event_callback_owner=previous;}
+    } event;
+    return run(entry,args);
+}
 static void throw_ref(int ref);
 static int alloc_obj(int cls);
 static bool read_whole(const std::string& path, std::vector<uint8_t>& out);
@@ -668,13 +736,14 @@ static int alloc_slot() {
 static int alloc_array(const std::string& descriptor, size_t length) {
     int ref = alloc_slot();
     Obj& o = VMS_HEAP(g_heap)[ref];
-    if (!o.elems.reset(descriptor, length)) die("invalid array descriptor or length");
+    if (!o.elems.reset(descriptor, length, &VMS_HEAP(g_primitive_buffers))) die("invalid array descriptor or length");
     o.is_array = true;
     o.array_desc = descriptor;
     uint64_t bytes = o.elems.payload_bytes();
     VMS_HEAP(g_array_payload_live) += bytes;
     VMS_HEAP(g_array_payload_peak) = std::max(VMS_HEAP(g_array_payload_peak), VMS_HEAP(g_array_payload_live));
     VMS_HEAP(g_array_alloc_since_gc) += bytes;
+    diag_alloc(descriptor,length,bytes);
     return ref;
 }
 static int alloc_obj(int cls) {
@@ -700,12 +769,22 @@ static int graphics_intrinsic(Method* mm) {
     if (mm->name == "drawImage" && mm->desc=="(Ljavax/microedition/lcdui/Image;III)V") return 1;
     if (mm->name == "drawRegion" && mm->desc=="(Ljavax/microedition/lcdui/Image;IIIIIIII)V") return 2;
     if (mm->name == "fillRect" && mm->desc=="(IIII)V") return 3;
+    if (mm->name == "drawLine" && mm->desc=="(IIII)V") return 9;
     if(J2ME_OPT_GFX_STATE) {
         if(mm->name=="setColor" && mm->desc=="(I)V")return 4;
         if(mm->name=="setColor" && mm->desc=="(III)V")return 5;
         if(mm->name=="setClip" && mm->desc=="(IIII)V")return 6;
         if(mm->name=="clipRect" && mm->desc=="(IIII)V")return 7;
         if(mm->name=="translate" && mm->desc=="(II)V")return 8;
+        if(mm->desc=="()I") {
+            if(mm->name=="getClipX")return 10;
+            if(mm->name=="getClipY")return 11;
+            if(mm->name=="getClipWidth")return 12;
+            if(mm->name=="getClipHeight")return 13;
+            if(mm->name=="getTranslateX")return 14;
+            if(mm->name=="getTranslateY")return 15;
+            if(mm->name=="getColor")return 16;
+        }
     }
     return 0;
 }
@@ -773,6 +852,18 @@ static const Field* pacing_loaded_static_long(const Class& c,int cp) {
     if(loaded==VMS_CL(g_class_index).end()||loaded->second<0||size_t(loaded->second)>=VMS_CL(g_classes).size())return nullptr;
     const auto* field=find_field(loaded->second,name,desc);
     if(!field||!field->is_static||field->owner<0||size_t(field->owner)>=VMS_CL(g_classes).size()||
+       field->slot<0||size_t(field->slot)>=VMS_CL(g_classes)[field->owner].statics.size())return nullptr;
+    return field;
+}
+static const Field* pacing_loaded_static_integral(const Class& c,int cp) {
+    if(cp<=0||size_t(cp)>=c.cp.size()||c.cp[cp].tag!=9)return nullptr;
+    std::string owner,name,desc;
+    if(!pacing_resolve_member(c,cp,owner,name,desc)||
+       (desc!="B"&&desc!="S"&&desc!="I"&&desc!="C"&&desc!="Z"))return nullptr;
+    const auto loaded=VMS_CL(g_class_index).find(owner);
+    if(loaded==VMS_CL(g_class_index).end()||loaded->second<0||size_t(loaded->second)>=VMS_CL(g_classes).size())return nullptr;
+    const auto* field=find_field(loaded->second,name,desc);
+    if(!field||!field->is_static||(field->flags&0x0040)||field->owner<0||size_t(field->owner)>=VMS_CL(g_classes).size()||
        field->slot<0||size_t(field->slot)>=VMS_CL(g_classes)[field->owner].statics.size())return nullptr;
     return field;
 }
@@ -891,6 +982,7 @@ static bool type_compatible(int ref, const std::string& want) {
     return descriptor_assignable(o.is_array ? o.array_desc : VMS_CL(g_classes)[o.cls].name, want);
 }
 static void throw_ref(int ref) {
+    diag_exception(ref); // Actual throw origin, before searching/unwinding handlers.
     current_context().compensated_sleep.cancel();
     current_context().rechecked_deadline.cancel(); // Same-method catches must earn fresh frame evidence.
     auto& cached_context=current_context();
@@ -942,6 +1034,7 @@ static void report_uncaught(int ref) {
         if (Field* f = find_field(VMS_HEAP(g_heap)[ref].cls, "detail", "Ljava/lang/String;")) msg = read_string(VMS_HEAP(g_heap)[ref].fields[f->slot].ref);
     }
     std::string message = "uncaught " + cn + (msg.empty() ? "" : " " + msg);
+    diag_fault("JAVA_UNCAUGHT",message.c_str());
     log_line("EX " + message);
     log_exception_trace(ref);
     if (VMS_EXEC(g_running_thread)) { VMS_EXEC(g_running_thread)->p1_end_reason=1; log_line("THREAD " + message); finish_thread(*VMS_EXEC(g_running_thread)); }
@@ -1135,8 +1228,81 @@ static bool gfx_anchor_ok(int anchor, bool text) {
         (text?(vertical==16||vertical==32||vertical==64):(vertical==2||vertical==16||vertical==32));
 }
 static void draw_region(int gfx, int target, int image_ref, int sx, int sy, int w, int h, int transform, int dx, int dy);
+// Resolved native ()I queries keep their diagnostic/profiling boundary and
+// original invoke charge, without constructing native argument/result Frames.
+// Non-void queries are excluded by the existing region-JIT Graphics admission.
+static int gfx_query_intrinsic(int kind,int self,Method* method) {
+    const auto diagnostic=diag_native_enter(method);
+    int result=0;
+    {
+        P61_SCOPE(2, method);
+        const auto target_entry=VMS_RS(g_gfx_target).find(self);
+        const int target=target_entry==VMS_RS(g_gfx_target).end()?0:target_entry->second;
+        GraphicsGlobalScope global_sample(VMS_RS(g_graphics_profile),target!=0);
+        GraphicsProfileScope native_sample(VMS_RS(g_graphics_profile),0);
+        auto state=[&](const std::unordered_map<int,int>& values) {
+            auto at=values.find(self);return at==values.end()?0:at->second;
+        };
+        auto difference=[](int a,int b){uint32_t bits=uint32_t(a)-uint32_t(b);int32_t value;std::memcpy(&value,&bits,4);return int(value);};
+        if(kind==16)result=state(VMS_RS(g_gfx_color))&0xffffff;
+        else if(kind==14)result=state(VMS_RS(g_gfx_tx));
+        else if(kind==15)result=state(VMS_RS(g_gfx_ty));
+        else {
+            auto at=VMS_RS(g_clip).find(self);
+            const Clip* clip=at!=VMS_RS(g_clip).end()&&at->second.on?&at->second:nullptr;
+            if(kind==10)result=difference(clip?clip->x:0,state(VMS_RS(g_gfx_tx)));
+            else if(kind==11)result=difference(clip?clip->y:0,state(VMS_RS(g_gfx_ty)));
+            else {
+                // The native width/height queries borrow pixels even with an
+                // explicit clip; retain that existing image-version barrier.
+                int w=0,h=0;pixels_of(target,w,h);
+                result=kind==12?(clip?std::max(0,clip->w):w):(clip?std::max(0,clip->h):h);
+            }
+        }
+    }
+    diag_native_leave(diagnostic);
+    return result;
+}
 // Hot Graphics calls skip the native-method frame and the class-name chain.
 static void gfx_intrinsic(int kind, Value* a) {
+    if(kind==9) {
+        // Keep the native diagnostic boundary and the declaring Graphics
+        // class's stroke field even when a subclass inherits drawLine.
+        const int self=a[0].ref;
+        Method* method=nullptr;
+        if(VMS_EXEC(g_active_stack)&&!VMS_EXEC(g_active_stack)->empty()) {
+            const auto& caller=VMS_EXEC(g_active_stack)->back();
+            if(caller.method&&caller.op_pc>=0&&size_t(caller.op_pc)<caller.method->quick.size()) {
+                const auto& site=caller.method->quick[size_t(caller.op_pc)];
+                if(site.intrinsic==9) {
+                    if(site.kind==4&&site.vclass==VMS_HEAP(g_heap)[self].cls)
+                        method=method_at((uint32_t(site.va)<<16)|uint32_t(site.vb));
+                    else if(site.kind==3)
+                        method=method_at((uint32_t(site.a)<<16)|uint32_t(site.b));
+                }
+            }
+        }
+        if(!method)method=find_method(VMS_HEAP(g_heap)[self].cls,"drawLine","(IIII)V",true);
+        const auto diagnostic=diag_native_enter(method);
+        {
+            const auto it=VMS_RS(g_gfx_target).find(self);
+            const int target=it==VMS_RS(g_gfx_target).end()?0:it->second;
+            GraphicsGlobalScope global_sample(VMS_RS(g_graphics_profile),target!=0);
+            GraphicsProfileScope native_sample(VMS_RS(g_graphics_profile),0);
+            auto state=[&](const std::unordered_map<int,int>& values) {auto at=values.find(self);return at==values.end()?0:at->second;};
+            auto coord=[](int x,int y){uint32_t bits=uint32_t(x)+uint32_t(y);int32_t result;std::memcpy(&result,&bits,4);return int(result);};
+            const int tx=state(VMS_RS(g_gfx_tx)),ty=state(VMS_RS(g_gfx_ty)),color=state(VMS_RS(g_gfx_color));
+            int tw=0,th=0;auto* pixels=pixels_of(target,tw,th);
+            if(VMS_RS(g_drawacc).on)++VMS_RS(g_drawacc).lines;
+            if(pixels) {
+                const Field* stroke=find_field(method->class_id,"strokeStyle","I");
+                const bool dotted=stroke&&VMS_HEAP(g_heap)[self].fields[stroke->slot].i==1;
+                auto surface=gfx_surface(self,target,*pixels,tw,th);
+                raster_primitives::line(surface,coord(a[1].i,tx),coord(a[2].i,ty),coord(a[3].i,tx),coord(a[4].i,ty),uint32_t(color),dotted);
+            }
+        }
+        diag_native_leave(diagnostic);return;
+    }
     const auto target_entry=VMS_RS(g_gfx_target).find(a[0].ref);
     const int target=target_entry==VMS_RS(g_gfx_target).end()?0:target_entry->second;
     GraphicsGlobalScope global_sample(VMS_RS(g_graphics_profile),target!=0);
@@ -1146,7 +1312,6 @@ static void gfx_intrinsic(int kind, Value* a) {
         auto it=values.find(self);return it==values.end()?0:it->second;
     };
     auto coord=[](int x,int y){uint32_t bits=uint32_t(x)+uint32_t(y);int32_t result;std::memcpy(&result,&bits,4);return (int)result;};
-    int tx=state(VMS_RS(g_gfx_tx)), ty=state(VMS_RS(g_gfx_ty));
     if(kind==4) {VMS_RS(g_gfx_color)[self]=a[1].i&0xffffff;gfx_opacity_set(self,255);return;}
     if(kind==5) {
         if(a[1].i<0||a[1].i>255||a[2].i<0||a[2].i>255||a[3].i<0||a[3].i>255) {
@@ -1154,6 +1319,7 @@ static void gfx_intrinsic(int kind, Value* a) {
         }
         VMS_RS(g_gfx_color)[self]=(a[1].i<<16)|(a[2].i<<8)|a[3].i;gfx_opacity_set(self,255);return;
     }
+    int tx=state(VMS_RS(g_gfx_tx)), ty=state(VMS_RS(g_gfx_ty));
     if(kind==8) {VMS_RS(g_gfx_tx)[self]=coord(tx,a[1].i);VMS_RS(g_gfx_ty)[self]=coord(ty,a[2].i);return;}
     if(kind==6 || kind==7) {
         int tw=0,th=0;pixels_of(target,tw,th);
@@ -1354,15 +1520,31 @@ static void screen_notify_size(int target) {
         screen_meta_set(target,meta);return; // default initial 240x320 keeps its old callback order
     }
     meta.w=VMS_RS(g_screen_w);meta.h=VMS_RS(g_screen_h);meta.notified=true;screen_meta_set(target,meta);
-    if(Method* m=find_method(VMS_HEAP(g_heap)[target].cls,"sizeChanged","(II)V",true))run(m,{Value::of_ref(target),Value::of_i(meta.w),Value::of_i(meta.h)});
+    if(Method* m=find_method(VMS_HEAP(g_heap)[target].cls,"sizeChanged","(II)V",true))run_event_callback(m,{Value::of_ref(target),Value::of_i(meta.w),Value::of_i(meta.h)});
 }
+static std::string g_canvas_notice;
 static void select_screen_sidecar(const std::string& jar,const std::string& identity="") {
-    (void)identity; // Automatic size inference from JAR/vendor properties is disabled.
+    (void)identity;g_canvas_notice.clear();
     int w=240,h=320;const int result=logical_screen::sidecar(jar,w,h);
-    const char* source=result==1?"explicit_sidecar":result<0?"invalid_sidecar_default":"default_fixed_240x320";
+    const char* source=result==1?"explicit_sidecar":result<0?"invalid_sidecar_default":"default";
+    if(result==0){
+        const auto hint=canvas_resolution::cold_launch(jar,VMS_CL(g_props));
+        const auto fixed=canvas_declared_size::inspect(VMS_CL(g_jar_files));
+        w=hint.w;h=hint.h;source=hint.source;
+        if(fixed.found){
+            if(std::string(hint.source)!="default"&&(hint.w!=fixed.w||hint.h!=fixed.h))g_canvas_notice="尺寸标注冲突，采用游戏固定画布 "+std::to_string(fixed.w)+"×"+std::to_string(fixed.h);
+            w=fixed.w;h=fixed.h;source="canvas_constant_getters";
+        }else if(fixed.conflict){
+            w=240;h=320;source="ambiguous_canvas_default";
+        }
+        const auto filename=canvas_resolution::filename_size(jar);
+        if(g_canvas_notice.empty()&&std::string(source)!="filename_explicit"&&std::string(filename.source)!="default"&&(filename.w!=w||filename.h!=h))g_canvas_notice="尺寸标注冲突，采用游戏声明 "+std::to_string(w)+"×"+std::to_string(h);
+    }
     VMS_RS(g_screen_w)=w;VMS_RS(g_screen_h)=h;
-    log_line("CANVAS size="+std::to_string(w)+"x"+std::to_string(h)+" source="+source+" auto_size=disabled");
+    log_line("CANVAS size="+std::to_string(w)+"x"+std::to_string(h)+" source="+source+" auto_size=cold_launch_only resume=saved_dimensions");
+    if(!g_canvas_notice.empty())log_line("DISPLAY notice="+g_canvas_notice);
 }
+
 static int game_buffer(int canvas) {
     auto it = VMS_RS(g_offscreen).find(canvas);
     if (it != VMS_RS(g_offscreen).end() && it->second > 0 && it->second < (int)VMS_HEAP(g_heap).size() && !VMS_HEAP(g_heap)[it->second].pixels.empty())
@@ -1778,6 +1960,8 @@ static void place_args(std::vector<Value>& locals, const std::vector<Value>& a) 
 #include "paint_hotspots241.h"
 #include "runtime/deterministic_cost.inc"
 #include "runtime/interpreter.inc"
+#include "runtime_diagnostics.inc"
+#include "causal_diagnostics.inc"
 
 #include "runtime/class_loader.inc"
 
@@ -1848,6 +2032,7 @@ static void gc_mark_phase(std::vector<char>& mark, std::vector<int>& work, bool 
     }
 }
 static void gc_collect(const std::string& why) { P61_SCOPE(3, nullptr); P7_SCOPE(Gc);
+    const auto diagnostic_phase=diag_phase_enter(runtime_diag::Phase::GC);
     RuntimeProfileScope gc(VMS_EXEC(g_runtime_profile),RuntimeProfile::Kind::GC);
     ++VMS_HEAP(g_gc_cycles);
     const int64_t gc_started_us=paint_clock_us();
@@ -1871,6 +2056,7 @@ static void gc_collect(const std::string& why) { P61_SCOPE(3, nullptr); P7_SCOPE
                       VMS_HEAP(g_heap)[i].fields.empty() && VMS_HEAP(g_heap)[i].elems.empty();
         if (vacant) continue;
         VMS_HEAP(g_array_payload_live) -= VMS_HEAP(g_heap)[i].elems.payload_bytes();
+        VMS_HEAP(g_heap)[i].elems.recycle_dead_primitive(VMS_HEAP(g_primitive_buffers));
         VMS_DIAG(g_exception_traces).erase(i);
         { const uint32_t gen = VMS_HEAP(g_heap)[i].generation + 1; VMS_HEAP(g_heap)[i] = Obj{}; VMS_HEAP(g_heap)[i].generation = gen; ++resver::g_stats.generations; } // P2.5: freed slot gets a new generation
         VMS_EXEC(g_monitors).erase(i);
@@ -1886,6 +2072,7 @@ static void gc_collect(const std::string& why) { P61_SCOPE(3, nullptr); P7_SCOPE
     VMS_HEAP(g_array_alloc_since_gc) = 0;
     VMS_RS(g_frame_metrics).pending.gc_pauses.add(uint64_t(std::max<int64_t>(0,paint_clock_us()-gc_started_us)));
     work.clear(); // No stale object ids can become roots of a later collection.
+    diag_native_leave(diagnostic_phase);
 }
 // P2.2-S6: the GC safepoint, formalised (was maybe_gc). Same two call sites, same thresholds, same decision:
 // GC frequency and memory behaviour are unchanged. Interpreter slice points remain poll-only (no GC there).
@@ -2032,6 +2219,11 @@ static void thread_resume() {
     audio_pump();
 #endif
     int64_t deadline = monotonic_ms() + VMS_EXEC(g_slice_ms);
+    const int64_t prior_native_deadline=VMS_EXEC(g_exec_ctx).native_poll_host_deadline_us;
+    const int64_t native_now=paint_clock_us();
+    const int64_t native_deadline=native_now+int64_t(std::max(0,VMS_EXEC(g_slice_ms)))*1000;
+    VMS_EXEC(g_exec_ctx).native_poll_host_deadline_us=prior_native_deadline>native_now?
+        std::min(prior_native_deadline,native_deadline):native_deadline;
     VMS_EXEC(g_repaint_yield_handoff)=false;
     // A Java yield is a scheduling opportunity, not a request to wait for the
     // next displayed frame. Keep rotating runnable workers inside this host
@@ -2041,6 +2233,7 @@ static void thread_resume() {
     while (true) {
         if (!pump_one_thread() || VMS_EXEC(g_speed_frame_open) || VMS_EXEC(g_repaint_yield_handoff) || monotonic_ms() >= deadline) break;
     }
+    VMS_EXEC(g_exec_ctx).native_poll_host_deadline_us=prior_native_deadline;
     if(VMS_EXEC(g_repaint_yield_handoff))runtime_early_repaint_handoff();
     update_thread_live();
     gc_safepoint(GcPoint::Threads);
@@ -2048,6 +2241,7 @@ static void thread_resume() {
 }
 static void thread_pump() { thread_resume(); }
 static void stop_thread(int p1_reason=2) {
+    VMS_EXEC(g_exec_ctx).native_poll_host_deadline_us=0;
     g_timer_clock_owner=nullptr;
     if(p7::g_window_start.load(std::memory_order_relaxed)){ log_line(p7::counters_summary(p1_reason==3?"destroy":"stop")); p7::g_window_start.store(0,std::memory_order_relaxed); }
     p8_caught_report(); p8::g_caught.clear(); p8::g_caught_total=0; // P8.2: per-launch caught-exception totals
@@ -2093,6 +2287,8 @@ static void stop_thread(int p1_reason=2) {
     VMS_RS(g_shown)=VMS_RS(g_alert_return)=0; VMS_RS(g_alert_deadline)=0; VMS_RS(g_alert_remaining)=-1; VMS_EXEC(g_serial_calls).clear(); cont_new_epoch(); VMS_PLAT(g_pressed_keys).clear(); VMS_PLAT(g_command_keys).clear(); VMS_PLAT(g_key_states)=0;
     VMS_PLAT(g_rms_suite).clear(); VMS_PLAT(g_rms_import_legacy) = false;
     VMS_EXEC(g_threads).clear(); VMS_EXEC(g_monitors).clear(); VMS_CL(g_class_objects).clear(); VMS_EXEC(g_main_thread) = JavaThreadContext{};
+    VMS_EXEC(g_exec_ctx).event_callback_owner=nullptr;
+    VMS_EXEC(g_exec_ctx).active_paint_canvas=0;
     VMS_EXEC(g_running_thread) = nullptr; VMS_HEAP(g_root_stacks).clear(); native_roots_reset(); VMS_EXEC(g_active_stack) = nullptr;
     VMS_EXEC(g_thread_live) = false; VMS_EXEC(g_resume_request) = VMS_EXEC(g_can_suspend) = false; VMS_EXEC(g_round_robin) = 0; VMS_EXEC(g_pump_depth) = 0;
     VMS_EXEC(g_repaint_owner_ref) = 0; VMS_EXEC(g_speed_frame_open) = false; VMS_EXEC(g_speed_serial_serviced) = false;
@@ -2109,7 +2305,10 @@ static void stop_thread(int p1_reason=2) {
     reset_runtime_stats();
 }
 static void reset_runtime_stats() {
+    diag_causal_reset();
+    g_device_diag.detector.reset(); // Launch/pause/restore must not inherit an old shortfall streak.
     g_stat_present_seen=VMS_RS(g_present_frames);   // 0.2.113 F4: STAT canvas_fps window starts here
+    g_stat_jit_ops_seen=VMS_NATIVE(g_native_jit).stats.ops;
     g_frame_sleep_stats={};
     VMS_EXEC(g_fast_ops)=VMS_EXEC(g_fast_blocks)=VMS_EXEC(g_slow_ops)=VMS_EXEC(g_fast_float241_ops)=0;
     VMS_NATIVE(g_library_indexes).reset_stats();VMS_NATIVE(g_library_leaf_calls)=0;
@@ -2161,6 +2360,9 @@ static void report_optimization_window(int64_t elapsed_us,const RuntimeProfileWi
         (unsigned long long)VMS_HEAP(g_frame_buffer_pool).discarded,VMS_HEAP(g_gc_mark_scratch).capacity(),VMS_HEAP(g_gc_work_scratch).capacity()*sizeof(int),
         VMS_RS(g_frame_metrics).snapshot_bytes(),(unsigned long long)VMS_HEAP(g_array_payload_live),VMS_HEAP(g_heap).size());
     log_line(line);VMS_HEAP(g_frame_buffer_pool).reset_counters();
+    {const auto& p=VMS_HEAP(g_primitive_buffers);log_line("ARRAYPOOL schema=1 hits="+std::to_string(p.hits)+" misses="+std::to_string(p.misses)+
+        " returns="+std::to_string(p.returns)+" discarded="+std::to_string(p.discarded)+" retained_bytes="+std::to_string(p.retained_bytes())+
+        " peak_bytes="+std::to_string(p.peak_bytes)+" budget_bytes="+std::to_string(p.byte_budget())+" max_buffer_bytes="+std::to_string(p.MaxBuffer)+" scope=since_launch_or_restore primitive_dead_payload_only=1");}
     std::snprintf(line,sizeof(line),"VMSTAT schema=2 fast_ops=%llu slow_ops=%llu fast_blocks=%llu max_batch_ops=1024 safepoints=preserved",
         (unsigned long long)VMS_EXEC(g_fast_ops),(unsigned long long)VMS_EXEC(g_slow_ops),(unsigned long long)VMS_EXEC(g_fast_blocks));
     log_line(line);
@@ -2221,12 +2423,13 @@ static void report_optimization_window(int64_t elapsed_us,const RuntimeProfileWi
         " calls="+std::to_string(js.executed)+" bytecodes="+std::to_string(js.ops)+
         " budget_fallbacks="+std::to_string(js.budget_fallbacks)+" permission_failures="+std::to_string(js.permission_failures)+
         " code_bytes="+std::to_string(VMS_NATIVE(g_native_jit).bytes())+" budget_bytes="+std::to_string(jit236::Engine::BudgetBytes)+
-        " allocation_paused="+std::to_string(VMS_NATIVE(g_native_jit).admission_closed)+" allocation_error="+jit236::Executable::last_error()+" allocation_result="+std::to_string(jit236::Executable::last_result())+" scope=suite_lifetime subset=bounded_static_int_leaf safepoints=preserved");
-    log_line("JITREGION schema=1 retired_short="+std::to_string(g_jit_region_stats.retired_short)+" retired_invoke="+std::to_string(g_jit_region_stats.retired_invoke)+" skip_marked="+std::to_string(g_jit_region_stats.skip_marked)+" full_skipped="+std::to_string(g_jit_region_stats.full_skipped)+" compiled="+std::to_string(g_jit_region_stats.compiled)+" rejected="+std::to_string(g_jit_region_stats.rejected)+" banned_wait="+std::to_string(g_jit_region_stats.banned_wait)+" entries="+std::to_string(g_jit_region_stats.entries)+" zero_progress="+std::to_string(g_jit_region_stats.zero)+" ops="+std::to_string(g_jit_region_stats.ops)+" code_bytes="+std::to_string(g_jit_region_stats.bytes)+" budget_bytes="+std::to_string(JitRegionMaxBytes)+" resident_regions="+std::to_string(g_jit_region_stats.resident)+" max_regions="+std::to_string(JitRegionMax)+" ic_sites="+std::to_string(g_jit_region_t3.ic_sites)+" cast_sites="+std::to_string(g_jit_region_t3.cast_sites)+" stack_entries="+std::to_string(g_jit_region_t3.stack_entries)+" recompiles="+std::to_string(g_jit_region_t3.recompiles)+" gfx_ok="+std::to_string(g_jitr_gfx_ok)+" gfx_bail_cls="+std::to_string(g_jitr_gfx_bail_cls)+" gfx_bail_slots="+std::to_string(g_jitr_gfx_bail_slots)+" bail=interpreter_same_pc"+
+        " allocation_paused="+std::to_string(VMS_NATIVE(g_native_jit).admission_closed)+" resource_reopens="+std::to_string(VMS_NATIVE(g_native_jit).stats.resource_reopens)+" allocation_generation="+std::to_string(VMS_NATIVE(g_native_jit).admission_generation())+" allocation_error="+jit236::Executable::last_error()+" allocation_result="+std::to_string(jit236::Executable::last_result())+" scope=suite_lifetime subset=bounded_static_int_leaf safepoints=preserved");
+    log_line("JITREGION schema=1 overlap_deferred="+std::to_string(g_jit_region_stats.overlap_deferred)+" overlap_hits="+std::to_string(g_jit_region_stats.overlap_hits)+" overlap_reopened="+std::to_string(g_jit_region_stats.overlap_reopened)+" overlap_pressure_bytes="+std::to_string(JitOverlapPressureBytes)+" retired_short="+std::to_string(g_jit_region_stats.retired_short)+" retired_invoke="+std::to_string(g_jit_region_stats.retired_invoke)+" skip_marked="+std::to_string(g_jit_region_stats.skip_marked)+" full_skipped="+std::to_string(g_jit_region_stats.full_skipped)+" compiled="+std::to_string(g_jit_region_stats.compiled)+" rejected="+std::to_string(g_jit_region_stats.rejected)+" banned_wait="+std::to_string(g_jit_region_stats.banned_wait)+" entries="+std::to_string(g_jit_region_stats.entries)+" zero_progress="+std::to_string(g_jit_region_stats.zero)+" ops="+std::to_string(g_jit_region_stats.ops)+" code_bytes="+std::to_string(g_jit_region_stats.bytes)+" budget_bytes="+std::to_string(JitRegionMaxBytes)+" resident_regions="+std::to_string(g_jit_region_stats.resident)+" max_regions="+std::to_string(JitRegionMax)+" ic_sites="+std::to_string(g_jit_region_t3.ic_sites)+" cast_sites="+std::to_string(g_jit_region_t3.cast_sites)+" stack_entries="+std::to_string(g_jit_region_t3.stack_entries)+" recompiles="+std::to_string(g_jit_region_t3.recompiles)+" gfx_ok="+std::to_string(g_jitr_gfx_ok)+" gfx_bail_cls="+std::to_string(g_jitr_gfx_bail_cls)+" gfx_bail_slots="+std::to_string(g_jitr_gfx_bail_slots)+" bail=interpreter_same_pc"+
         " stale_id="+std::to_string(g_jit_region_stats.stale_id)+" stale_exit="+std::to_string(g_jit_region_stats.stale_exit)+" stale_recompiles="+std::to_string(g_jit_region_stats.stale_recompiles)+
         " leaf_stale="+std::to_string(js.stale)+" leaf_stale_reinstalls="+std::to_string(js.stale_reinstalls)+" jitstale_lines="+std::to_string(g_jitstale_lines)+
         " jitstale_shown="+std::to_string(g_jitstale_limit.shown)+" jitstale_suppressed="+std::to_string(g_jitstale_limit.suppressed)+" jitstale_summaries="+std::to_string(g_jitstale_limit.summaries)+" stale_fatal="+std::to_string(g_jit_region_stats.stale_fatal));
-    {const auto& pool=jit236::code_pool_stats();log_line("JITPOOL block_bytes="+std::to_string(jit236::CodeBlockBytes)+" blocks="+std::to_string(pool.blocks)+" peak_blocks="+std::to_string(pool.peak_blocks)+" slices="+std::to_string(pool.slices)+" committed_bytes="+std::to_string(pool.blocks*jit236::CodeBlockBytes)+" used_bytes="+std::to_string(pool.used_bytes)+" cap_bytes="+std::to_string(jit236::CodePoolMaxBlocks*jit236::CodeBlockBytes)+
+    log_line("JITLOOP schema=1 backedge_handoffs="+std::to_string(g_jit_region_stats.backedge_handoffs)+" scope=suite_lifetime same_pc_entry=1 safepoints=preserved");
+    {const auto& pool=jit236::code_pool_stats();log_line("JITPOOL block_bytes="+std::to_string(jit236::CodeBlockBytes)+" dedicated_block_bytes="+std::to_string(jit236::CodeDedicatedBytes)+" max_slice_bytes="+std::to_string(jit236::CodeMaxSliceBytes)+" blocks="+std::to_string(pool.blocks)+" peak_blocks="+std::to_string(pool.peak_blocks)+" slices="+std::to_string(pool.slices)+" committed_bytes="+std::to_string(pool.reserved_bytes)+" peak_committed_bytes="+std::to_string(pool.peak_reserved_bytes)+" used_bytes="+std::to_string(pool.used_bytes)+" cap_bytes="+std::to_string(jit236::CodePoolMaxBytes)+
         " quarantined_pages="+std::to_string(pool.quarantined_pages)+" quarantine_releases="+std::to_string(pool.quarantine_releases)+" fresh_installs="+std::to_string(pool.fresh_installs)+
         " reused_installs="+std::to_string(pool.reused_installs)+" dedicated_blocks="+std::to_string(pool.dedicated_blocks)+" jit_type="+jit236::jit_type_name());}
     if(VMS_EXEC(g_execution_profile).enabled) {
@@ -2434,17 +2637,24 @@ static void configure_runtime_diagnostics() {
 }
 #ifdef __SWITCH__
 // P7.3: Switch pump on worker 0. Same pumpThrottled() call, same arguments; failures are carried back and logged here.
+static void diag_audio_sample(const j2me_audio::SwitchAudioSink& sink){
+    const auto& stats=sink.metrics();runtime_diag::AudioSnapshot s;
+    s.request_us=uint64_t(paint_clock_us());s.service_us=sink.lastServiceUs();s.queued=sink.queuedBuffers();s.pumps=stats.pump_count;s.empty_polls=stats.queue_empty_polls;s.blocks=stats.render_blocks;s.nonzero_blocks=stats.nonzero_blocks;s.errors=stats.errors;s.max_gap_us=stats.max_pump_gap_us;s.max_mix_us=stats.max_mix_us;
+    g_device_diag.audio.publish(s); // Caller owns the sink, including on its worker.
+}
 static void p7_audio_report_failure() {
     const int64_t rc=p7audio::g_failure_rc.exchange(0);
-    if(rc) log_line("AUDIO output failure op="+std::string(p7audio::g_failure_op.load()?p7audio::g_failure_op.load():"?")+" result="+std::to_string(rc)+" thread=worker");
+    if(rc) {const auto message="AUDIO output failure op="+std::string(p7audio::g_failure_op.load()?p7audio::g_failure_op.load():"?")+" result="+std::to_string(rc)+" thread=worker";log_line(message);g_device_diag.flight.note(paint_clock_us(),"audio_failure",message.c_str());diag_fault("AUDIO_OUTPUT_FAILURE",message.c_str(),false);}
 }
 static void p7_audio_submit_pump(bool frame) {
     j2me_audio::Engine& engine=VMS_PLAT(g_audio);              // fences the previous job
     j2me_audio::SwitchAudioSink& sink=VMS_PLAT(g_audio_sink);
     p7_audio_snapshot_if_needed(j2me_audio::SwitchAudioSink::BufferCount*j2me_audio::SwitchAudioSink::BufferFrames); // max one pump renders
     if(p7audio::q_idle){ ++p7audio::g_idle_pumps; Result rc=sink.pumpThrottled(engine,frame); // idle: same inline pump as switch-off, no handoff
+        diag_audio_sample(sink);
         if(R_FAILED(rc)){ p7audio::g_failure_op.store(sink.errorOperation()); p7audio::g_failure_rc.store(int64_t(rc)); } return; }
     p7audio::submit([&engine,&sink,frame]{ Result rc=sink.pumpThrottled(engine,frame);
+        diag_audio_sample(sink);
         if(R_FAILED(rc)){ p7audio::g_failure_op.store(sink.errorOperation()); p7audio::g_failure_rc.store(int64_t(rc)); } });
 }
 #endif
@@ -2503,13 +2713,16 @@ static void audio_render_desktop(size_t frames) {
 }
 #endif
 // Audio servicing never calls Java; it is also safe inside a long interpreter slice.
-static void audio_pump() {
+static void audio_pump_impl();
+static void audio_pump(){const auto phase=diag_phase_enter(runtime_diag::Phase::Audio);audio_pump_impl();diag_native_leave(phase);}
+static void audio_pump_impl() {
     if(r4::state.active)return;
 #ifdef __SWITCH__
     P7_SCOPE(AudioOut); // desktop has no audio output; its per-slice pump is not timed (mixing is, in Engine::render)
     if (VMS_PLAT(g_audio_sink).available()) {
         if (p7audio::g_enabled) { p7_audio_report_failure(); p7_audio_submit_pump(false); return; }
-        Result rc=VMS_PLAT(g_audio_sink).pumpThrottled(VMS_PLAT(g_audio));
+        auto& sink=VMS_PLAT(g_audio_sink);Result rc=sink.pumpThrottled(VMS_PLAT(g_audio));
+        diag_audio_sample(sink); // Inline owner; no additional accessor/fence.
         if (R_FAILED(rc)) log_line("AUDIO output failure op="+std::string(VMS_PLAT(g_audio_sink).errorOperation())+" result="+std::to_string(rc));
     }
 #else
@@ -2523,14 +2736,17 @@ static void audio_pump() {
     audio_render_desktop(frames);
 #endif
 }
-static void audio_pump_frame() {
+static void audio_pump_frame_impl();
+static void audio_pump_frame(){const auto phase=diag_phase_enter(runtime_diag::Phase::Audio);audio_pump_frame_impl();diag_native_leave(phase);}
+static void audio_pump_frame_impl() {
     if(r4::state.active)return;
     P23_HOOK(p23_service(1));
 #ifdef __SWITCH__
     P7_SCOPE(AudioOut);
     if (!VMS_PLAT(g_audio_sink).available()) return;
     if (p7audio::g_enabled) { p7_audio_report_failure(); p7_audio_submit_pump(true); return; }
-    Result rc = VMS_PLAT(g_audio_sink).pumpThrottled(VMS_PLAT(g_audio),true);
+    auto& sink=VMS_PLAT(g_audio_sink);Result rc = sink.pumpThrottled(VMS_PLAT(g_audio),true);
+    diag_audio_sample(sink);
     if (R_FAILED(rc)) log_line("AUDIO output failure op="+std::string(VMS_PLAT(g_audio_sink).errorOperation())+" result="+std::to_string(rc));
 #endif
 }
@@ -2578,8 +2794,14 @@ static int64_t idle_sleep_ms() {
     bool frame_pace = false;
     for (auto& t : VMS_EXEC(g_threads)) {
         refresh_thread(t);
+        if (t.state == ThreadState::Runnable && (!t.begun || !t.frames.empty())) return 0;
         if (t.sleep_request >= 8 && t.sleep_request <= 20 && t.state == ThreadState::Sleeping) frame_pace = true;
-        if (t.wake > now && (t.state == ThreadState::Sleeping || t.state == ThreadState::Waiting || t.state == ThreadState::Joining))
+        // A paced wait's compatibility millisecond timer can expire before
+        // its precise deadline. Keep that pending timer visible; otherwise
+        // the no-timer fallback adds an unrelated 4ms nap near every boundary.
+        if ((t.state == ThreadState::Sleeping || t.state == ThreadState::Waiting) && t.wake_us)
+            delay = std::min(delay, std::max<int64_t>(0, (t.wake_us - paint_clock_us()) / 1000));
+        else if (t.wake > now && (t.state == ThreadState::Sleeping || t.state == ThreadState::Waiting || t.state == ThreadState::Joining))
             delay = std::min(delay, t.wake - now);
     }
     if (frame_pace || delay <= 2) return 0;
@@ -2638,8 +2860,12 @@ static void wait_game_wake(int64_t milliseconds) {
 // callbacks must run inside the budget after input is sampled. Preserve an
 // already completed dirty frame rather than overwriting it before presentation.
 static bool host_boundary242_active(){return VMS_RS(g_host_boundary242_enabled)&&speed_period_us()==0;}
-static void host_lifecycle_poll242(){host_events(!host_boundary242_active());}
-static bool host_frame_ready242(){return host_boundary242_active()&&VMS_RS(g_fb_dirty)&&!speed_group_incomplete();}
+// A post-present speculative turn can finish the next frame in any speed mode.
+// Keep it until Present instead of running another paint over the same buffer.
+// Incomplete grouped frames still need Java work, and lifecycle work is always
+// serviced by host_events(false). Native's paint-budget policy stays separate.
+static bool host_frame_ready242(){return VMS_RS(g_host_boundary242_enabled)&&VMS_RS(g_fb_dirty)&&!speed_group_incomplete();}
+static void host_lifecycle_poll242(){host_events(!host_boundary242_active()&&!host_frame_ready242());}
 static bool host_speculation_allowed242(){
     return !host_boundary242_active()||VMS_EXEC(g_completed_paint241).completed_us<CompletedPaintBudget241::BudgetUs;
 }
@@ -2735,7 +2961,7 @@ static void release_game_keys() {
     Method* m=find_method(VMS_HEAP(g_heap)[target].cls,"keyReleased","(I)V",true);
     if(m)for(int key:keys) {
         if(suppress_actions && game_key_action(key))continue;
-        run(m,{Value::of_ref(target),Value::of_i(key)});
+        run_event_callback(m,{Value::of_ref(target),Value::of_i(key)});
     }
 }
 static bool farm_startup_ready();
@@ -2759,14 +2985,14 @@ static void display_visibility() {
         }
         if(target && VMS_EXEC(g_farm_startup).pending_show==target && !startup_defer_visibility(target)) {
             VMS_EXEC(g_farm_startup).pending_show=0;
-            if(Method* m=find_method(VMS_HEAP(g_heap)[target].cls,"showNotify","()V",true))run(m,{Value::of_ref(target)});
+            if(Method* m=find_method(VMS_HEAP(g_heap)[target].cls,"showNotify","()V",true))run_event_callback(m,{Value::of_ref(target)});
         }
         return;
     }
     old=VMS_RS(g_shown); VMS_RS(g_shown)=0;
     const bool old_unnotified=old && VMS_EXEC(g_farm_startup).pending_show==old;
     VMS_EXEC(g_farm_startup).pending_show=0;
-    if(old && !old_unnotified) if(Method* m=find_method(VMS_HEAP(g_heap)[old].cls,"hideNotify","()V",true))run(m,{Value::of_ref(old)});
+    if(old && !old_unnotified) if(Method* m=find_method(VMS_HEAP(g_heap)[old].cls,"hideNotify","()V",true))run_event_callback(m,{Value::of_ref(old)});
     // hideNotify may itself have changed the requested screen.
     target=(!VMS_PLAT(g_host_paused) && (VMS_EXEC(g_midlet_state)==MidletState::Active || VMS_EXEC(g_midlet_state)==MidletState::Empty)) ? VMS_RS(g_current) : 0;
     VMS_RS(g_shown)=target;
@@ -2781,7 +3007,7 @@ static void display_visibility() {
             if(VMS_RS(g_current)!=target || VMS_EXEC(g_notify_paused) || VMS_EXEC(g_notify_destroyed) || VMS_PLAT(g_host_paused) ||
                (VMS_EXEC(g_midlet_state)!=MidletState::Active&&VMS_EXEC(g_midlet_state)!=MidletState::Empty)) {VMS_RS(g_repaint)=true;return;}
             VMS_RS(g_shown)=target;
-            if(Method* m=find_method(VMS_HEAP(g_heap)[target].cls,"showNotify","()V",true))run(m,{Value::of_ref(target)});
+            if(Method* m=find_method(VMS_HEAP(g_heap)[target].cls,"showNotify","()V",true))run_event_callback(m,{Value::of_ref(target)});
         }
         VMS_RS(g_repaint)=true;
     }
@@ -2838,6 +3064,7 @@ static void lifecycle_resume() {
 static void host_freeze236(bool freeze) {
     if(VMS_EXEC(g_midlet_state)==MidletState::Destroyed || VMS_EXEC(g_midlet_state)==MidletState::Empty)return;
     if(freeze) {
+        g_device_diag.owner.paused=true;g_device_diag.live.publish(g_device_diag.owner);g_device_diag.detector.reset();
         if(VMS_PLAT(g_host_frozen236))return;
         if(VMS_EXEC(g_midlet_state)!=MidletState::Active){lifecycle_pause(true);return;}
         release_game_keys();
@@ -2860,6 +3087,7 @@ static void host_freeze236(bool freeze) {
     auto resume_deadlines=[&](JavaThreadContext& t){shift(t.wake,ms);shift(t.wake_us,us);t.sleep_sample_due=0;};
     resume_deadlines(VMS_EXEC(g_main_thread));for(auto& t:VMS_EXEC(g_threads))resume_deadlines(t);
     VMS_PLAT(g_host_frozen236)=false;VMS_PLAT(g_host_paused)=false;VMS_PLAT(g_host_freeze_started236)=0;
+    g_device_diag.owner.paused=false;g_device_diag.live.publish(g_device_diag.owner);g_device_diag.detector.reset();
     speed_pause_clock(false);VMS_EXEC(g_farm_startup).resume(monotonic_ms());
     if(VMS_RS(g_alert_remaining)>=0){VMS_RS(g_alert_deadline)=monotonic_ms()+VMS_RS(g_alert_remaining);VMS_RS(g_alert_remaining)=-1;}
     if(VMS_EXEC(g_midlet_state)==MidletState::Active)audio_suspend(false);
@@ -3034,7 +3262,9 @@ static void speed_wait_until_us(int64_t due, bool account_added) {
 #include "residual_sleep_runtime.inc"
 #include "rechecked_deadline_runtime.inc"
 #include "cached_elapsed_runtime.inc"
+#include "cooperative_poll_runtime.inc"
 #include "compensated_sleep_runtime.inc"
+#include "event_frame_sleep_runtime.inc"
 static bool speed_group_helper(JavaThreadContext* owner) {
     if(owner&&speed_timer_helper(*owner))return true;
     const int period=speed_period_us();
@@ -3067,7 +3297,8 @@ static int64_t speed_begin_frame(JavaThreadContext* owner) {
         if(!period || speed_group_helper(owner))owner->frame_prep.reset();
         else owner->frame_prep.before_draw(VMS_RS(g_current),period,paint_clock_us());
     }
-    if(period && !speed_group_helper(owner) && VMS_EXEC(g_speed_next_us)>0)speed_wait_until_us(VMS_EXEC(g_speed_next_us),true);
+    if(period && !speed_group_helper(owner) && VMS_EXEC(g_speed_next_us)>0)
+        speed_wait_until_us(speed_paint_wait_deadline(period,VMS_EXEC(g_speed_next_us),VMS_EXEC(g_speed_last_paint_us)),true);
     return paint_clock_us();
 }
 static void speed_note_paint(int64_t started_us, JavaThreadContext* owner) {
@@ -3190,16 +3421,20 @@ static void repaint_current() {
     // worker stacks retain their budgets; native paint continuations cannot be
     // saved, and pumping an updater here can invalidate the frame being drawn.
     paint_hotspots241::begin();
+    const int previous_paint_canvas=VMS_EXEC(g_exec_ctx).active_paint_canvas;
+    VMS_EXEC(g_exec_ctx).active_paint_canvas=canvas;
     ++VMS_RS(g_paint_depth);
     { RootScope roots(ReentrySite::Paint,{&canvas,&gid}); run(paint, {Value::of_ref(canvas), Value::of_ref(gid)}); } // S5: scope ends before the paint GC safepoint
     --VMS_RS(g_paint_depth);
+    VMS_EXEC(g_exec_ctx).active_paint_canvas=previous_paint_canvas;
     VMS_RS(g_graphics_profile).end_paint(graphics_token);
     const int64_t paint_finished_us=paint_clock_us();
     p1_paint_complete(paint_finished_us-paint_started_us);
-    paint_hotspots241::finish(paint_finished_us-paint_started_us);
     if(r4::state.active)++r4::state.paints;else VMS_EXEC(g_completed_paint241).painted(paint_finished_us-paint_started_us);
-    if(VMS_EXEC(g_runtime_profile).end_paint(paint_token,paint_finished_us))
+    RuntimePaintAttribution paint_attribution;
+    if(VMS_EXEC(g_runtime_profile).end_paint(paint_token,paint_finished_us,&paint_attribution))
         VMS_RS(g_paint_stats).completed(paint_finished_us-paint_started_us);
+    paint_hotspots241::finish(paint_finished_us-paint_started_us,paint_attribution);
     speed_note_paint(paint_started_us, frame_owner);
     speed_frame_wait_painted(frame_owner,canvas,wait_request);
     if (!r4::state.active && VMS_EXEC(g_can_suspend) && (VMS_EXEC(g_completed_paint241).exhausted() ||
@@ -3251,7 +3486,11 @@ static bool unzip(const std::vector<uint8_t>& zip, std::unordered_map<std::strin
         if(local>central || central-local<30 || ru32le(&zip[local])!=0x04034b50)return fail("zip local header invalid: "+name);
         size_t ln=ru16le(&zip[local+26]),le=ru16le(&zip[local+28]);
         if(ln+le>central-local-30)return fail("zip local name truncated: "+name);
-        if(ru16le(&zip[local+8])!=method || ru16le(&zip[local+6])!=flags ||
+        uint16_t flag_diff=ru16le(&zip[local+6])^flags;
+        // ASCII filenames have identical bytes in UTF-8 and legacy ZIP encodings.
+        // Some writers add bit 11 only to the central directory when repacking.
+        bool ascii_name=std::all_of(name.begin(),name.end(),[](unsigned char c){return c<128;});
+        if(ru16le(&zip[local+8])!=method || (flag_diff & ~0x0800) || ((flag_diff & 0x0800) && !ascii_name) ||
            std::string((const char*)&zip[local+30],ln)!=name)return fail("zip header mismatch: "+name);
         size_t data=local+30+ln+le;
         if(csize>central-data)return fail("zip data truncated: "+name);
@@ -3489,6 +3728,7 @@ static void launch_class(const std::string& main, const std::string& suite = "",
     log_line("RMS scope=" + identity + " legacy_import=" + (import_legacy ? "requested-for-this-launch" : "off"));
     VMS_EXEC(g_execution_profile).reset();
     VMS_HEAP(g_frame_buffer_pool).clear();
+    VMS_HEAP(g_primitive_buffers).clear();
     std::vector<char>().swap(VMS_HEAP(g_gc_mark_scratch));
     std::vector<int>().swap(VMS_HEAP(g_gc_work_scratch));
     VMS_CL(g_classes).clear(); VMS_CL(g_class_index).clear();
@@ -3533,6 +3773,7 @@ static int adapt_key(int code) {
     return code;
 }
 static void dispatch_key(int code, bool release) {
+    {char line[144];std::snprintf(line,sizeof(line),"code=%d release=%d canvas=%d paused=%d lifecycle=%d",code,int(release),VMS_RS(g_current),int(VMS_PLAT(g_host_paused)),int(VMS_EXEC(g_midlet_state)));const auto now=paint_clock_us();g_device_diag.flight.note(now,"input",line);g_device_diag.owner.input_us=now;g_device_diag.owner.key=code;g_device_diag.owner.release=release;g_device_diag.live.publish(g_device_diag.owner);}
     // Command presses never reached keyPressed. Match their raw host release
     // even if commandAction switched screen, changed key mapping, or paused.
     if(release && VMS_PLAT(g_command_keys).erase(code))return;
@@ -3566,7 +3807,7 @@ static void dispatch_key(int code, bool release) {
             // numeric/directional keys belong to Canvas unless its menu is open.
             Method* command=find_method(cls,"dispatchCommand","(I)Z",false);
             VMS_PLAT(g_command_keys).insert(code);
-            if(run(command,{Value::of_ref(target),Value::of_i(send)}).i) {
+            if(run_event_callback(command,{Value::of_ref(target),Value::of_i(send)}).i) {
                 log_line("KEY midp command code="+std::to_string(send));
                 VMS_RS(g_repaint)=true;
                 if(!VMS_EXEC(g_notify_destroyed) && !VMS_EXEC(g_thread_live))repaint_current();
@@ -3597,7 +3838,7 @@ static void dispatch_key(int code, bool release) {
     // Do not drop the clock on a key. A tiled map repeats the same text and
     // image count, so the static test fired while walking and pulled 60 down to 30.
     CityKeySpan city_key(code,send,release,VMS_RS(g_current),m,VMS_EXEC(g_fast_ops)+VMS_EXEC(g_slow_ops));
-    run(m, {Value::of_ref(VMS_RS(g_current)), Value::of_i(send)});
+    run_event_callback(m, {Value::of_ref(VMS_RS(g_current)), Value::of_i(send)});
     city_key.end();
     if (!release && VMS_RS(g_current) && !type_compatible(VMS_RS(g_current),"javax/microedition/lcdui/Canvas"))VMS_RS(g_repaint)=true;
     if (!release && !VMS_EXEC(g_thread_live)) repaint_current();
@@ -3677,8 +3918,11 @@ static void maybe_emit_runtime_stats(){
     const uint64_t window_presents=present_now>=g_stat_present_seen?present_now-g_stat_present_seen:0; g_stat_present_seen=present_now;
     const WakeStats wake=VMS_EXEC(g_wake_stats).take();
     const auto work=VMS_EXEC(g_runtime_profile).take();
+    diag_window(stats_now_us,stats,work,window_presents); // Preserve all ten one-second windows before legacy resets.
     if(!emit){
         // silent drain of the same windows the log path would consume
+        // Keep the calling-thread CPU baseline aligned with this wall window.
+        VMS_PLAT(g_cpu_window_start_ns)=j2me_cpu_clock::now_ns();
         (void)VMS_RS(g_graphics_profile).take_global();
         (void)VMS_RS(g_graphics_profile).take();
 #ifdef __SWITCH__

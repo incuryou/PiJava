@@ -155,6 +155,6 @@ inline void render(uint32_t* f,size_t pitch,const Editor& e,
         }
     }
     footer(f,pitch,{{"A","确认"},{"B","返回"},{"X","恢复默认"},
-                    {"Y",e.global?"改为游戏映射":"改为全局映射"},{"+","保存当前映射"}},text,center,right);
+                    {"Y",e.global?"改为游戏映射":"改为全局映射"},{"−","清除映射"},{"+","保存当前映射"}},text,center,right);
 }
 } // namespace host_keymap

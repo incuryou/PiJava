@@ -21,9 +21,9 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
-VERSION = "0.2.114-keyui5-gpuf5-save1"
+VERSION = "0.2.114-keyui7-gpuf5-fit30"
 # NACP has only 15 usable UTF-8 bytes; use a compact chapter-save build identity.
-NACP_VERSION = "0.2.114-k5-sv1"
+NACP_VERSION = "0.2.114-k7-f30"
 # These legacy raw-opcode regression fixtures deliberately have no Java source.
 EXAMPLE_BYTECODE_FIXTURES = {"Mix.jar": ("Wide.class",), "Old.jar": ("Jsr.class",)}
 
@@ -254,7 +254,7 @@ def switch(dkp, tools, args):
     objects = BUILD / "switch"
     objects.mkdir(parents=True, exist_ok=True)
     arch = ["-march=armv8-a+crc+crypto", "-mtune=cortex-a57", "-mtp=soft", "-fPIE"]
-    common = ["-O1", "-g1", "-DJ2ME_VERSION=\"" + VERSION + "\"", "-ffile-prefix-map=" + str(ROOT) + "=.", "-fstack-usage", "-ffunction-sections", "-fdata-sections", "-D__SWITCH__"] + arch
+    common = ["-O2", "-g1", "-DJ2ME_VERSION=\"" + VERSION + "\"", "-ffile-prefix-map=" + str(ROOT) + "=.", "-fstack-usage", "-ffunction-sections", "-fdata-sections", "-D__SWITCH__"] + arch
     gpu = not args.switch_cpu_only
     if gpu:
         for required in [dkp / 'libnx/include/deko3d.h', dkp / 'libnx/lib/libdeko3d.a']:

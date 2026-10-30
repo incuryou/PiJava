@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
         else if (a == "--jar" && i + 1 < argc) jar = argv[++i];
         else if (a == "--size") {
             int w=0,h=0;
-            if(i+1>=argc||!logical_screen::parse(argv[++i],w,h)) {std::cerr<<"Invalid --size; use WIDTHxHEIGHT, each 16..640\n";return 2;}
+            if(i+1>=argc||!logical_screen::parse(argv[++i],w,h)) {std::cerr<<"Invalid --size; use WIDTHxHEIGHT, each 16..800, at most 409600 pixels\n";return 2;}
             VMS_RS(g_screen_w)=w;VMS_RS(g_screen_h)=h;explicit_size=true;
         } else main_class = a;
     }

@@ -4,5 +4,5 @@
 namespace j2me_present { namespace gpu_filter {
 struct ShaderAsset { unsigned bytes; const char* sha256; };
 constexpr ShaderAsset vert_asset = {768, "1defc49a4d17eddce805b58f963d9e058b4993947f7963999c6172ba0dac38f5"};
-constexpr ShaderAsset frag_asset = {5632, "6b172d25c09f91a956ca366d1f24d7600131bf3be56cf1470f46f8c5bdc801b2"};
+constexpr ShaderAsset frag_asset = {12544, "8f65ebf6e36104e7dfb69b728ab3c7c7cfd81f70f7fe248c3e1978849127d933"};
 }}

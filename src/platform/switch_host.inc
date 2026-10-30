@@ -1,4 +1,5 @@
 // Horizon frontend, input, layered presenter and application lifecycle.
+#include "../present_fps.h"
 #include <switch.h>
 #include <dirent.h>
 #include "../n1_paths.h"
@@ -6,13 +7,21 @@
 #include "../game_names.h"
 #include "../menu_catalog.h"
 #include "../host_menu_settings.h"
+#include "../host_display_preferences.h"
+#include "../host_display_menu.h"
 #include "../host_keymap_ui.h"
 #include "../controller_skin_labels.h"
+#include "../presentation/orientation.h"
+static presentation::orientation::Cache g_orientation;
+static const std::vector<uint8_t>* g_display_pixels=nullptr;
+static int g_display_w=240,g_display_h=320;
 static host_keymap::Store g_keymaps;
 static host_keymap::Editor g_keymap_editor;
 static host_pro::Preview g_keymap_pro;
 static host_keymap::Config g_keymap_active;
 static host_controller::Legends g_controller_legends;
+static host_menu::UniversalLayout g_universal_layout;
+static auto g_universal_legend_layout=host_controller::universal_game_layout(g_universal_layout);
 static bool standard_game_keys();
 static host_keymap::Tracker g_keymap_tracker;
 static std::string g_keymap_id, g_keymap_name;
@@ -32,7 +41,7 @@ struct GpuHostLayerCache {
     std::vector<uint32_t> rgba,canvas,raw; uint64_t generation=0;
     j2me_present::gpu_filter::FrameCache raw_frame;
     int logged_path=-1,logged_filter=-1,logged_w=0,logged_h=0;uint64_t logged_epoch=0;
-    int bezel=-1,fps=-1; uint64_t mapping_generation=0; bool was_layered=false; std::string previous_label;
+    int bezel=-1,fps=-1,source_w=0,source_h=0; uint64_t mapping_generation=0; bool was_layered=false; std::string previous_label;
     void clear(){*this=GpuHostLayerCache{};}
 };
  VMS_PLAT_ACCESSOR(g_gpu_layers, GpuHostLayerCache)
@@ -91,11 +100,32 @@ enum class HostSurface { Game, Menu, Import };
 struct MenuNameUi { menu_catalog::State catalog; int64_t scroll_t0 = 0; int last_sel = -1; bool scrolling = false; int64_t last_tick = 0; };
 static MenuNameUi g_menu_name_ui;
 static menu_actions::Deletion g_menu_delete;
+static host_display_menu::Model g_display_menu;
 static menu_actions::Repeat g_menu_repeat;
 static chapter_ui::State g_chapter_import;
 static u64 g_chapter_blocked=0;
 static const char* g_chapter_rms_root="sdmc:/switch/j2me/rms";
 static bool g_menu_note_error=false,g_menu_note_neutral=true;
+static void invalidate_display_preferences() {
+    g_display_pixels=nullptr;
+    g_orientation=presentation::orientation::Cache{};
+    VMS_PLAT(g_cpu_cleared)=0;
+    VMS_RS(g_fb_dirty)=true;
+#ifdef J2ME_ENABLE_DEKO3D
+    VMS_PLAT(g_gpu_layers).raw_frame.invalidate();
+    VMS_PLAT(g_gpu_present).invalidate_game();
+#endif
+}
+static void select_display_preferences(const std::string& path,bool force=false) {
+    static std::string selected_path;
+    static bool loaded=false;
+    if(!force&&loaded&&selected_path==path)return;
+    selected_path=path;loaded=true;
+    host_display::load_into(path,VMS_PLAT(g_menu_settings));
+    invalidate_display_preferences();
+    log_line("DISPLAY preferences path="+path+" rotation="+std::to_string(VMS_PLAT(g_menu_settings).rotation*90)+
+             " canvas="+std::to_string(VMS_PLAT(g_menu_settings).canvas)+" source=per_game_sidecars");
+}
 static void close_host_fonts() {
     if (VMS_PLAT(g_host_font_service)) { plExit(); VMS_PLAT(g_host_font_service) = false; }
 }
@@ -153,11 +183,20 @@ static host_menu::Text host_text_callback(u32* frame, u32 pitch, bool centered =
     };
 }
 static void sync_controller_legends() {
+    // Check source geometry before the GPU decides whether to reuse its chrome.
+    // Dimensions are a key even when their aspect ratio and frame ID repeat.
+    const int layout_w=g_display_pixels?g_display_w:VMS_RS(g_screen_w);
+    const int layout_h=g_display_pixels?g_display_h:VMS_RS(g_screen_h);
+    if(g_universal_layout.update(layout_w,layout_h)){
+        g_universal_legend_layout=host_controller::universal_game_layout(g_universal_layout);
+        if(VMS_PLAT(g_menu_settings).bezel==j2me_present::adaptive_bezel)g_controller_legends.invalidate();
+        VMS_PLAT(g_cpu_cleared)=0;
+    }
     if(g_controller_legends.update(g_keymap_active,standard_game_keys(),VMS_PLAT(g_menu_settings).bezel,
         [](const std::string& text,int size){
             const auto measured=VMS_PLAT(g_host_font).measure(text,size);
             return measured.ok?measured.advance:host_menu::text_advance(text,size);
-        }))VMS_PLAT(g_cpu_cleared)=0;
+        },VMS_PLAT(g_menu_settings).bezel==j2me_present::adaptive_bezel?&g_universal_legend_layout:nullptr))VMS_PLAT(g_cpu_cleared)=0;
 }
 static bool save_menu_settings() {
     VMS_PLAT(g_cpu_cleared) = 0;
@@ -289,6 +328,7 @@ static void compose_host_surface(u32* frame,u32 pitch,const std::string& label,
                                g_menu_name_ui.catalog.details, monotonic_ms() - g_menu_name_ui.scroll_t0, &g_menu_name_ui.scrolling,
                                g_menu_note_error,g_menu_note_neutral);
         host_menu::render_delete(frame,pitch,g_menu_delete,host_text_callback(frame,pitch),host_text_callback(frame,pitch,true));
+        host_display_menu::render(frame,pitch,g_display_menu,VMS_PLAT(g_menu_settings),host_text_callback(frame,pitch),host_text_callback(frame,pitch,true));
         chapter_ui::render(frame,pitch,g_chapter_import,host_text_callback(frame,pitch));
     } else if (VMS_PLAT(g_host_surface) == HostSurface::Import) {
         host_menu::rect(frame, pitch, 0, 0, 1280, 720, host_menu::color(0x1c201f));
@@ -304,26 +344,37 @@ static void compose_host_surface(u32* frame,u32 pitch,const std::string& label,
     // Phone skin and the FPS badge are host chrome. Repaint them when the menu
     // selection changes so a continued game follows the current 遮罩 and 显示帧数.
     sync_controller_legends();
+    const int display_w=g_display_pixels?g_display_w:VMS_RS(g_screen_w),display_h=g_display_pixels?g_display_h:VMS_RS(g_screen_h);
+    const auto& display_rgb=g_display_pixels?*g_display_pixels:VMS_RS(g_fb);
     const int fps_bit = VMS_PLAT(g_menu_settings).show_fps ? 1 : 0;
-    if (VMS_PLAT(g_chrome_bezel) != VMS_PLAT(g_menu_settings).bezel || VMS_PLAT(g_chrome_fps) != fps_bit) {
+    const auto viewport=j2me_present::game_viewport(display_w,display_h,VMS_PLAT(g_menu_settings).bezel==j2me_present::adaptive_bezel);
+    static j2me_present::Viewport previous_viewport;
+    static int logged_w=0,logged_h=0,logged_rotation=-1;
+    if(viewport.x!=previous_viewport.x||viewport.y!=previous_viewport.y||viewport.w!=previous_viewport.w||viewport.h!=previous_viewport.h){
+        previous_viewport=viewport;VMS_PLAT(g_cpu_cleared)=0;
+    }
+    if (VMS_PLAT(g_chrome_bezel) != VMS_PLAT(g_menu_settings).bezel || VMS_PLAT(g_chrome_fps) != fps_bit || logged_w!=display_w || logged_h!=display_h || logged_rotation!=VMS_PLAT(g_menu_settings).rotation) {
+        logged_w=display_w;logged_h=display_h;logged_rotation=VMS_PLAT(g_menu_settings).rotation;
         VMS_PLAT(g_chrome_bezel) = VMS_PLAT(g_menu_settings).bezel;
         VMS_PLAT(g_chrome_fps) = fps_bit;
         VMS_PLAT(g_cpu_cleared) = 0;
         log_line("HOST chrome bezel=" + std::to_string(VMS_PLAT(g_menu_settings).bezel) +
                  " show_fps=" + std::to_string(fps_bit) +
-                 " speed=" + host_speed::log_name(VMS_EXEC(g_speed_cap)));
+                 " speed=" + host_speed::log_name(VMS_EXEC(g_speed_cap)) +
+                 " source=" + std::to_string(VMS_RS(g_screen_w)) + "x" + std::to_string(VMS_RS(g_screen_h)) +
+                 " rotation="+std::to_string(VMS_PLAT(g_menu_settings).rotation*90)+" oriented="+std::to_string(display_w)+"x"+std::to_string(display_h)+" output=" + std::to_string(viewport.x) + "," + std::to_string(viewport.y) + "," + std::to_string(viewport.w) + "," + std::to_string(viewport.h));
     }
     if (force_chrome || VMS_PLAT(g_cpu_cleared) < 3) {
         VMS_PLAT(g_host_skin).select(VMS_PLAT(g_menu_settings).bezel, [](const std::string& message) { log_line(message); });
         host_menu::render_bezel(frame, pitch, VMS_PLAT(g_menu_settings).bezel, host_text_callback(frame, pitch),
-                                VMS_PLAT(g_host_skin).data(), VMS_PLAT(g_host_skin).size());
+                                VMS_PLAT(g_host_skin).data(), VMS_PLAT(g_host_skin).size(),&g_universal_layout);
         if(VMS_PLAT(g_host_skin).data())g_controller_legends.render(frame,pitch,VMS_PLAT(g_menu_settings).bezel,host_text_callback(frame,pitch),host_controller::Context::Game,host_text_callback(frame,pitch,true));
         ++VMS_PLAT(g_cpu_cleared);
     }
-    const uint8_t* src = VMS_RS(g_fb).data();
-    const size_t fb_need = (size_t)VMS_RS(g_screen_w) * (size_t)VMS_RS(g_screen_h) * 3;
-    if (include_game && VMS_RS(g_fb).size() >= fb_need) {
-    p7present::blit_game(reinterpret_cast<uint32_t*>(frame), uint32_t(pitch), src, VMS_RS(g_screen_w), VMS_RS(g_screen_h), VMS_PLAT(g_menu_settings).filter); // original retains P7.5 row split
+    const uint8_t* src = display_rgb.data();
+    const size_t fb_need = (size_t)display_w * (size_t)display_h * 3;
+    if (include_game && logical_screen::valid_extent(display_w,display_h) && display_rgb.size() >= fb_need) {
+    p7present::blit_game(reinterpret_cast<uint32_t*>(frame), uint32_t(pitch), src, display_w, display_h, VMS_PLAT(g_menu_settings).filter,viewport); // legacy retains P7.5 row split
     }
     if (VMS_PLAT(g_menu_settings).show_fps) {
         const auto prefix = VMS_PLAT(g_host_font).measure("FPS ", host_menu::fps_font);
@@ -344,20 +395,36 @@ static void compose_host_surface(u32* frame,u32 pitch,const std::string& label,
     }
 }
 
-static void present() {
+static void present_impl();
+static void present(){const auto phase=diag_phase_enter(runtime_diag::Phase::Present);present_impl();diag_native_leave(phase);}
+static void present_impl() {
     const int64_t present_started=paint_clock_us();
+    g_display_pixels=nullptr;
+    g_display_w=VMS_RS(g_screen_w);g_display_h=VMS_RS(g_screen_h);
+    if(VMS_PLAT(g_host_surface)==HostSurface::Game) {
+        static int previous_w=0,previous_h=0,previous_rotation=-1;
+        const int rotation=VMS_PLAT(g_menu_settings).rotation;
+        if(previous_w!=VMS_RS(g_screen_w)||previous_h!=VMS_RS(g_screen_h)||previous_rotation!=rotation) {
+            log_line("DISPLAY source_size="+std::to_string(VMS_RS(g_screen_w))+"x"+std::to_string(VMS_RS(g_screen_h))+
+                " previous="+std::to_string(previous_w)+"x"+std::to_string(previous_h)+" rotation="+std::to_string(rotation*90));
+            previous_w=VMS_RS(g_screen_w);previous_h=VMS_RS(g_screen_h);previous_rotation=rotation;
+            invalidate_display_preferences(); // Also covers 180 degrees and square buffers.
+        }
+        g_display_pixels=&g_orientation.apply(VMS_RS(g_fb),VMS_RS(g_screen_w),VMS_RS(g_screen_h),rotation,resver::g_epoch,uint64_t(uint32_t(VMS_RS(g_game_frames))),VMS_RS(g_fb_dirty));
+        g_display_w=g_orientation.width();g_display_h=g_orientation.height();
+    }
     VMS_PLAT_LOCAL(fps_shown, present_fps_shown, static int fps_shown = 0;)
     VMS_PLAT_LOCAL(fps_seen, present_fps_seen, static uint64_t fps_seen = 0;)
     VMS_PLAT_LOCAL(fps_t0, present_fps_t0, static int64_t fps_t0 = 0;)
-    int64_t now = monotonic_ms();
+    int64_t now = paint_clock_us();
     const uint64_t fps_frames=VMS_RS(g_present_frames);  // 0.2.112 F4: frames delivered to the screen, not paint calls
     if (!fps_t0 || VMS_PLAT(g_fps_reset) || fps_frames < fps_seen) {
         fps_t0 = now; fps_seen = fps_frames; fps_shown = 0; VMS_PLAT(g_fps_reset) = false;
     }
     int64_t dt = now - fps_t0;
-    if (dt >= 500) {
+    if (dt >= 500000) {
         const uint64_t paints = fps_frames - fps_seen;
-        fps_shown = (int)((paints * 1000) / (dt > 0 ? dt : 1));
+        fps_shown = rounded_present_fps(paints, dt);
         fps_seen = fps_frames;
         fps_t0 = now;
     }
@@ -374,17 +441,20 @@ static void present() {
         const bool rebuild=!layered || !was_layered || canvas.size()!=j2me_present::canvas_pixels ||
             bezel!=VMS_PLAT(g_menu_settings).bezel || fps!=int(VMS_PLAT(g_menu_settings).show_fps) ||
             cache.mapping_generation!=g_controller_legends.generation() ||
+            cache.source_w!=g_display_w || cache.source_h!=g_display_h ||
             (VMS_PLAT(g_menu_settings).show_fps && previous_label!=label) || VMS_PLAT(g_cpu_cleared)==0;
         if(rebuild) {
             canvas.resize(j2me_present::canvas_pixels);
             compose_host_surface(canvas.data(),1280,label,!layered,true);
             ++generation;bezel=VMS_PLAT(g_menu_settings).bezel;fps=int(VMS_PLAT(g_menu_settings).show_fps);previous_label=label;
             cache.mapping_generation=g_controller_legends.generation();
+            cache.source_w=g_display_w;cache.source_h=g_display_h;
         }
         was_layered=layered;
         const auto filter=VMS_PLAT(g_menu_settings).filter;
         const bool shader=layered&&j2me_present::gpu_filter::supported(filter);
-        const j2me_present::gpu_filter::FrameKey frame_key{resver::g_epoch,uint64_t(uint32_t(VMS_RS(g_game_frames))),VMS_RS(g_screen_w),VMS_RS(g_screen_h),filter};
+        const bool adaptive=VMS_PLAT(g_menu_settings).bezel==j2me_present::adaptive_bezel;
+        const j2me_present::gpu_filter::FrameKey frame_key{resver::g_epoch,uint64_t(uint32_t(VMS_RS(g_game_frames))),g_display_w,g_display_h,filter,adaptive};
         bool valid=true;
         if(shader){
             // Dirty is also an explicit refresh signal (for example host-side
@@ -392,12 +462,12 @@ static void present() {
             const bool changed=cache.raw_frame.needs_upload(frame_key);
             if(VMS_RS(g_fb_dirty)&&!changed)VMS_PLAT(g_gpu_present).invalidate_game();
             if(changed||VMS_RS(g_fb_dirty)){
-                valid=logical_screen::valid(frame_key.w,frame_key.h)&&j2me_present::gpu_filter::pack(VMS_RS(g_fb),frame_key.w,frame_key.h,filter,cache.raw);
+                valid=g_display_pixels&&logical_screen::valid(frame_key.w,frame_key.h)&&j2me_present::gpu_filter::pack(*g_display_pixels,frame_key.w,frame_key.h,filter,cache.raw,adaptive);
                 if(valid)cache.raw_frame.committed(frame_key);
             }
         }else{
             cache.raw_frame.invalidate();VMS_PLAT(g_gpu_present).invalidate_game();
-            valid=!layered||j2me_present::game_rgba(VMS_RS(g_fb),VMS_RS(g_screen_w),VMS_RS(g_screen_h),rgba,filter);
+            valid=!layered||(g_display_pixels&&j2me_present::game_rgba(*g_display_pixels,g_display_w,g_display_h,rgba,filter));
         }
         const int path=shader?2:layered?1:0;
         if(cache.logged_path!=path||cache.logged_filter!=int(filter)||cache.logged_w!=frame_key.w||cache.logged_h!=frame_key.h||cache.logged_epoch!=frame_key.epoch){
@@ -406,9 +476,19 @@ static void present() {
             cache.logged_path=path;cache.logged_filter=int(filter);cache.logged_w=frame_key.w;cache.logged_h=frame_key.h;cache.logged_epoch=frame_key.epoch;
         }
         const int64_t prepared=paint_clock_us();
+        j2me_present::Viewport fps_overlay{0,0,0,0};
+        if(layered&&adaptive&&VMS_PLAT(g_menu_settings).show_fps){
+            const auto prefix=VMS_PLAT(g_host_font).measure("FPS ",host_menu::fps_font);
+            const auto tens=VMS_PLAT(g_host_font).measure("8",host_menu::fps_font);
+            const auto slot=VMS_PLAT(g_host_font).measure("FPS 88",host_menu::fps_font);
+            const auto box=host_menu::place_fps(label,0,prefix.ok?prefix.advance:0,tens.ok?tens.advance:0,
+                slot.ok?slot.w:0,slot.ok?slot.h:0,slot.ok?slot.x:0,slot.ok?slot.y:0);
+            fps_overlay={box.x,box.y,std::min(box.w,1280-box.x),std::min(box.h,720-box.y)};
+        }
         const bool ok=valid && VMS_PLAT(g_gpu_present).present_layers(reinterpret_cast<const uint8_t*>(canvas.data()),generation,
                         layered&&!shader?reinterpret_cast<const uint8_t*>(rgba.data()):nullptr,
-                        shader?cache.raw.data():nullptr,shader?&frame_key:nullptr);
+                        shader?cache.raw.data():nullptr,shader?&frame_key:nullptr,
+                        fps_overlay.w>0?&fps_overlay:nullptr);
         const int64_t done=paint_clock_us();const auto timing=VMS_PLAT(g_gpu_present).lastTimings();
         const uint64_t prepare=uint64_t(prepared-present_started)+timing.upload_us;
         const uint64_t total=uint64_t(done-present_started)+timing.acquire_before_present_us;
@@ -477,6 +557,8 @@ static void draw_menu(const std::vector<Entry>& items, int sel, const std::strin
     VMS_PLAT(g_cpu_cleared) = 0;
     VMS_PLAT(g_menu_selected) = std::max(0, std::min(sel, std::max(0, int(items.size()) - 1)));
     VMS_PLAT(g_menu_status) = status;
+    const int selected=VMS_PLAT(g_menu_selected);
+    select_display_preferences(items.empty()?std::string():items[selected].path);
     auto& catalog = g_menu_name_ui.catalog;
     if (catalog.dirty) {
         catalog.rebuild(items, VMS_PLAT(g_menu_labels), VMS_PLAT(g_menu_paths), VMS_PLAT(g_menu_saved));
@@ -526,13 +608,23 @@ static void update_chapter_import(u64 down,u64 held,const std::vector<Entry>& it
     VMS_PLAT(g_cpu_cleared)=0;
     if(!g_chapter_import.open){g_menu_repeat.reset();draw_menu(items,sel,status);}
 }
-static void update_menu_delete(u64 down,std::vector<Entry>& items,int& sel,std::string& status) {
+static void update_menu_delete(u64 down,std::vector<Entry>& items,int& sel,std::string& status,u64 held=0) {
     using menu_actions::Action;using menu_actions::Result;
     Result result=Result::None;
-    if(down&HidNpadButton_B)result=g_menu_delete.act(Action::Back);
+    if(down&HidNpadButton_B){
+        const int selected=g_menu_delete.selection;
+        g_menu_delete.open=false;g_menu_delete.confirming=false;
+        g_display_menu.open=true;g_display_menu.selection=selected==0?1:2;
+    }
     else if(down&HidNpadButton_AnyUp)result=g_menu_delete.act(Action::Up);
     else if(down&HidNpadButton_AnyDown)result=g_menu_delete.act(Action::Down);
     else if(down&HidNpadButton_A)result=g_menu_delete.act(Action::Confirm);
+    if(result==Result::InheritSave) {
+        g_menu_repeat.reset();g_chapter_blocked=held;
+        if(!g_chapter_import.begin(items,sel))status="至少需要两款游戏，才能选择来源章节";
+        if(down)draw_menu(items,sel,status);
+        return;
+    }
     if(result!=Result::None) {
         const std::string path=g_menu_delete.path;
         bool ok=false;
@@ -552,6 +644,26 @@ static void update_menu_delete(u64 down,std::vector<Entry>& items,int& sel,std::
         log_line(std::string("MENUDELETE kind=")+(result==Result::DeleteGame?"game":"instant")+" ok="+std::to_string(ok)+" path="+path);
     }
     if(down)draw_menu(items,sel,status);
+}
+static void update_display_menu(u64 down,u64 held,const std::vector<Entry>& items,int sel,std::string& status) {
+    using host_display_menu::Action;
+    if(down&HidNpadButton_B){g_display_menu.open=false;draw_menu(items,sel,status);return;}
+    if(down&HidNpadButton_AnyUp)g_display_menu.move(-1);
+    else if(down&HidNpadButton_AnyDown)g_display_menu.move(1);
+    if(!(down&HidNpadButton_A)){if(down)draw_menu(items,sel,status);return;}
+    const auto action=g_display_menu.selected();
+    if(action==Action::Back){g_display_menu.open=false;draw_menu(items,sel,status);return;}
+    if(items.empty()){g_display_menu.open=false;status="先选择一款游戏";draw_menu(items,sel,status);return;}
+    if(action==Action::Inherit) {
+        g_display_menu.open=false;g_menu_repeat.reset();g_chapter_blocked=held;
+        if(!g_chapter_import.begin(items,sel))status="至少需要两款游戏，才能选择来源章节";
+    } else if(action==Action::DeleteGame||action==Action::DeleteInstant) {
+        g_display_menu.open=false;
+        g_menu_delete.begin(items[sel].path,game_names::strip_jar(items[sel].path));
+        g_menu_delete.selection=action==Action::DeleteGame?0:1;
+        g_menu_delete.confirming=true;
+    }
+    draw_menu(items,sel,status);
 }
 static std::string button_names(u64 down) {
     std::string s;
@@ -605,6 +717,10 @@ static void open_keymap(u64 held) {
     const bool paused=VMS_PLAT(g_host_paused);
     host_freeze236(true);g_keymap_tracker.clear();g_keymap_blocked|=held;
     g_keymap_editor.begin(g_keymaps,g_keymap_id,g_keymap_name,standard_game_keys(),paused);
+    if(g_keymap_editor.save_note.empty()&&!g_canvas_notice.empty()) {
+        g_keymap_editor.save_note=g_canvas_notice;
+        g_keymap_editor.save_note_error=false;g_keymap_editor.save_note_neutral=true;
+    }
     VMS_PLAT(g_cpu_cleared)=0;
     log_line("L3MENU open page=save_exit L3_reserved=1 game="+g_keymap_name);
 }
@@ -616,12 +732,13 @@ static bool update_keymap_editor(u64 down,u64 held,bool focus_paused) {
     const bool forward=arrows&(HidNpadButton_AnyDown|HidNpadButton_AnyRight),backward=arrows&(HidNpadButton_AnyUp|HidNpadButton_AnyLeft);
     const int direction=forward!=backward?(forward?1:-1):0;
     const bool choosing=g_keymap_editor.open&&g_keymap_editor.page==host_keymap::Page::Keymap&&g_keymap_editor.phase==host_keymap::Phase::Choice;
-    const bool command=down&(HidNpadButton_StickL|HidNpadButton_L|HidNpadButton_R|HidNpadButton_Plus|HidNpadButton_B|HidNpadButton_X|HidNpadButton_Y|HidNpadButton_A);
+    const bool command=down&(HidNpadButton_StickL|HidNpadButton_L|HidNpadButton_R|HidNpadButton_Plus|HidNpadButton_Minus|HidNpadButton_B|HidNpadButton_X|HidNpadButton_Y|HidNpadButton_A);
     const int repeated=g_keymap_editor.choice_repeat.update(choosing,direction,bool(down&directions),monotonic_ms(),command);
     if(down&HidNpadButton_StickL)result=host_keymap::act(g_keymap_editor,Action::Close);
     else if(down&HidNpadButton_L)result=host_keymap::act(g_keymap_editor,Action::PreviousPage);
     else if(down&HidNpadButton_R)result=host_keymap::act(g_keymap_editor,Action::NextPage);
     else if(down&HidNpadButton_Plus)result=host_keymap::act(g_keymap_editor,Action::Save);
+    else if(down&HidNpadButton_Minus)result=host_keymap::act(g_keymap_editor,Action::Clear);
     else if(down&HidNpadButton_B)result=host_keymap::act(g_keymap_editor,Action::Back);
     else if(down&HidNpadButton_X)result=host_keymap::act(g_keymap_editor,Action::Reset);
     else if(down&HidNpadButton_Y)result=host_keymap::act(g_keymap_editor,Action::Global);
@@ -690,6 +807,7 @@ static void unpack_nested_jars() {
     } else log_line("JAR nested failed " + nested_error);
 }
 static void launch_entry(const Entry& e, bool import_legacy = false) {
+    select_display_preferences(e.path,true);
     VMS_PLAT(g_launched_path) = e.path;
     VMS_PLAT(g_host_surface) = HostSurface::Game;
     VMS_PLAT(g_cpu_cleared) = 0;
@@ -791,6 +909,8 @@ int main(int argc, char** argv) {
     VMS_PLAT_LOCAL(import_prompt, main_import_prompt, static bool import_prompt = false;)
     bool focus_paused=false;
     const bool config_loaded = host_menu::load_settings("sdmc:/switch/j2me/menu.cfg", VMS_PLAT(g_menu_settings));
+    // This test build starts in aspect-fit even when an earlier skin was saved.
+    VMS_PLAT(g_menu_settings).bezel = j2me_present::adaptive_bezel;
     select_presenter();
     std::string status;
 #ifdef J2ME_ENABLE_DEKO3D
@@ -810,16 +930,18 @@ int main(int argc, char** argv) {
       log_line("SPEEDKEY key=sha256 migrated=" + std::to_string(mr.migrated) + " kept_unresolved=" + std::to_string(mr.kept) +
                " rewritten=" + std::to_string(mr.rewritten) + " bak_written=" + std::to_string(mr.bak_written) + " save_ok=" + std::to_string(mr.save_ok) +
                " hashed=" + std::to_string(g_speed_keys.hashed) + " cache_hits=" + std::to_string(g_speed_keys.hits) + " cache_entries=" + std::to_string(g_speed_keys.cache.size())); }
-    log_line("MENU native=1280x720 viewport=480x640 speed=per-game native/30/60 settings_loaded=" + std::to_string(config_loaded) +
+    log_line("MENU native=1280x720 viewport=aspect-fit first-edge-stop speed=per-game native/30/60 settings_loaded=" + std::to_string(config_loaded) +
              " speeds_loaded=" + std::to_string(speeds_loaded) + " speeds=" + std::to_string(VMS_PLAT(g_game_speeds).size()));
     draw_menu(items, sel, status);
     static AppletHookCookie p8_exit_cookie; // P8.2: HOME->close / exit request writes the last P7COUNT summary
     appletHook(&p8_exit_cookie, [](AppletHookType t, void*) { if (t == AppletHookType_OnExitRequest) p8_exit_summary(); }, nullptr);
     g_die_catch = true;
     while (appletMainLoop()) {
+        diag_host(in_game!=0,VMS_PLAT(g_host_paused)||VMS_PLAT(g_exit_sheet)||g_keymap_editor.open);
         if (setjmp(g_die_jmp) != 0) {
+            g_device_diag.owner.phase=runtime_diag::Phase::Error;g_device_diag.live.publish(g_device_diag.owner);
             g_keymap_editor.open=false;g_keymap_tracker.clear();
-            g_chapter_import=chapter_ui::State{};
+            g_chapter_import=chapter_ui::State{};g_display_menu.open=false;
             stop_thread(); in_game = 0; import_prompt = false; VMS_PLAT(g_exit_sheet) = false; VMS_PLAT(g_sheet_paused_here) = false; VMS_PLAT(g_sheet_swallow) = 0; status = VMS_EXEC(g_error);
             g_menu_note_error=true;g_menu_note_neutral=false;g_menu_repeat.reset();
             draw_menu(items, sel, status); log_line("EX back-to-menu " + VMS_EXEC(g_error)); present(); continue;
@@ -837,6 +959,7 @@ int main(int argc, char** argv) {
                     return measured.ok?measured.x+measured.w:host_menu::text_advance(s,host_menu::status_px);},host_menu::status_width);
                 g_menu_note_error=false;g_menu_note_neutral=true;log_line("SELFEXIT menu_hint="+status);
             }
+            if(!g_canvas_notice.empty()){status=g_canvas_notice;g_menu_note_error=false;g_menu_note_neutral=true;}
             sel=std::max(0,std::min(sel,std::max(0,int(items.size())-1)));draw_menu(items,sel,status);
         }
         if(!focused) {if(g_chapter_import.open){g_chapter_blocked=~u64(0);g_menu_repeat.reset();}g_keymap_editor.choice_repeat.reset();{ P7_SCOPE(Idle); svcSleepThread(10000000); }continue;}
@@ -861,8 +984,12 @@ int main(int argc, char** argv) {
             log_line(std::string("KEY ") + (in_game ? "game" : "menu") + " down=" + button_names(down) +
                      (stick && !dpad ? " stick-only" : "") + " sel=" + std::to_string(sel));
         }
+        if(!in_game && g_display_menu.open) {
+            g_menu_repeat.reset();update_display_menu(down,held,items,sel,status);
+            present();{P7_SCOPE(Idle);svcSleepThread(16000000);}continue;
+        }
         if(!in_game && g_menu_delete.open) {
-            g_menu_repeat.reset();update_menu_delete(down,items,sel,status);
+            g_menu_repeat.reset();update_menu_delete(down,items,sel,status,held);
             present();{P7_SCOPE(Idle);svcSleepThread(16000000);}continue;
         }
         if (!in_game && g_chapter_import.open) {
@@ -876,7 +1003,7 @@ int main(int argc, char** argv) {
             } else if ((down & HidNpadButton_X) && !items.empty()) {
                 import_prompt = false;
                 log_line("LAUNCH explicit legacy import " + items[sel].label);
-                launch_entry(items[sel], true); in_game = 1; VMS_EXEC(g_slices) = 0;
+                launch_entry(items[sel], true); status=g_canvas_notice; in_game = 1; VMS_EXEC(g_slices) = 0;
             }
             present(); continue;
         }
@@ -917,16 +1044,10 @@ int main(int argc, char** argv) {
                 changed = changed || VMS_PLAT(g_menu_focus) != host_menu::Focus::Games;
                 VMS_PLAT(g_menu_focus) = host_menu::Focus::Games;
             }
-            else if ((down & HidNpadButton_Plus) && VMS_PLAT(g_menu_focus)==host_menu::Focus::Games) {
+            else if ((down & HidNpadButton_Plus)) {
                 g_menu_repeat.reset();
                 if(items.empty())status="先选择一款游戏";
-                else g_menu_delete.begin(items[sel].path,game_names::strip_jar(items[sel].path));
-                draw_menu(items,sel,status);present();continue;
-            }
-            else if ((down & HidNpadButton_Y) && VMS_PLAT(g_menu_focus)==host_menu::Focus::Games) {
-                g_menu_repeat.reset();
-                g_chapter_blocked=held;
-                if(!g_chapter_import.begin(items,sel))status="至少需要两款游戏，才能选择来源章节";
+                else g_display_menu.begin();
                 draw_menu(items,sel,status);present();continue;
             }
             else if (down & HidNpadButton_X) {
@@ -934,6 +1055,7 @@ int main(int argc, char** argv) {
                 else if (items.empty()) status = "先选择一款游戏";
                 else if (!instant_state_exists(items[sel].path)) status = "没有即时存档";
                 else {
+                    select_display_preferences(items[sel].path,true);
                     VMS_PLAT(g_launched_path) = items[sel].path;
                     VMS_PLAT(g_host_surface) = HostSurface::Game;
                     VMS_PLAT(g_cpu_cleared) = 0;
@@ -960,7 +1082,7 @@ int main(int argc, char** argv) {
                         select_game_keymap(items[sel],identity);
                         if(!chapter_save::recover(g_chapter_rms_root,identity,err)) status="存档恢复失败："+err;
                         else if (restore_instant_state(items[sel].path,identity)) {
-                            in_game = 1; VMS_EXEC(g_slices) = 0; status.clear(); changed = false;
+                            in_game = 1; VMS_EXEC(g_slices) = 0; status=g_canvas_notice; changed = false;
                             VMS_EXEC(g_last_console_line).clear(); VMS_EXEC(g_self_exit) = false;   // 0.2.112 F2: per-continue
                             VMS_PLAT(g_chrome_bezel) = -2; VMS_PLAT(g_chrome_fps) = -2; VMS_PLAT(g_cpu_cleared) = 0; VMS_RS(g_fb_dirty) = true;
                             log_line("CONTINUE host bezel=" + std::to_string(VMS_PLAT(g_menu_settings).bezel) +
@@ -985,7 +1107,7 @@ int main(int argc, char** argv) {
                     import_prompt = true; draw_import_prompt(items[sel]); present(); continue;
                 } else if ((down & HidNpadButton_A) && !items.empty()) {
                     log_line("LAUNCH begin " + items[sel].label + " path=" + items[sel].path);
-                    launch_entry(items[sel]); in_game = 1; VMS_EXEC(g_slices) = 0;
+                    launch_entry(items[sel]); status=g_canvas_notice; in_game = 1; VMS_EXEC(g_slices) = 0;
                     log_line("LAUNCH entered " + items[sel].label);
                 }
             } else if (down & (HidNpadButton_AnyUp | HidNpadButton_AnyDown)) {
@@ -999,6 +1121,14 @@ int main(int argc, char** argv) {
                 } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Filter) {
                     settings_changed=host_menu::change_filter(VMS_PLAT(g_menu_settings),1);
                     if(settings_changed)select_presenter();
+                } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Rotation && !items.empty()) {
+                    auto chosen=VMS_PLAT(g_menu_settings);
+                    host_menu::change_rotation(chosen,1);
+                    const bool saved=host_display::save_rotation(items[sel].path,chosen.rotation);
+                    if(saved){VMS_PLAT(g_menu_settings).rotation=chosen.rotation;invalidate_display_preferences();}
+                    status=saved?std::string("此游戏旋转 ")+host_menu::rotation_name(chosen.rotation):"旋转保存失败，请检查游戏目录";
+                    g_menu_note_error=!saved;g_menu_note_neutral=false;
+                    log_line("DISPLAY rotation="+std::to_string(chosen.rotation*90)+" saved="+std::to_string(saved)+" path="+items[sel].path);
                 } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Fps) {
                     VMS_PLAT(g_menu_settings).show_fps = !VMS_PLAT(g_menu_settings).show_fps; settings_changed = true;
                 } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Speed && !items.empty()) {
@@ -1035,7 +1165,7 @@ int main(int argc, char** argv) {
             if(Value* key_held=game_canvas_state(VMS_RS(g_current),"keyHeld"))key_held->i=VMS_PLAT(g_key_states);
 
         }
-        if (!in_game && !import_prompt && !g_menu_delete.open) poll_menu_name();
+        if (!in_game && !import_prompt && !g_menu_delete.open && !g_display_menu.open) poll_menu_name();
         if (in_game && VMS_PLAT(g_exit_sheet)) {
             { P7_SCOPE(Idle); std::this_thread::sleep_for(std::chrono::milliseconds(16)); }
         } else if (in_game) {

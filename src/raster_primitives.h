@@ -109,9 +109,13 @@ inline void arc(Surface& s,int64_t x,int64_t y,int w,int h,int start,int sweep,
         double u=double(xx-x)+0.5,v=double(yy-y)+0.5;
         if(!inside(u,v)) continue;
         if(outline && inside(u-1,v)&&inside(u+1,v)&&inside(u,v-1)&&inside(u,v+1)) continue;
-        double nx=(u-ww/2)/(ww/2),ny=(v-hh/2)/(hh/2);
-        double angle=std::atan2(-ny,nx)*180.0/3.14159265358979323846;
-        if((nx!=0||ny!=0)&&!in_sweep(angle,start,sweep)) continue;
+        // Full ellipses have no angular boundary. Avoid one transcendental
+        // calculation per covered pixel; compare directly to handle INT_MIN.
+        if(sweep<360 && sweep>-360) {
+            double nx=(u-ww/2)/(ww/2),ny=(v-hh/2)/(hh/2);
+            double angle=std::atan2(-ny,nx)*180.0/3.14159265358979323846;
+            if((nx!=0||ny!=0)&&!in_sweep(angle,start,sweep)) continue;
+        }
         if(outline&&dotted&&((xx-x+yy-y)&1)) continue;
         s.put(xx,yy,color);
     }

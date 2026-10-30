@@ -8,17 +8,22 @@ inline bool pace_align_sleep(int requested_ms, bool sleeping, int64_t wake, int6
     return sleeping && requested_ms >= 8 && requested_ms <= 20 && wake > now;
 }
 
-// Keep the usual grid phase through small wake jitter, but skip a near slot
-// after a hitch. A late frame cannot earn a second drawing only 0.3ms later.
+// Keep the absolute phase through ordinary late wakes. A missed full period
+// starts a fresh grid, so a long hitch cannot accumulate catch-up debt.
 inline int64_t speed_next_paint_deadline(int period_us,int64_t next_us,int64_t anchor_us) {
     if(period_us<=0)return 0;
-    if(next_us<=0)return anchor_us+period_us;
-    if(next_us<=anchor_us)next_us+=((anchor_us-next_us)/period_us+1)*period_us;
-    const int64_t earliest=anchor_us+(period_us>3000?period_us-2000:period_us);
-    // A near slot would be a catch-up burst; waiting for the slot after it
-    // would add almost a whole extra period. Reanchor only for that hitch.
-    if(next_us<earliest)return anchor_us+period_us;
-    return next_us;
+    if(next_us<=0 || anchor_us-next_us>=period_us)return anchor_us+period_us;
+    if(anchor_us<next_us)return next_us;
+    return next_us+period_us;
+}
+
+// Retaining the nominal grid must not permit a near-slot drawing burst.
+// Repay at most the existing 2ms allowance per actual drawing interval.
+inline int64_t speed_paint_wait_deadline(int period_us,int64_t next_us,int64_t last_us) {
+    if(period_us<=0 || next_us<=0)return 0;
+    if(last_us<=0)return next_us;
+    const int64_t earliest=last_us+(period_us>3000?period_us-2000:period_us);
+    return next_us<earliest?earliest:next_us;
 }
 
 // Absolute paint-clock deadline for a speed cap, or 0 to keep the Java sleep.

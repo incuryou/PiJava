@@ -27,6 +27,17 @@ static int stream_intrinsic_kind(const Method* method) {
     }
     return StreamNone;
 }
+static int stream_field_slot(int cls,unsigned key) {
+    static const char* names[]={"in","pos","count","mark","buf"};
+    static const char* descs[]={"Ljava/io/InputStream;","I","I","I","[B"};
+    if(cls<0 || size_t(cls)>=VMS_CL(g_classes).size() || key>=5)return -1;
+    auto& owner=VMS_CL(g_classes)[cls];int& slot=owner.stream_slots[key];
+    if(slot==-2) {
+        const Field* field=find_field(cls,names[key],descs[key]);
+        slot=field&&!field->is_static&&field->slot>=0&&field->slot<owner.instance_fields?field->slot:-1;
+    }
+    return slot;
+}
 static bool stream_intrinsic_dispatch(int kind, const Method* method, Value* args, Value& result) {
     const int receiver = args[0].ref;
     if (receiver <= 0 || receiver >= (int)VMS_HEAP(g_heap).size() ||
@@ -34,9 +45,9 @@ static bool stream_intrinsic_dispatch(int kind, const Method* method, Value* arg
     int stream = receiver;
     const bool data_input = kind >= StreamUnsignedByte;
     if (data_input) {
-        Field* input = find_field(method->class_id, "in", "Ljava/io/InputStream;");
-        if (!input) return false;
-        stream = VMS_HEAP(g_heap)[receiver].fields[input->slot].ref;
+        const int input = stream_field_slot(method->class_id,0);
+        if (input<0 || size_t(input)>=VMS_HEAP(g_heap)[receiver].fields.size()) return false;
+        stream = VMS_HEAP(g_heap)[receiver].fields[input].ref;
         // Let the Java method deliver null/foreign-input behavior. Calling a
         // subclass's inherited read may itself contain overridden operations.
         if (stream <= 0 || stream >= (int)VMS_HEAP(g_heap).size()) return false;
@@ -44,28 +55,27 @@ static bool stream_intrinsic_dispatch(int kind, const Method* method, Value* arg
         if (cls < 0 || VMS_CL(g_classes)[cls].name != "java/io/ByteArrayInputStream") return false;
     }
     const int cls = VMS_HEAP(g_heap)[stream].cls;
-    Field* pos_field = find_field(cls, "pos", "I");
-    Field* count_field = find_field(cls, "count", "I");
-    Field* mark_field = find_field(cls, "mark", "I");
-    Field* buf_field = find_field(cls, "buf", "[B");
-    if (!pos_field || !count_field || !mark_field || !buf_field) return false;
+    const int pos_slot=stream_field_slot(cls,1),count_slot=stream_field_slot(cls,2),
+        mark_slot=stream_field_slot(cls,3),buf_slot=stream_field_slot(cls,4);
+    if(pos_slot<0||count_slot<0||mark_slot<0||buf_slot<0)return false;
     Obj& source = VMS_HEAP(g_heap)[stream];
-    int32_t pos = source.fields[pos_field->slot].i;
-    const int32_t count = source.fields[count_field->slot].i;
+    if(size_t(std::max({pos_slot,count_slot,mark_slot,buf_slot}))>=source.fields.size())return false;
+    int32_t pos = source.fields[pos_slot].i;
+    const int32_t count = source.fields[count_slot].i;
     if (kind == StreamAvailable) {
         result = Value::of_i(int_bits(uint32_t(count) - uint32_t(pos))); return true;
     }
     if (kind == StreamMark) {
-        source.fields[mark_field->slot] = Value::of_i(pos); return true;
+        source.fields[mark_slot] = Value::of_i(pos); return true;
     }
     if (kind == StreamReset) {
-        source.fields[pos_field->slot] = source.fields[mark_field->slot]; return true;
+        source.fields[pos_slot] = source.fields[mark_slot]; return true;
     }
     if (kind == StreamSkip) {
         int64_t skipped = args[1].l;
         if (skipped <= 0) skipped = 0;
         else skipped = std::min<int64_t>(skipped, int_bits(uint32_t(count) - uint32_t(pos)));
-        source.fields[pos_field->slot] = Value::of_i(int_bits(uint32_t(pos) + uint32_t(skipped)));
+        source.fields[pos_slot] = Value::of_i(int_bits(uint32_t(pos) + uint32_t(skipped)));
         result = Value::of_l(skipped); return true;
     }
     if (kind == StreamReadBytes) {
@@ -83,14 +93,14 @@ static bool stream_intrinsic_dispatch(int kind, const Method* method, Value* arg
         result = Value::of_i(-1);
         return true;
     }
-    const int buf = source.fields[buf_field->slot].ref;
+    const int buf = source.fields[buf_slot].ref;
     // Corrupted/protected state must retain Java's exception and mutation order.
     if (buf <= 0 || buf >= (int)VMS_HEAP(g_heap).size() || VMS_HEAP(g_heap)[buf].array_desc != "[B" ||
         pos < 0 || count < pos || size_t(count) > VMS_HEAP(g_heap)[buf].elems.size()) return false;
     if (kind == StreamReadBytes) {
         const int amount = std::min(args[3].i, count - pos);
         if (!VMS_HEAP(g_heap)[args[1].ref].elems.copy_from(VMS_HEAP(g_heap)[buf].elems, pos, args[2].i, amount)) return false;
-        source.fields[pos_field->slot] = Value::of_i(pos + amount);
+        source.fields[pos_slot] = Value::of_i(pos + amount);
         result = Value::of_i(amount); return true;
     }
     const int needed = kind == StreamUnsignedShort ? 2 : kind == StreamInt ? 4 : 1;
@@ -102,7 +112,7 @@ static bool stream_intrinsic_dispatch(int kind, const Method* method, Value* arg
     const uint8_t* bytes = VMS_HEAP(g_heap)[buf].elems.read_bytes();
     uint32_t value = 0;
     for (int i = 0; i < amount; ++i) value = (value << 8) | bytes[pos + i];
-    source.fields[pos_field->slot] = Value::of_i(pos + amount);
+    source.fields[pos_slot] = Value::of_i(pos + amount);
     result = Value::of_i(int_bits(value));
     return true;
 }

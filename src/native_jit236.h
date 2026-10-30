@@ -20,7 +20,8 @@
 #endif
 namespace jit236 {
 constexpr unsigned MaxLocals=32,MaxStack=64,MaxCode=512,MaxOps=128;
-struct Site { uint64_t epoch=0; uint32_t calls=0; int entry=-1; };
+struct Site { uint64_t epoch=0; uint32_t calls=0; int entry=-1;
+    uint64_t resource_generation=0;bool resource_wait=false; };
 struct Constant { bool integer=false; int32_t value=0; };
 struct Spec {
     const uint8_t* code=nullptr;size_t size=0;
@@ -265,20 +266,47 @@ inline std::vector<uint8_t> emit_host(const Program& p,uint32_t id=0){
     return {};
 #endif
 }
-struct Stats{uint64_t compiled=0,rejected=0,executed=0,ops=0,budget_fallbacks=0,permission_failures=0,stale=0,stale_reinstalls=0;};
+struct Stats{uint64_t compiled=0,rejected=0,executed=0,ops=0,budget_fallbacks=0,permission_failures=0,stale=0,stale_reinstalls=0,resource_reopens=0;};
 // 0.2.113: what the last caught stale leaf call looked like (read once by the VM glue for its JITSTALE line).
 struct StaleLeaf{bool hit=false;uint32_t expected=0,got=0;bool reinstalled=false;};
 class Engine {
     friend struct EngineTestAccess;   // 0.2.114: unit-test access only (declaration, no runtime effect)
     struct Entry{Executable code;unsigned args=0,max_ops=0;Program program;};
     std::vector<Entry> entries_;uint64_t epoch_=1;size_t bytes_=0;
+    bool resource_pause_=false;
+    uint64_t failed_retirement_sequence_=0,admission_generation_=0;
 public:
     static constexpr size_t BudgetBytes=jit_budget::LeafBytes,MaxEntries=jit_budget::LeafEntries;
     static constexpr unsigned HotThreshold=32;
     bool enabled=false,available=false,self_test=false,admission_closed=false;Stats stats{};std::string reason="not_requested";int result_fault=0;int guard_fault=0;StaleLeaf last_stale{};   // guard_fault: 0.2.114 desktop-only fault (J2ME_JIT_FAULT=leafguard), never set on Switch
-    void clear(){entries_.clear();bytes_=0;++epoch_;if(!epoch_)++epoch_;stats={};admission_closed=false;}
+    size_t last_failure_bytes=0;InstallMode last_failure_mode=InstallMode::Normal;
+    void clear(){entries_.clear();bytes_=0;++epoch_;if(!epoch_)++epoch_;stats={};admission_closed=false;
+        resource_pause_=false;failed_retirement_sequence_=retirement_sequence();admission_generation_=0;
+        last_failure_bytes=0;last_failure_mode=InstallMode::Normal;}
     size_t bytes()const{return bytes_;}size_t entries()const{return entries_.size();}
     uint64_t epoch()const{return epoch_;}
+    uint64_t admission_generation()const{return admission_generation_;}
+    bool resource_paused()const{return admission_closed&&resource_pause_;}
+    bool refresh_admission(){
+        if(!resource_paused()||active_code_calls()||failed_retirement_sequence_==retirement_sequence())return false;
+        if(admission_generation_==UINT64_MAX)return false;
+        admission_closed=false;resource_pause_=false;++admission_generation_;++stats.resource_reopens;return true;
+    }
+    void installation_failed(size_t requested_bytes=0,InstallMode mode=InstallMode::Normal){
+        admission_closed=true;
+        last_failure_bytes=requested_bytes;last_failure_mode=mode;
+        resource_pause_=Executable::last_result()==0xCE01u&&std::strcmp(Executable::last_error(),"jitCreate_failed")==0;
+        // Capture after the complete attempt: replacing/closing its own code
+        // must not manufacture a new retry opportunity and spin.
+        failed_retirement_sequence_=retirement_sequence();++stats.permission_failures;
+    }
+    void rearm_site(Site& site){
+        if(site.epoch!=epoch_){site={};site.epoch=epoch_;}
+        refresh_admission();
+        if(site.entry==-2&&site.resource_wait&&!admission_closed&&site.resource_generation!=admission_generation_) {
+            site.entry=-1;site.resource_wait=false;
+        }
+    }
     bool configure(bool requested){
         clear();enabled=requested;available=false;self_test=false;reason=requested?"pending":"not_requested";if(!requested)return false;
         const uint8_t b[]={26,16,17,130,172};std::string d="(I)I";Spec s{b,sizeof(b),&d,8,1,2,false,false,nullptr};Program p;
@@ -301,15 +329,15 @@ public:
     }
     bool prepare(Site& site,const Spec& s){
         if(!enabled||!available)return false;
-        if(site.epoch!=epoch_){site={};site.epoch=epoch_;}
+        rearm_site(site);
         if(site.entry==-2)return false;if(site.entry>=0)return true;
-        if(admission_closed){site.entry=-2;++stats.budget_fallbacks;return false;}
+        if(admission_closed){site.entry=-2;site.resource_wait=resource_paused();site.resource_generation=admission_generation_;++stats.budget_fallbacks;return false;}
         if(site.calls<HotThreshold){++site.calls;return false;}
         Program p;if(!verify(s,p)){site.entry=-2;++stats.rejected;return false;}
         const uint32_t id=next_install_id();auto bytes=emit_host(p,id);size_t pages=(bytes.size()+4095)&~size_t(4095);
         if(entries_.size()>=MaxEntries||pages>BudgetBytes-bytes_){site.entry=-2;++stats.budget_fallbacks;return false;}
         Entry e;e.args=p.args;e.max_ops=p.max_ops;
-        if(!e.code.install(bytes,id)){site.entry=-2;admission_closed=true;++stats.permission_failures;return false;}
+        if(!e.code.install(bytes,id)){site.entry=-2;installation_failed(bytes.size(),InstallMode::Normal);site.resource_wait=resource_paused();site.resource_generation=admission_generation_;return false;}
         if(e.code.size>BudgetBytes-bytes_){site.entry=-2;++stats.budget_fallbacks;return false;}
         e.program=p;bytes_+=e.code.size;site.entry=int(entries_.size());entries_.push_back(std::move(e));++stats.compiled;return true;
     }

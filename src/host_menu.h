@@ -1,6 +1,7 @@
 #pragma once
 #include "menu_actions.h"
 #include "presentation/filters.h"
+#include "presentation/viewport.h"
 
 #include <algorithm>
 #include <array>
@@ -21,9 +22,11 @@ namespace host_menu {
 constexpr int width = 1280;
 constexpr int height = 720;
 constexpr int visible_rows = 9;
-constexpr int bezel_count = 7;
-inline constexpr std::array<int,bezel_count> bezel_choices={{4,5,6,1,2,3,0}};
+constexpr int bezel_count = 8;
+// ID 0 remains reserved for old records, but is no longer selectable.
+inline constexpr std::array<int,4> bezel_choices={{4,5,6,j2me_present::adaptive_bezel}};
 inline int next_bezel(int current){
+    if(current==0)return j2me_present::adaptive_bezel;
     for(size_t i=0;i<bezel_choices.size();++i)if(bezel_choices[i]==current)return bezel_choices[(i+1)%bezel_choices.size()];
     return bezel_choices[0];
 }
@@ -33,21 +36,57 @@ constexpr int game_width = 480;
 constexpr int game_height = 640;
 
 struct Settings {
-    int bezel = 4;
+    int bezel = j2me_present::adaptive_bezel;
     bool show_fps = true;
     display_filter::Filter filter = display_filter::Filter::Original;
+    int rotation = 0; // Clockwise quarter turns, independent of the bezel.
+    int canvas = 0; // Selected game only; persisted by the host sidecar.
 };
 
-enum class Focus { Games = 0, Bezel = 1, Filter = 2, Speed = 3, Fps = 4 };
+enum class Focus { Games = 0, Bezel = 1, Filter = 2, Speed = 3, Fps = 4, Rotation = 5 };
 
 inline Focus option_step(Focus focus,int direction){
-    const int current=std::max(int(Focus::Bezel),std::min(int(Focus::Fps),int(focus)));
-    return static_cast<Focus>(std::max(int(Focus::Bezel),std::min(int(Focus::Fps),current+(direction>0?1:direction<0?-1:0))));
+    constexpr Focus order[]={Focus::Bezel,Focus::Filter,Focus::Rotation,Focus::Speed,Focus::Fps};
+    int index=0;
+    for(int i=0;i<5;++i)if(order[i]==focus){index=i;break;}
+    return order[std::max(0,std::min(4,index+(direction>0?1:direction<0?-1:0)))];
 }
 inline bool change_filter(Settings& settings,int direction){
     if(!direction)return false;
     const int current=int(display_filter::normalized(settings.filter));
     settings.filter=static_cast<display_filter::Filter>((current+(direction>0?1:display_filter::count-1))%display_filter::count);
+    return true;
+}
+
+inline bool change_rotation(Settings& settings, int direction) {
+    if (!direction) return false;
+    const int current = settings.rotation >= 0 && settings.rotation < 4 ? settings.rotation : 0;
+    settings.rotation = (current + (direction > 0 ? 1 : 3)) % 4;
+    return true;
+}
+inline const char* rotation_name(int rotation) {
+    constexpr const char* names[] = {"0°", "90°", "180°", "270°"};
+    return names[rotation >= 0 && rotation < 4 ? rotation : 0];
+}
+
+inline constexpr int canvas_count = 17;
+inline std::pair<int, int> canvas_size(int canvas) {
+    constexpr std::pair<int, int> sizes[] = {{0,0},{128,128},{128,160},{176,205},{176,208},{176,220},{208,208},{240,320},{240,400},{320,240},{320,480},{352,416},{360,360},{360,640},{480,800},{640,360},{800,480}};
+    return sizes[canvas >= 0 && canvas < canvas_count ? canvas : 0];
+}
+inline const char* canvas_name(int canvas) {
+    if (canvas == -1) return "自定义（现有配置）";
+    constexpr const char* names[] = {"自动", "128×128", "128×160", "176×205", "176×208", "176×220", "208×208", "240×320", "240×400", "320×240", "320×480", "352×416", "360×360", "360×640", "480×800", "640×360", "800×480"};
+    return names[canvas >= 0 && canvas < canvas_count ? canvas : 0];
+}
+inline bool change_canvas(Settings& settings, int direction) {
+    if (!direction) return false;
+    if (settings.canvas == -1) {
+        settings.canvas = direction > 0 ? 0 : canvas_count - 1;
+        return true;
+    }
+    const int current = settings.canvas >= 0 && settings.canvas < canvas_count ? settings.canvas : 0;
+    settings.canvas = (current + (direction > 0 ? 1 : canvas_count - 1)) % canvas_count;
     return true;
 }
 
@@ -79,13 +118,11 @@ inline void rect(uint32_t* frame, size_t pitch, int x, int y, int w, int h,
 
 inline const char* bezel_name(int bezel) {
     switch (bezel) {
-    case 1: return "银蓝塑料";
-    case 2: return "黑银金属";
-    case 3: return "复古米灰";
     case 4: return "手柄米白";
     case 5: return "手柄蓝";
     case 6: return "手柄黑";
-    default: return "无边框";
+    case j2me_present::adaptive_bezel:return "自适应屏幕";
+    default: return "自适应屏幕";
     }
 }
 
@@ -145,7 +182,6 @@ inline void render_menu(uint32_t* frame, size_t pitch,
                         bool status_neutral = true) {
     if (scrolling) *scrolling = false;
     if (!frame || pitch < size_t(width)) return;
-    (void)centered;
     const uint32_t background = color(0xf3f3f3);
     const uint32_t selected = color(0xf4dddd);
     const uint32_t foreground = color(0x262626);
@@ -227,11 +263,14 @@ inline void render_menu(uint32_t* frame, size_t pitch,
         }
     };
 
-    label(48, 40, "游戏", foreground, 34, 100);
+    constexpr int header_center_y=57;
+    if(centered)centered(48+measure("游戏",34)/2,header_center_y,"游戏",foreground,34,100);
+    else label(48,40,"游戏",foreground,34,100);
     rect(frame, pitch, 164, 47, 1, 27, line_color);
-    label(184, 48, "J2ME", secondary, 20, 120);
-    switch_key(1125, 59, '+');
-    label(1151, 47, "删除", secondary, 18, 80);
+
+    switch_key(1125, header_center_y, '+');
+    if(centered)centered(1151+measure("更多设置",18)/2,header_center_y,"更多设置",secondary,18,95);
+    else label(1151,header_center_y-9,"更多设置",secondary,18,95);
     rect(frame, pitch, 892, 124, 1, 466, line_color);
 
     const size_t count = labels.size();
@@ -240,7 +279,8 @@ inline void render_menu(uint32_t* frame, size_t pitch,
     const size_t first = (selected_index / visible_rows) * visible_rows;
     const std::string position = count == 0 ? "0 / 0" :
         std::to_string(selected_index + 1) + " / " + std::to_string(count);
-    label(740, 51, position, secondary, 20, 120);
+    if(centered)centered(184+measure(position,20)/2,header_center_y,position,secondary,20,120);
+    else label(184,header_center_y-10,position,secondary,20,120);
 
     if (count == 0) {
         label(82, 164, "暂无游戏", secondary, 24, 754);
@@ -271,20 +311,22 @@ inline void render_menu(uint32_t* frame, size_t pitch,
     const auto option = [&](int y, Focus option_focus, const std::string& name,
                             const std::string& value, bool enabled, int max_width) {
         if (focus == option_focus) {
-            rounded(908, y - 10, 332, 96, 12.0f, selected);
+            rounded(908, y - 10, 332, 80, 12.0f, selected);
         }
         label(920, y, name, secondary, 20, 310);
         label(920, y + 37, value, enabled ? foreground : secondary, 24, max_width);
     };
     option(138, Focus::Bezel, "遮罩", bezel_name(settings.bezel), true, 272);
-    rect(frame, pitch, 920, 234, 310, 1, line_color);
-    option(246, Focus::Filter, "滤镜", display_filter::name(settings.filter), true, 272);
-    rect(frame, pitch, 920, 342, 310, 1, line_color);
-    option(354, Focus::Speed, "速度", speed_label.empty() ? "原生" : speed_label, true, 120);
-    rect(frame, pitch, 920, 450, 310, 1, line_color);
-    option(462, Focus::Fps, "显示帧数", settings.show_fps ? "开启" : "关闭", true, 190);
-    rounded(1178, 498, 52, 30, 15.0f, settings.show_fps ? accent : secondary);
-    rounded(settings.show_fps ? 1203 : 1182, 502, 22, 22, 11.0f, on_accent);
+    rect(frame, pitch, 920, 214, 310, 1, line_color);
+    option(226, Focus::Filter, "滤镜", display_filter::name(settings.filter), true, 272);
+    rect(frame, pitch, 920, 302, 310, 1, line_color);
+    option(314, Focus::Rotation, "画面旋转", rotation_name(settings.rotation), true, 272);
+    rect(frame, pitch, 920, 390, 310, 1, line_color);
+    option(402, Focus::Speed, "速度", speed_label.empty() ? "原生" : speed_label, true, 120);
+    rect(frame, pitch, 920, 478, 310, 1, line_color);
+    option(490, Focus::Fps, "显示帧数", settings.show_fps ? "开启" : "关闭", true, 190);
+    rounded(1178, 526, 52, 30, 15.0f, settings.show_fps ? accent : secondary);
+    rounded(settings.show_fps ? 1203 : 1182, 530, 22, 22, 11.0f, on_accent);
 
     // P8.11: no status -> the selected JAR's manifest name (details), else its label.
     // P8.11-r2: same right edge as the list text (82 + 754 = 836), left of the divider at 892.
@@ -299,7 +341,7 @@ inline void render_menu(uint32_t* frame, size_t pitch,
     label(48, 653, "↑ ↓ 选择", secondary, 18, 90);
     label(160, 653, "← → 游戏 / 选项", secondary, 18, 148);
     label(326, 653, "L / R 翻页", secondary, 18, 148);
-    label(500, 653, "Y 继承存档", secondary, 18, 160);
+
     rounded(936, 638, 140, 55, 27.5f, accent);
     switch_key(969, 665, 'X');
     label(995, 653, "继续", on_accent, 24, 65);
@@ -316,27 +358,20 @@ inline void render_delete(uint32_t* frame,size_t pitch,const menu_actions::Delet
     rect(frame,pitch,296,184,688,352,color(0xffffff));
     const auto ink=color(0x26313e),muted=color(0x718094),red=color(0xc81e41);
     if(text){
-        text(330,208,deletion.confirming?"确认删除":"删除选项",ink,26,620);
+        text(330,208,deletion.confirming?"确认删除":"游戏选项",ink,26,620);
         text(330,250,deletion.label,muted,20,620);
         if(deletion.confirming){
             text(330,305,deletion.selection==0?"删除此游戏 JAR？":"删除此游戏的即时存档？",red,23,620);
             text(330,350,deletion.selection==0?"游戏存档、映射和设置将保留。":"删除后将无法继续此即时存档。",muted,17,620);
             text(330,383,"此操作无法撤销，请确认后执行。",muted,17,620);
         }else{
-            for(int i=0;i<2;++i){
+            for(int i=0;i<3;++i){
                 rect(frame,pitch,326,293+i*62,628,50,color(i==deletion.selection?0xffe7ed:0xf2f4f7));
-                text(344,306+i*62,i==0?"删除游戏":"删除即时存档",i==deletion.selection?red:ink,23,588);
+                text(344,306+i*62,i==0?"删除游戏":i==1?"删除即时存档":"继承存档",i==deletion.selection?red:ink,23,588);
             }
         }
-        text(377,479,"确认",ink,18,80);text(553,479,"取消",ink,18,80);
+        text(330,479,"A 确认    B 返回",ink,18,620);
     }
-    const auto icon=[&](int x,const std::string& key){
-        // Same centered circular token as the mapping page.
-        for(int yy=-15;yy<=15;++yy)for(int xx=-15;xx<=15;++xx)
-            if(xx*xx+yy*yy<=225)rect(frame,pitch,x+xx,489+yy,1,1,color(0x2a2a2a));
-        if(centered)centered(x,489,key,color(0xffffff),16,26);
-    };
-    icon(350,"A");icon(526,"B");
 }
 
 inline void render_exit_sheet(uint32_t* frame, size_t pitch, const Text& text,
@@ -394,12 +429,47 @@ inline const BezelPalette& bezel_palette(int bezel) {
     return palettes[bezel > 0 && bezel < 4 ? bezel : 0];
 }
 
+// Cached projection of the unchanged black controller's two 352x720 side
+// panes. The game remains aspect-fit; narrow sidebars deliberately stay black.
+struct UniversalPane {
+    int source_x=0,x=0,y=0,w=0,h=0;
+    int project_x(int source)const{return x+(source-source_x)*w/352;}
+    int project_y(int source)const{return y+source*w/352;}
+};
+struct UniversalLayout {
+    int source_w=0,source_h=0;
+    j2me_present::Viewport viewport{0,0,0,0};
+    std::array<UniversalPane,2> panes{};
+    UniversalLayout(){update(240,320);}
+    bool update(int w,int h){
+        if(w==source_w&&h==source_h)return false;
+        source_w=w;source_h=h;
+        viewport=j2me_present::game_viewport(w,h,true);
+        panes={};
+        if(!j2me_present::valid_viewport(viewport))return true;
+        for(int side=0;side<2;++side){
+            auto& pane=panes[size_t(side)];pane.source_x=side?928:0;
+            const int start=side?viewport.x+viewport.w:0;
+            const int sidebar=side?width-start:viewport.x;
+            if(sidebar<96)continue;
+            pane.w=std::min(352,sidebar);pane.h=pane.w*height/352;
+            pane.x=start+(sidebar-pane.w)/2;pane.y=(height-pane.h)/2;
+        }
+        return true;
+    }
+};
+
 // Static decoration is painted only when entering a game / clearing the
 // framebuffer ring. The exact 480x640 game viewport remains unobstructed.
 inline void render_bezel(uint32_t* frame, size_t pitch, int bezel, const Text& text,
-                         const uint32_t* texture = nullptr, size_t texture_count = 0) {
+                         const uint32_t* texture = nullptr, size_t texture_count = 0,
+                         const UniversalLayout* universal = nullptr) {
     if (!frame || pitch < size_t(width)) return;
     (void)text;
+    if(bezel==j2me_present::adaptive_bezel){
+        rect(frame,pitch,0,0,width,height,color(0));
+        return;
+    }
     const BezelPalette& p = bezel_palette(bezel);
     // Only a complete active skin can use a texture. In particular, no-bezel
     // remains black even if a caller accidentally passes an earlier skin.

@@ -180,7 +180,7 @@ inline void move_phone(Editor& e,int dx,int dy) {
         for(int p=0;p<PhoneCount;++p)if(position(p)==std::make_pair(x,y)){e.phone=p;return;}
     }
 }
-enum class Action { Up, Down, Left, Right, Confirm, Back, Reset, Global, Save, Close, PreviousPage, NextPage };
+enum class Action { Up, Down, Left, Right, Confirm, Back, Reset, Global, Save, Close, PreviousPage, NextPage, Clear };
 enum class Result { None, Close, Save, SaveInstant, DeleteInstant, ExitGame };
 inline Result act(Editor& e,Action a) {
     if(a!=Action::Up&&a!=Action::Down&&a!=Action::Left&&a!=Action::Right)e.choice_repeat.reset();
@@ -203,6 +203,7 @@ inline Result act(Editor& e,Action a) {
         return Result::None;
     }
     if(a==Action::Save)return Result::Save;
+    if(a==Action::Clear){e.draft.automatic=false;e.draft.bindings=empty_bindings();e.phase=Phase::Phone;e.note="已清除全部映射，请按 + 保存";e.note_error=false;return Result::None;}
     if(a==Action::Reset){e.draft=Config{};e.phase=Phase::Phone;e.note="已恢复默认，请按 + 保存";e.note_error=false;return Result::None;}
     if(a==Action::Global){e.global=!e.global;e.note=e.global?"已切换为全局映射，请按 + 保存":"已切换为当前游戏映射，请按 + 保存";e.note_error=false;return Result::None;}
     if(a==Action::Back) {

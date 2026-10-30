@@ -6,9 +6,11 @@
 #pragma once
 #include "p7_worker.h"
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include "logical_screen.h"
 #include "presentation/filters.h"
+#include "presentation/viewport.h"
 namespace p7present {
 inline bool g_enabled = false;
 inline uint64_t g_split = 0, g_serial = 0, g_steal = 0, g_probe = 0;
@@ -44,9 +46,45 @@ inline uint64_t ns_of(uint64_t t) {
     return t;
 #endif
 }
+// Precompute columns once, convert each distinct source row once, then copy
+// repeated rows. No divisions or filter dispatch in the per-pixel loop.
+inline void blit_scaled_rows(uint32_t* frame,uint32_t pitch,const uint8_t* fb,int w,int h,
+                             const j2me_present::Viewport& v,const int* columns,int y0,int y1){
+    int previous=-1;
+    for(int y=y0;y<y1;++y){
+        const int sy=y*h/v.h;uint32_t* row=frame+size_t(v.y+y)*pitch+v.x;
+        if(sy==previous){std::memcpy(row,row-pitch,size_t(v.w)*sizeof(uint32_t));continue;}
+        const uint8_t* source=fb+size_t(sy)*w*3;
+        for(int x=0;x<v.w;++x){const auto* p=source+columns[x];row[x]=uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|0xff000000u;}
+        previous=sy;
+    }
+}
 // Whole game area; serial or split across worker 0 + main, chosen by measured wall time. Pixels identical either way.
-inline void blit_game(uint32_t* frame, uint32_t pitch, const uint8_t* fb, int w, int h, display_filter::Filter filter=display_filter::Filter::Original) {
+inline void blit_game(uint32_t* frame, uint32_t pitch, const uint8_t* fb, int w, int h, display_filter::Filter filter=display_filter::Filter::Original,const j2me_present::Viewport& viewport={}) {
     if(!logical_screen::valid(w,h)||!frame||!fb||pitch<1280)return;
+    if(!j2me_present::valid_viewport(viewport))return;
+    if(viewport.x!=400||viewport.y!=40||viewport.w!=480||viewport.h!=640){
+        if(display_filter::normalized(filter)!=display_filter::Filter::Original){
+            ++g_serial;display_filter::render(frame+size_t(viewport.y)*pitch+viewport.x,pitch,fb,w,h,filter,viewport.w,viewport.h);return;
+        }
+        const uint64_t t0=p7::ticks();
+        std::array<int,1280> columns;
+        for(int x=0;x<viewport.w;++x)columns[x]=(x*w/viewport.w)*3;
+        const int mode=g_enabled&&viewport.h>=2?pick():0;++g_frames;
+        if(!mode){++g_serial;blit_scaled_rows(frame,pitch,fb,w,h,viewport,columns.data(),0,viewport.h);}
+        else{
+            const int mid=viewport.h/2;
+            const uint64_t t=p7::pool().submit([frame,pitch,fb,w,h,viewport,&columns,mid]{P7_SCOPE(Present);blit_scaled_rows(frame,pitch,fb,w,h,viewport,columns.data(),0,mid);},0);
+            blit_scaled_rows(frame,pitch,fb,w,h,viewport,columns.data(),mid,viewport.h);
+            p7::Pool::Task top;
+            if(p7::pool().steal(t,top)){++g_steal;top();}
+            else{P7_SCOPE(PresentWait);p7::pool().wait(t);}
+            ++g_split;
+        }
+        const uint64_t d=ns_of(p7::ticks()-t0);g_wall_ns[mode]+=d;
+        g_ema[mode]=g_n[mode]++==0?d:(g_ema[mode]*7+d)/8;
+        return;
+    }
     if(display_filter::normalized(filter)!=display_filter::Filter::Original){
         ++g_serial;display_filter::render(frame+size_t(40)*pitch+400,pitch,fb,w,h,filter);return;
     }

@@ -214,7 +214,52 @@ static Value sav_array_value(const uint8_t* bytes, const std::string& desc, size
     return Value::of_i(int32_t(bits)); // ArrayStorage.set handles Java narrowing.
 }
 
+// A worker can finish while a native callback pumps Java threads. Its list
+// node remains until a later outer thread_resume, which may never run when it
+// was the last worker. GC correctly stops rooting that finished context, so
+// its identity can already be a free or reused heap slot at snapshot time.
+// Only unfinished workers have resumable continuations. Remove inert nodes
+// from the saved copy, preserving worker order and remapping dependent IDs.
+// This also repairs J2S5 files written before finished nodes were omitted.
+static bool sav_compact_finished_threads(SavState& s) {
+    std::vector<int> ids(s.threads.size()+1,-1);ids[0]=0;
+    size_t kept=0,removed=0;
+    auto reject=[](const char* why){log_line(std::string("SAVE invalid state: ")+why);return false;};
+    for(size_t i=0;i<s.threads.size();++i) {
+        const auto& t=s.threads[i];
+        if(t.state!=int(ThreadState::Terminated)){ids[i+1]=int(++kept);continue;}
+        // finish_thread clears all executable/ownership state. Ref values
+        // within the old heap may be stale; out-of-range values are corrupt.
+        if(!t.begun || !t.frames.empty() || t.monitor || t.join_target || t.restore_depth<0 ||
+           t.reacquire || t.interrupt_exception || t.has_wake || t.init_wait!=-1 || !t.init_wait_class.empty() ||
+           t.ref<=0 || size_t(t.ref)>=s.heap.size() || t.unhandled<0 || size_t(t.unhandled)>=s.heap.size())
+            return reject("terminated worker has continuation, ownership, or invalid identity");
+        ++removed;
+    }
+    if(!removed)return true;
+    auto retained=[&](int id,bool optional){return (optional&&id==-1)||(id>=0&&size_t(id)<ids.size()&&ids[size_t(id)]>=0);};
+    // Complete this preflight before rewriting any saved IDs or list entries.
+    for(const auto& c:s.classes)if(!retained(c.init_owner,true))return reject("terminated or invalid class initialization owner");
+    for(const auto& m:s.monitors) {
+        if(!retained(m.owner,true))return reject("terminated or invalid monitor owner");
+        for(int id:m.waiters)if(!retained(id,false))return reject("terminated or invalid monitor waiter");
+    }
+    for(auto& c:s.classes)if(c.init_owner>=0)c.init_owner=ids[size_t(c.init_owner)];
+    for(auto& m:s.monitors) {
+        if(m.owner>=0)m.owner=ids[size_t(m.owner)];
+        for(int& id:m.waiters)id=ids[size_t(id)];
+    }
+    std::vector<SavThread> threads;threads.reserve(kept);
+    for(auto& t:s.threads)if(t.state!=int(ThreadState::Terminated))threads.push_back(std::move(t));
+    s.threads.swap(threads);
+    log_line("SAVE threads compacted="+std::to_string(removed)+" kept="+std::to_string(kept)+" reason=finished_without_continuation");
+    return true;
+}
+
 static bool capture_state(SavState& s, const std::string& jar) {
+    for(const auto& t:VMS_EXEC(g_threads))if(t.state==ThreadState::Terminated&&t.executing) {
+        log_line("SAVE invalid state: terminated worker is still executing");return false;
+    }
     if(VMS_RS(g_current)>0&&size_t(VMS_RS(g_current))<VMS_HEAP(g_heap).size()) {
         ScreenMeta m=screen_meta(VMS_HEAP(g_heap)[VMS_RS(g_current)].text);
         if(m.w!=VMS_RS(g_screen_w)||m.h!=VMS_RS(g_screen_h))m.notified=false;
@@ -273,7 +318,7 @@ static bool capture_state(SavState& s, const std::string& jar) {
     s.rms = VMS_PLAT(g_rms_suite); s.fb = VMS_RS(g_fb);
     for (int r : VMS_EXEC(g_serial_calls)) s.serial.push_back(r);
     for (auto& player : VMS_PLAT(g_audio).capture()) if (!VMS_PLAT(g_tones).count(player.handle)) s.audio.push_back(std::move(player));
-    return true;
+    return sav_compact_finished_threads(s);
 }
 static bool encode_state(const SavState& s, std::string& out) {
     if(s.version>=4 && (s.game_millis<0 || s.game_millis>INT64_MAX/1000 || !std::isfinite(s.clock_scale) || s.clock_scale<1 || s.clock_scale>16))return false;
@@ -406,7 +451,7 @@ static bool decode_state(const std::string& bytes, SavState& s) {
             s.audio.push_back(std::move(p));
         }
     }
-    return r.ok && r.p == r.e;
+    return r.ok && r.p == r.e && sav_compact_finished_threads(s);
 }
 // Legacy class IDs refer to the saved class sequence, never today's load order.
 static std::string sav_wait_name(const SavState& s, const SavThread& t) {
@@ -713,7 +758,7 @@ static bool apply_state(const SavState& s,bool use_saved_size=false) {
     }
     stop_thread();
     VMS_PLAT(g_rms_suite) = s.rms; VMS_PLAT(g_rms_import_legacy) = false;
-    VMS_EXEC(g_execution_profile).reset();VMS_HEAP(g_frame_buffer_pool).clear();
+    VMS_EXEC(g_execution_profile).reset();VMS_HEAP(g_frame_buffer_pool).clear();VMS_HEAP(g_primitive_buffers).clear();
     VMS_HEAP(g_gc_mark_scratch).clear();VMS_HEAP(g_gc_work_scratch).clear();
     VMS_CL(g_classes).clear(); VMS_CL(g_class_index).clear();
     VMS_HEAP(g_heap).assign(1, Obj{}); VMS_HEAP(g_free).clear(); resver::bump_epoch(); p7::pool().epoch_clear(resver::g_epoch); // P2.5 restore
@@ -815,6 +860,11 @@ static bool apply_state(const SavState& s,bool use_saved_size=false) {
     VMS_EXEC(g_game_clock_inherited)=true;
     speed_reset_learning();
     VMS_EXEC(g_running_thread) = nullptr; VMS_EXEC(g_active_stack) = nullptr; VMS_HEAP(g_root_stacks).clear(); native_roots_reset();
+    // Snapshots contain the pending Java invoke, never a native event stack.
+    VMS_EXEC(g_exec_ctx).event_callback_owner=nullptr;
+    VMS_EXEC(g_exec_ctx).active_paint_canvas=0;
+    VMS_EXEC(g_main_thread).service_repaints_deferred=false;
+    for(auto& thread:VMS_EXEC(g_threads))thread.service_repaints_deferred=false;
     update_thread_live();
     VMS_RS(g_repaint) = true; VMS_RS(g_fb_dirty) = true;
     const int audio_restored = VMS_PLAT(g_audio).restore(s.audio);
@@ -926,5 +976,8 @@ static bool restore_instant_state(const std::string& jar, const std::string& exp
              " speed=" + host_speed::log_name(VMS_EXEC(g_speed_cap)));
     { auto& c = VMS_EXEC(g_save_clock); c.anchor_epoch = c.exec_epoch; c.valid = true; }  // logical time stands still until the VM executes
     p8_caught_reset(); p8_count_open_continue(); // P8.2: continue sessions get a P7COUNT window too
+    const int diagnostic_midlet=VMS_EXEC(g_midlet);
+    diag_launch(identity,diagnostic_midlet>0&&size_t(diagnostic_midlet)<VMS_HEAP(g_heap).size()&&VMS_HEAP(g_heap)[diagnostic_midlet].cls>=0?VMS_CL(g_classes)[VMS_HEAP(g_heap)[diagnostic_midlet].cls].name:"restored_midlet");
+    log_line("DIAGRESTORE identity_bound=1 saved_format=J2S5 diagnostic_state=transient_only");
     return true;
 }

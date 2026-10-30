@@ -1,7 +1,9 @@
 #pragma once
 // P6.2 T2 / P6.3 T3: region JIT (+ T3: non-empty-stack entry, checkcast/instanceof, monomorphic IC inlining of
-// trivial Java instance methods). Native callees (e.g. Graphics.fillRect) are NEVER called from compiled code:
-// region slots are not GC roots and natives may allocate, suspend or throw, so those sites always exit. A region starts at a bytecode pc where the operand stack is empty and runs native code with
+// trivial Java instance methods). General native callees exit: region slots are
+// not GC roots and natives may allocate, suspend or throw. Only checked synchronous
+// Graphics intrinsics with no Java allocation/callback/throw may execute inside
+// a region. A region starts at a verified bytecode/stack boundary and runs native code with
 // EXACTLY the semantics of execute_fast_batch (interpreter_fast.inc): bounded by the caller's op budget, no Java
 // calls, no allocation, no monitors, no GC. Opt-in iastore uses a checked helper and the existing array write
 // barrier; other heap/statics writes stay interpreted. An unsupported or failing op (null, bounds) exits BEFORE executing it, at that
@@ -16,7 +18,7 @@ using jit236::Bytes; using jit236::Constant;
 using Helper = uint64_t (*)(int32_t a, int32_t b, int32_t c);
 struct Helpers { Helper getfield = nullptr, aload = nullptr, alen = nullptr;
     Helper icget = nullptr, icchk = nullptr, cast = nullptr, inst = nullptr, icgfx = nullptr;
-    Helper iastore = nullptr; };
+    Helper iastore = nullptr, getstatic = nullptr; };
 // T3 monomorphic IC. A call site whose receiver class was seen once (the interpreter's own QuickSite cache) is
 // compiled as a class guard plus the inlined body of a trivial callee. Guard miss / null -> exit at the invoke pc
 // (not executed), so the interpreter dispatches or throws. cost = 1 (invoke) + callee bytecodes (incl. return),
@@ -25,14 +27,16 @@ enum IcKind : uint8_t { IC_NONE = 0, IC_GET = 1, IC_CONST = 2, IC_VOID = 3, IC_S
 struct IcSite { uint8_t kind = IC_NONE, argc = 0, cost = 0; int32_t cls = -1, slot = 0, value = 0; };
 constexpr uint64_t Bail = 0xFFFFFFFF00000000ull;
 inline uint64_t pack(int32_t i, int32_t ref) { return (uint64_t(uint32_t(ref)) << 32) | uint32_t(i); }
+struct StaticSite { int32_t cls = -1, slot = -1; };
 struct Spec {
     const uint8_t* code = nullptr; size_t size = 0; int entry = 0; unsigned max_locals = 0, max_stack = 0;
     const std::vector<Constant>* constants = nullptr;   // int CP entries (ldc/ldc_w)
     const std::vector<int>* field_slot = nullptr;       // per pc: resolved instance-field slot for getfield, -1 = unresolved
     unsigned entry_depth = 0;                           // T3: operand stack depth at entry (values copied in by the glue)
-    const std::vector<IcSite>* ic = nullptr;            // T3: per pc, invokevirtual/invokespecial IC (kind 0 = exit)
+    const std::vector<IcSite>* ic = nullptr;            // T3: per pc, virtual/special/interface IC (kind 0 = exit)
     const std::vector<int>* cast_site = nullptr;        // T3: per pc, checkcast/instanceof cache index (-1 = exit)
     bool int_array_stores = false;                     // requires Helpers::iastore; no reference-array writes
+    const std::vector<StaticSite>* static_site = nullptr; // resolved class/slot indices only; helper rechecks initialization/value
 };
 enum Kind : uint8_t { K_NONE = 0, K_OP = 1, K_EXIT = 2 };
 struct Ins { int pc = 0, next = 0, op = 0, index = 0, target = -1, depth = 0; int32_t value = 0, aux = 0; unsigned cost = 1, argc = 0; Kind kind = K_NONE;
@@ -79,21 +83,25 @@ inline bool build(const Spec& s, Region& r) {
         else if (op == 46 || op == 48 || op == 50 || op == 51 || op == 52 || op == 53) { need = 2; delta = -1; }
         else if (op == 79 && s.int_array_stores) { need = 3; delta = -3; }
         else if (op == 190) { need = 1; }
+        else if (op == 178) { if (!have(2)) return false; len = 3; delta = 1;
+            if (!s.static_site || size_t(pc) >= s.static_site->size() || (*s.static_site)[size_t(pc)].cls < 0 || (*s.static_site)[size_t(pc)].slot < 0) ok = false;
+            else { n.aux = (*s.static_site)[size_t(pc)].cls; n.index = (*s.static_site)[size_t(pc)].slot; } }
         else if (op == 180) { if (!have(2)) return false; len = 3; need = 1;
             if (!s.field_slot || size_t(pc) >= s.field_slot->size() || (*s.field_slot)[size_t(pc)] < 0) ok = false; else n.index = (*s.field_slot)[size_t(pc)]; }
         else if (op == 87) { need = 1; delta = -1; }
         else if (op == 89) { need = 1; delta = 1; }
         else if (op == 95) { need = 2; }
-        else if (op == 96 || op == 100 || op == 104 || op == 120 || op == 122 || op == 124 || op == 126 || op == 128 || op == 130) { need = 2; delta = -1; }
+        else if (op == 96 || op == 100 || op == 104 || op == 108 || op == 112 || op == 120 || op == 122 || op == 124 || op == 126 || op == 128 || op == 130) { need = 2; delta = -1; }
         else if (op == 116 || (op >= 145 && op <= 147)) { need = 1; }
         else if (cond1(op)) { if (!have(2)) return false; len = 3; need = 1; delta = -1; n.target = pc + s16(s.code + pc + 1); }
         else if (cond2(op)) { if (!have(2)) return false; len = 3; need = 2; delta = -2; n.target = pc + s16(s.code + pc + 1); }
         else if (op == 167) { if (!have(2)) return false; len = 3; n.target = pc + s16(s.code + pc + 1); }
         else if (op == 192 || op == 193) { if (!have(2)) return false; len = 3; need = 1;
             if (!s.cast_site || size_t(pc) >= s.cast_site->size() || (*s.cast_site)[size_t(pc)] < 0) ok = false; else n.index = (*s.cast_site)[size_t(pc)]; }
-        else if (op == 182 || op == 183) { if (!have(2)) return false; len = 3;
+        else if (op == 182 || op == 183 || op == 185) { len = op == 185 ? 5 : 3; if (!have(size_t(len - 1))) return false;
             const IcSite* ic = s.ic && size_t(pc) < s.ic->size() ? &(*s.ic)[size_t(pc)] : nullptr;
             if (!ic || ic->kind == IC_NONE || ic->cost < 1) ok = false;
+            else if (op == 185 && (s.code[pc + 3] != unsigned(ic->argc) + 1 || s.code[pc + 4] != 0)) ok = false;
             else { n.op = OP_IC + ic->kind; n.argc = ic->argc; n.cost = ic->cost; n.aux = ic->cls; n.index = ic->slot; n.value = ic->value;
                 need = int(ic->argc) + 1;
                 if (ic->kind == IC_VOID || ic->kind == IC_GFX) delta = -need;
@@ -131,7 +139,7 @@ inline unsigned off_local(const Region& r, unsigned k) { (void)r; return 8 + 8 *
 inline unsigned off_stack(const Region& r, unsigned d) { return 8 + 8 * (r.locals + d); }
 // Native function: uint64 fn(int32* slots, uint32 budget) -> (ops_executed<<32) | exit_pc. Never executes more than budget.
 using Fn = uint64_t (*)(int32_t*, uint32_t);
-inline bool binop(int op) { return op == 96 || op == 100 || op == 104 || op == 120 || op == 122 || op == 124 || op == 126 || op == 128 || op == 130; }
+inline bool binop(int op) { return op == 96 || op == 100 || op == 104 || op == 108 || op == 112 || op == 120 || op == 122 || op == 124 || op == 126 || op == 128 || op == 130; }
 // 0.2.114: side-effect classification of a built region. WHITELIST: an op is pure only if it reads the heap or
 // writes nothing but the region's own local/stack slot copies (which a bad exit discards). iastore (79) and the
 // fillRect IC (OP_IC+IC_GFX) write outside the frame; any op not listed here counts as a write as well.
@@ -140,7 +148,7 @@ inline bool pure_op(const Ins& n) {
     if (op >= OP_IC) return op == OP_IC + IC_GET || op == OP_IC + IC_CONST || op == OP_IC + IC_VOID || op == OP_IC + IC_SELF;
     if ((op >= 1 && op <= 8) || (op >= 16 && op <= 19) || op == 21 || op == 25 || (op >= 26 && op <= 29) || (op >= 42 && op <= 45)) return true;      // consts, loads
     if (op == 54 || op == 58 || (op >= 59 && op <= 62) || (op >= 75 && op <= 78) || op == 132) return true;                  // local stores, iinc
-    if (op == 46 || op == 48 || op == 50 || op == 51 || op == 52 || op == 53 || op == 190 || op == 180) return true;          // heap reads
+    if (op == 46 || op == 48 || op == 50 || op == 51 || op == 52 || op == 53 || op == 190 || op == 178 || op == 180) return true;          // heap reads
     if (op == 87 || op == 89 || op == 95 || binop(op) || op == 116 || (op >= 145 && op <= 147)) return true;                 // stack / int math
     if (cond1(op) || cond2(op) || op == 167 || op == 170 || op == 171 || op == 192 || op == 193) return true;               // control, casts
     return false;
@@ -200,6 +208,14 @@ inline std::vector<uint8_t> emit_x64(const Region& r, const Helpers& h, uint32_t
         else if (op == 87) { }
         else if (op == 89) { ld(0, S(d - 1)); ld(2, S(d - 1) + 4); st(0, S(d)); st(2, S(d) + 4); }
         else if (op == 95) { ld(0, S(d - 1)); ld(2, S(d - 1) + 4); ld(1, S(d - 2)); ld(6, S(d - 2) + 4); st(0, S(d - 2)); st(2, S(d - 2) + 4); st(1, S(d - 1)); st(6, S(d - 1) + 4); }
+        else if (op == 108 || op == 112) {
+            ld(0, S(d - 2)); ld(1, S(d - 1));
+            // Zero divisor: undo this op count and leave operands/last-pc intact for the interpreter.
+            o.b(0x85); o.b(0xc9); o.b(0x75); o.b(8); o.b(0x41); o.b(0xff); o.b(0xcc); jmp_stub(n.pc);
+            // Widen before division: Java MIN/-1 then fits without x86 IDIV overflow; low32 is the Java result.
+            for (uint8_t b : {0x48, 0x63, 0xc0, 0x48, 0x63, 0xc9, 0x48, 0x99, 0x48, 0xf7, 0xf9}) o.b(b);
+            if (op == 112) { o.b(0x89); o.b(0xd0); }
+            st(0, S(d - 2)); movi(2, 0); st(2, S(d - 2) + 4); }
         else if (binop(op)) { ld(0, S(d - 2)); ld(1, S(d - 1));
             switch (op) { case 96: o.b(0x01); o.b(0xc8); break; case 100: o.b(0x29); o.b(0xc8); break; case 104: o.b(0x0f); o.b(0xaf); o.b(0xc1); break;
             case 120: o.b(0xd3); o.b(0xe0); break; case 122: o.b(0xd3); o.b(0xf8); break; case 124: o.b(0xd3); o.b(0xe8); break;
@@ -214,12 +230,16 @@ inline std::vector<uint8_t> emit_x64(const Region& r, const Helpers& h, uint32_t
             if(!h.iastore)return {};
             ld(7, S(d - 3) + 4); ld(6, S(d - 2)); ld(2, S(d - 1)); helper_call(h.iastore); bail_check(); }
         else if (op == 190) { ld(7, S(d - 1) + 4); movi(6, 0); movi(2, 0); helper_call(h.alen); bail_check(); st(0, S(d - 1)); st(2, S(d - 1) + 4); }
+        else if (op == 178) {
+            if (!h.getstatic) return {};
+            movi(7, uint32_t(n.aux)); movi(6, uint32_t(n.index)); movi(2, 0); helper_call(h.getstatic); bail_check(); st(0, S(d)); st(2, S(d) + 4); }
         else if (op == 180) { ld(7, S(d - 1) + 4); movi(6, uint32_t(n.index)); movi(2, 0); helper_call(h.getfield); bail_check(); st(0, S(d - 1)); st(2, S(d - 1) + 4); }
         else if (op == 192) { ld(7, S(d - 1) + 4); movi(6, uint32_t(n.index)); movi(2, 0); helper_call(h.cast); bail_check(); }
         else if (op == 193) { ld(7, S(d - 1) + 4); movi(6, uint32_t(n.index)); movi(2, 0); helper_call(h.inst); bail_check(); st(0, S(d - 1)); movi(2, 0); st(2, S(d - 1) + 4); }
         else if (op > OP_IC) {
             const unsigned rd = d - 1 - n.argc;
             if (op == OP_IC + IC_GFX) {
+                if(n.value==1||n.value==2||n.value==9){movi(0,uint32_t(n.pc));st(0,0);} // Image compatibility/diagnostic call BCI; exit keeps original last-pc register.
                 ld(7, S(rd) + 4); movi(6, uint32_t(n.aux)); movi(2, uint32_t(n.value) | (uint32_t(n.argc) << 8) | (uint32_t(d) << 16));
                 helper_call(h.icgfx); bail_check();
             } else {
@@ -318,6 +338,12 @@ inline std::vector<uint8_t> emit_a64(const Region& r, const Helpers& h, uint32_t
         else if (op == 87) { }
         else if (op == 89) { ldr(9, S(d - 1)); ldr(10, S(d - 1) + 4); str(9, S(d)); str(10, S(d) + 4); }
         else if (op == 95) { ldr(9, S(d - 1)); ldr(10, S(d - 1) + 4); ldr(11, S(d - 2)); ldr(12, S(d - 2) + 4); str(9, S(d - 2)); str(10, S(d - 2) + 4); str(11, S(d - 1)); str(12, S(d - 1) + 4); }
+        else if (op == 108 || op == 112) {
+            ldr(9, S(d - 2)); ldr(10, S(d - 1));
+            ins(0x7100015fu); ins(0x54000061u); ins(0x51000694u); b_stub(n.pc); // cmp w10,0; b.ne +3; sub count,1; bail
+            ins(0x1aca0d2bu); // sdiv w11,w9,w10: A64 MIN/-1 naturally wraps as Java requires
+            if (op == 112) ins(0x1b0aa569u); // msub w9,w11,w10,w9: dividend - quotient*divisor
+            str(op == 108 ? 11 : 9, S(d - 2)); str(31, S(d - 2) + 4); }
         else if (binop(op)) { ldr(9, S(d - 2)); ldr(10, S(d - 1)); uint32_t v = 0;
             switch (op) { case 96: v = 0x0b0a0129u; break; case 100: v = 0x4b0a0129u; break; case 104: v = 0x1b0a7d29u; break;
             case 120: v = 0x1aca2129u; break; case 122: v = 0x1aca2929u; break; case 124: v = 0x1aca2529u; break;
@@ -331,12 +357,16 @@ inline std::vector<uint8_t> emit_a64(const Region& r, const Helpers& h, uint32_t
             if(!h.iastore)return {};
             ldr(0, S(d - 3) + 4); ldr(1, S(d - 2)); ldr(2, S(d - 1)); helper_call(h.iastore); bail_check(); }
         else if (op == 190) { ldr(0, S(d - 1) + 4); movw(1, 0); movw(2, 0); helper_call(h.alen); bail_check(); str(0, S(d - 1)); str(1, S(d - 1) + 4); }
+        else if (op == 178) {
+            if (!h.getstatic) return {};
+            movw(0, uint32_t(n.aux)); movw(1, uint32_t(n.index)); movw(2, 0); helper_call(h.getstatic); bail_check(); str(0, S(d)); str(1, S(d) + 4); }
         else if (op == 180) { ldr(0, S(d - 1) + 4); movw(1, uint32_t(n.index)); movw(2, 0); helper_call(h.getfield); bail_check(); str(0, S(d - 1)); str(1, S(d - 1) + 4); }
         else if (op == 192) { ldr(0, S(d - 1) + 4); movw(1, uint32_t(n.index)); movw(2, 0); helper_call(h.cast); bail_check(); }
         else if (op == 193) { ldr(0, S(d - 1) + 4); movw(1, uint32_t(n.index)); movw(2, 0); helper_call(h.inst); bail_check(); str(0, S(d - 1)); str(31, S(d - 1) + 4); }
         else if (op > OP_IC) {
             const unsigned rd = d - 1 - n.argc;
             if (op == OP_IC + IC_GFX) {
+                if(n.value==1||n.value==2||n.value==9){movw(9,uint32_t(n.pc));str(9,0);} // Image compatibility/diagnostic call BCI; exit keeps original last-pc register.
                 ldr(0, S(rd) + 4); movw(1, uint32_t(n.aux)); movw(2, uint32_t(n.value) | (uint32_t(n.argc) << 8) | (uint32_t(d) << 16));
                 helper_call(h.icgfx); bail_check();
             } else {

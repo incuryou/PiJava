@@ -7,6 +7,7 @@
  VMS_EXEC_ACCESSOR(g_fast_float241_enabled, bool)
  VMS_EXEC_ACCESSOR(g_fast_float241_ops, uint64_t)
 #if J2ME_OPT_FAST_DISPATCH
+template<bool JitReentry = false>
 static int execute_fast_batch(Frame& fr, int budget) {
     auto& stack=fr.stack;
     auto& locals=fr.locals;
@@ -95,8 +96,43 @@ static int execute_fast_batch(Frame& fr, int budget) {
             if(n<2)return done;const Value v=stack[n-1],w=stack[n-2];
             stack[n-2]=v;stack[n-1]=w;push(v);break;
         }
+        case 92: {
+            if(!n || (!stack.back().is_long && (n<2 || stack[n-2].is_long)))return done;
+            // Copy Values before vector growth; references and category-2 bits
+            // must survive both JVM forms. No Java allocation or safepoint.
+            const Value top=stack[n-1];
+            if(top.is_long)push(top);
+            else {const Value below=stack[n-2];push(below);push(top);}
+            // Preserve the original next-PC JIT observation (as for lcmp).
+            P61_OP(fr.method,pc,op);fr.op_pc=pc;fr.pc=next;return done+1;
+        }
         case 95:
             if(n<2)return done;std::swap(stack[n-1],stack[n-2]);break;
+        // Java long wraparound and bit operations are pure, bounded bytecodes.
+        // Keep lsub on the slow path: it owns compensated-wait provenance.
+        case 97:case 105:case 121:case 123:case 125:case 127:case 129:case 131: {
+            if(n<2)return done;
+            const uint64_t a=uint64_t(as_long(stack[n-2])),b=uint64_t(as_long(stack[n-1]));
+            uint64_t v=0;
+            switch(op) {
+            case 97:v=a+b;break;
+            case 105:v=a*b;break;
+            case 121:v=a<<(b&63);break;
+            case 123:v=uint64_t(as_long(stack[n-2])>>(b&63));break;
+            case 125:v=a>>(b&63);break;
+            case 127:v=a&b;break;
+            case 129:v=a|b;break;
+            case 131:v=a^b;break;
+            }
+            stack[n-2]=Value::of_l(long_bits(v));stack.pop_back();break;
+        }
+        case 148: {
+            if(n<2)return done;
+            const int64_t a=as_long(stack[n-2]),b=as_long(stack[n-1]);
+            stack[n-2]=Value::of_i(a>b?1:a<b?-1:0);stack.pop_back();
+            // lcmp leaves a plain int: preserve the old next-PC JIT observation.
+            P61_OP(fr.method,pc,op);fr.op_pc=pc;fr.pc=next;return done+1;
+        }
         case 96:case 100:case 104:case 108:case 112:
         case 120:case 122:case 124:case 126:case 128:case 130: {
             if(n<2)return done;
@@ -202,6 +238,18 @@ static int execute_fast_batch(Frame& fr, int budget) {
         default:return done;
         }
         P61_OP(fr.method,pc,op);fr.op_pc=pc;fr.pc=next;++done;
+        if constexpr(JitReentry) {
+            // An overlap-deferred budget exit can land inside a compiled loop. Running another
+            // whole fast batch there would repeatedly cross its real entry,
+            // especially when overlap admission defers the interior PC.
+            // Finish this taken backedge first, then let the ordinary caller
+            // try the exact target with its remaining budget and all guards.
+            // Banned/retired entries keep the uninterrupted fast path.
+            if(next<=pc && next>=0 && size_t(next)<code.size() && !jitr_skipped(fr)) {
+                ++g_jit_region_stats.backedge_handoffs;
+                return done;
+            }
+        }
     }
     return done;
 }

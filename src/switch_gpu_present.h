@@ -10,6 +10,7 @@
 #include <cstdio>
 #include "presentation/layers.h"
 #include "presentation/gpu_filter.h"
+#include "presentation/viewport.h"
 #include "presentation/gpu_filter_assets.h"
 #include "suite_identity.h"
 
@@ -79,15 +80,16 @@ public:
         if(index<0||index>=int(kSlots)||dkQueueIsInErrorState(queue_))return false;
         acquired_index_=index;return true;
     }
-    // canvas:1280x720, game:480x640 CPU-prepared pixels. The three shader
+    // canvas:1280x720, game:480x640 CPU-prepared pixels. The five shader
     // presets instead pass raw logical RGBA + four header words and its key.
     // Pointers are consumed synchronously, never retained by GPU submission.
     bool present_layers(const uint8_t* canvas,uint64_t generation,const uint8_t* game=nullptr,
-                        const uint32_t* raw=nullptr,const j2me_present::gpu_filter::FrameKey* key=nullptr){
-        timings_={};if(!ready_||!canvas)return false;
+                        const uint32_t* raw=nullptr,const j2me_present::gpu_filter::FrameKey* key=nullptr,
+                        const j2me_present::Viewport* overlay=nullptr){
+        timings_={};if(!ready_||!canvas||(overlay&&!j2me_present::valid_viewport(*overlay)))return false;
         if(raw){
-            if(game||!key||!j2me_present::gpu_filter::supported(key->filter)||key->w<1||key->w>640||key->h<1||key->h>640||
-               raw[0]!=unsigned(key->w)||raw[1]!=unsigned(key->h)||raw[2]!=unsigned(key->filter))return false;
+            if(game||!key||!j2me_present::gpu_filter::supported(key->filter)||!logical_screen::valid_extent(key->w,key->h)||
+               raw[0]!=unsigned(key->w)||raw[1]!=unsigned(key->h)||raw[2]!=unsigned(key->filter)||raw[3]!=(key->adaptive?1u:0u))return false;
         }else invalidate_game();
         const bool acquired_before=acquired_index_>=0;
         if(!acquire_frame())return false;
@@ -122,6 +124,13 @@ public:
         dkCmdBufBlitImage(s.commands,&chromeView,&canvasRect,&outView,&canvasRect,flags,0);
         if(game){dkCmdBufBarrier(s.commands,DkBarrier_Full,0);dkCmdBufBlitImage(s.commands,&gameView,&srcRect,&outView,&dstRect,flags,0);}
         if(raw)drawFilter(s,outView,*key);
+        // Reapply the existing opaque FPS box after game pixels. The canonical
+        // chrome already contains its pixels; other chrome stays underneath.
+        if(overlay){
+            const DkImageRect rect={uint32_t(overlay->x),uint32_t(overlay->y),0,uint32_t(overlay->w),uint32_t(overlay->h),1};
+            dkCmdBufBarrier(s.commands,DkBarrier_Full,0);
+            dkCmdBufBlitImage(s.commands,&chromeView,&rect,&outView,&rect,flags,0);
+        }
         dkCmdBufBarrier(s.commands,DkBarrier_Full,0);dkCmdBufSignalFence(s.commands,&s.fence,true);
         dkQueueSubmitCommands(queue_,dkCmdBufFinishList(s.commands));s.pending=true;
         dkQueuePresentImage(queue_,swapchain_,index);return !dkQueueIsInErrorState(queue_);
@@ -196,7 +205,9 @@ private:
         DkDepthStencilState depth;dkDepthStencilStateDefaults(&depth);
         dkCmdBufBindRasterizerState(s.commands,&raster);dkCmdBufBindMultisampleState(s.commands,&multisample);
         dkCmdBufBindColorState(s.commands,&color);dkCmdBufBindColorWriteState(s.commands,&writes);dkCmdBufBindDepthStencilState(s.commands,&depth);
-        const DkViewport viewport={400,40,480,640,0,1};const DkScissor scissor={400,40,480,640};
+        const auto rect=j2me_present::game_viewport(key.w,key.h,key.adaptive);
+        const DkViewport viewport={float(rect.x),float(rect.y),float(rect.w),float(rect.h),0,1};
+        const DkScissor scissor={uint32_t(rect.x),uint32_t(rect.y),uint32_t(rect.w),uint32_t(rect.h)};
         dkCmdBufSetViewports(s.commands,0,&viewport,1);dkCmdBufSetScissors(s.commands,0,&scissor,1);
         dkCmdBufDraw(s.commands,DkPrimitive_Triangles,3,1,0,0);
     }

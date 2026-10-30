@@ -32,7 +32,7 @@ inline uint32_t gain(uint32_t c,unsigned numerator,unsigned denominator){
         out|=std::min(255u,(((c>>shift)&255u)*numerator+denominator/2)/denominator)<<shift;
     return out;
 }
-inline uint32_t bilinear(const uint8_t* source,int w,int h,int x,int y){
+inline uint32_t bilinear(const uint8_t* source,int w,int h,int x,int y,int width=display_filter::width,int height=display_filter::height){
     // Center-aligned coordinates: ((output+.5)*source/output_size)-.5.
     int nx=(2*x+1)*w-width,ny=(2*y+1)*h-height;
     int sx=0,sy=0,fx=0,fy=0;
@@ -43,7 +43,7 @@ inline uint32_t bilinear(const uint8_t* source,int w,int h,int x,int y){
     const int right=std::min(sx+1,w-1),bottom=std::min(sy+1,h-1);
     const uint32_t c[]={rgb(source,w,sx,sy),rgb(source,w,right,sy),rgb(source,w,sx,bottom),rgb(source,w,right,bottom)};
     const unsigned weights[]={unsigned((2*width-fx)*(2*height-fy)),unsigned(fx*(2*height-fy)),unsigned((2*width-fx)*fy),unsigned(fx*fy)};
-    constexpr unsigned denominator=4*width*height;
+    const unsigned denominator=4u*width*height;
     uint32_t out=0xff000000u;
     for(int shift=0;shift<24;shift+=8){
         unsigned sum=0;for(int i=0;i<4;++i)sum+=((c[i]>>shift)&255u)*weights[i];
@@ -51,7 +51,7 @@ inline uint32_t bilinear(const uint8_t* source,int w,int h,int x,int y){
     }
     return out;
 }
-inline uint32_t scale2x(const uint8_t* source,int w,int h,int x,int y){
+inline uint32_t scale2x(const uint8_t* source,int w,int h,int x,int y,int width=display_filter::width,int height=display_filter::height){
     const int vx=int(int64_t(x)*w*2/width),vy=int(int64_t(y)*h*2/height);
     const int sx=vx/2,sy=vy/2;
     const uint32_t b=rgb(source,w,sx,std::max(0,sy-1)),d=rgb(source,w,std::max(0,sx-1),sy),
@@ -85,13 +85,15 @@ inline const std::array<uint16_t,48*64>& scanlinesdx_gains(){
 }
 // Callers validate the fixed destination and logical source before rendering.
 // Source RGB888 is tightly packed; output pitch is in uint32_t pixels.
-inline void render(uint32_t* output,size_t pitch,const uint8_t* source,int w,int h,Filter filter){
+inline void render(uint32_t* output,size_t pitch,const uint8_t* source,int w,int h,Filter filter,int output_width=width,int output_height=height){
+    if(!output||!source||w<1||h<1||output_width<1||output_width>1280||output_height<1||output_height>720||pitch<size_t(output_width))return;
+    const int width=output_width,height=output_height;
     filter=normalized(filter);
     const auto* dx=filter==Filter::ScanlinesDX?detail::scanlinesdx_gains().data():nullptr;
     for(int y=0;y<height;++y)for(int x=0;x<width;++x){
         uint32_t c;
-        if(filter==Filter::Bilinear)c=detail::bilinear(source,w,h,x,y);
-        else if(filter==Filter::Scale2x)c=detail::scale2x(source,w,h,x,y);
+        if(filter==Filter::Bilinear)c=detail::bilinear(source,w,h,x,y,width,height);
+        else if(filter==Filter::Scale2x)c=detail::scale2x(source,w,h,x,y,width,height);
         else {
             const int sx=dx?int(int64_t(2*x+1)*w/(2*width)):int(int64_t(x)*w/width);
             const int sy=dx?int(int64_t(2*y+1)*h/(2*height)):int(int64_t(y)*h/height);

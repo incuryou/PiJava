@@ -132,7 +132,19 @@ private:
     void clearEnd(int h) {ends_.erase(std::remove(ends_.begin(),ends_.end(),h),ends_.end());}
     static void rewind(Player& p) {p.frame=0;p.rateFraction=0;p.cursor=0;p.channels={};p.voices={};}
     static void releaseVoice(Voice& v,uint64_t at) {if(!v.released){v.released=true;v.release=at;}v.held=false;}
-    size_t activeVoices() const {size_t n=0;for(const auto& p:players_)for(const auto& v:p.voices)n+=v.active;return n;}
+    size_t activeVoices() const {size_t n=0;for(const auto& p:players_)if(p.state==Started)for(const auto& v:p.voices)n+=v.active;return n;}
+    void admitVoices(Player& p) {
+        const size_t room=MaxVoices-std::min(MaxVoices,activeVoices());
+        size_t count=0;for(const auto& v:p.voices)count+=v.active;
+        // Keep stopped note state and position; on restart/restore admit only
+        // notes that fit, without stealing from another running player.
+        while(count>room){
+            Voice* oldest=nullptr;
+            for(auto& v:p.voices)if(v.active&&(!oldest||v.begin<oldest->begin))oldest=&v;
+            if(!oldest)break;
+            oldest->active=false;--count;
+        }
+    }
     void dispatch(Player& p,const Event& ev) {
         if(!ev.status)return;
         int c=ev.status&15,kind=ev.status&0xf0;auto& ch=p.channels[size_t(c)];
@@ -149,7 +161,7 @@ private:
         } else if(kind==0x90) {
             for(auto& v:p.voices)if(v.active&&((v.released&&ev.at>=v.release&&ev.at-v.release>=3840)||(v.channel==9&&ev.at>=v.begin&&ev.at-v.begin>SampleRate)))v.active=false;
             Voice* chosen=nullptr;for(auto& v:p.voices)if(!v.active){chosen=&v;break;}
-            if(!chosen||activeVoices()>=MaxVoices) {
+            if(!chosen||(p.state==Started&&activeVoices()>=MaxVoices)) {
                 chosen=nullptr;for(auto& v:p.voices)if(v.active&&(!chosen||v.begin<chosen->begin))chosen=&v;
                 if(!chosen)return; // Global polyphony is full; never exceed its bound.
             }
@@ -214,7 +226,7 @@ public:
         if(nextHandle_==std::numeric_limits<int>::max()){error="audio handle space exhausted";return 0;}
         parsed.handle=nextHandle_++;totalBytes_+=parsed.bytes;*slot=std::move(parsed);return slot->handle;
     }
-    bool start(int h) {auto* p=player(h);if(!p)return false;if(p->state==Started)return true;if(p->frame>=p->frames)rewind(*p);p->remaining=p->loops;p->state=Started;clearEnd(h);return true;}
+    bool start(int h) {auto* p=player(h);if(!p)return false;if(p->state==Started)return true;if(p->frame>=p->frames)rewind(*p);admitVoices(*p);p->remaining=p->loops;p->state=Started;clearEnd(h);return true;}
     bool stop(int h) {auto* p=player(h);if(!p)return false;p->state=Prefetched;return true;}
     bool close(int h) {auto* p=player(h);if(!p)return false;totalBytes_-=p->bytes;*p=Player{};clearEnd(h);return true;}
     int64_t seek(int h,int64_t us) {auto* p=player(h);if(!p)return -1;uint64_t f=us<=0?0:uint64_t(us/1000000)*SampleRate+uint64_t(us%1000000)*SampleRate/1000000;seekInternal(*p,std::min(f,p->frames));clearEnd(h);return time(h);}
@@ -295,6 +307,7 @@ public:
             p.bytes = p.pcm.size() * sizeof(int16_t) + p.events.size() * sizeof(Event);
             if (p.bytes > MaxTotalBytes - totalBytes_) continue;
             seekInternal(p, std::min(s.frame, p.frames));
+            if(s.state==Started)admitVoices(p);
             p.state = s.state == Started ? Started : Prefetched;
             p.volume = std::max(0, std::min(100, s.volume));
             p.loops = s.loops == 0 ? 1 : s.loops; p.remaining = s.remaining;

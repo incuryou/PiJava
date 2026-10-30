@@ -12,6 +12,7 @@ public final class Double {
     public boolean isNaN() { return isNaN(doubleValue()); }
     public boolean isInfinite() { return isInfinite(doubleValue()); }
     public String toString() { return String.valueOf(doubleValue()); }
+    public static String toString(double value) { return String.valueOf(value); }
     public static native long doubleToRawLongBits(double value);
     public static native long doubleToLongBits(double value);
     public static native double longBitsToDouble(long bits);

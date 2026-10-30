@@ -1,6 +1,10 @@
 // Java native API and host-service boundary; original Java call/exception contracts.
 // Included once by the runtime composition unit; not a standalone TU.
-static void call_native(Method* m, Frame& fr) { P61_SCOPE(2, m);
+static void call_native_impl(Method*,Frame&);
+static void call_native(Method* m,Frame& fr){
+    const auto token=diag_native_enter(m);call_native_impl(m,fr);diag_native_leave(token);
+}
+static void call_native_impl(Method* m, Frame& fr) { P61_SCOPE(2, m);
     Class& native_owner=VMS_CL(g_classes)[m->class_id];
     const std::string& cn = native_owner.name;
     if(J2ME_OPT_NATIVE_CLASS_CACHE && native_owner.native_id==NativeClassId::Unresolved)
@@ -460,6 +464,8 @@ static void call_native(Method* m, Frame& fr) { P61_SCOPE(2, m);
                 speed_invalidate_group(VMS_EXEC(g_main_thread));
                 for(auto& t:VMS_EXEC(g_threads))speed_invalidate_group(t);
                 VMS_EXEC(g_exec_ctx).frame_wait_request_owner=0;
+                VMS_EXEC(g_main_thread).event_frame_sleep.reset();
+                for(auto& t:VMS_EXEC(g_threads))t.event_frame_sleep.reset();
                 VMS_EXEC(g_main_thread).compensated_sleep.reset();VMS_EXEC(g_main_thread).cached_elapsed.reset();VMS_EXEC(g_main_thread).frame_prep.reset();VMS_EXEC(g_main_thread).wait_frame.reset();VMS_EXEC(g_main_thread).residual_sleep.reset();VMS_EXEC(g_main_thread).rechecked_deadline.reset();VMS_EXEC(g_main_thread).field_gate_anchor.reset();VMS_EXEC(g_main_thread).frame_due_us=0;VMS_EXEC(g_main_thread).sleep_paced=false;
                 VMS_EXEC(g_main_thread).frame_sleep_bridge=VMS_EXEC(g_main_thread).mixed_wait=false;
                 for(auto& t:VMS_EXEC(g_threads)) {t.compensated_sleep.reset();t.cached_elapsed.reset();t.frame_prep.reset();t.wait_frame.reset();t.residual_sleep.reset();t.rechecked_deadline.reset();t.field_gate_anchor.reset();t.frame_due_us=0;t.sleep_paced=false;t.frame_sleep_bridge=t.mixed_wait=false;}
@@ -688,6 +694,7 @@ static void call_native(Method* m, Frame& fr) { P61_SCOPE(2, m);
             }
             std::string built;
             for (int i = 0; i < len; ++i) utf8_append(built, VMS_HEAP(g_heap)[arr].elems.get(off + i).i & (chars ? 0xFFFF : 0xFF));
+            if(VMS_HEAP(g_heap)[self].indexed_key)++VMS_NATIVE(g_index_key_epoch);
             VMS_HEAP(g_heap)[self].text = built;
             return;
         }
@@ -702,6 +709,7 @@ static void call_native(Method* m, Frame& fr) { P61_SCOPE(2, m);
             if (!encoding) { throw_new("java/io/UnsupportedEncodingException", charset); return; }
             std::string built;
             append_encoded(built, VMS_HEAP(g_heap)[arr].elems, off, len, encoding);
+            if(VMS_HEAP(g_heap)[self].indexed_key)++VMS_NATIVE(g_index_key_epoch);
             VMS_HEAP(g_heap)[self].text = built;
             return;
         }
@@ -1118,7 +1126,6 @@ static void call_native(Method* m, Frame& fr) { P61_SCOPE(2, m);
         };
         std::string directory;
 #ifdef __SWITCH__
-        if (!ensure_directory("sdmc:/switch/j2me")) return;
         directory = "sdmc:/switch/j2me/rms";
 #else
         const char* override_directory = std::getenv("J2ME_RMS_DIR");
@@ -1126,7 +1133,19 @@ static void call_native(Method* m, Frame& fr) { P61_SCOPE(2, m);
 #endif
         if(r4::state.active)directory=r4::state.dir+"/rms";
         std::string suite_directory = directory + "/suites/" + VMS_PLAT(g_rms_suite);
-        if (!ensure_directory(directory) || !ensure_directory(directory + "/suites") || !ensure_directory(suite_directory)) return;
+        // The full existing directory proves that its ancestors are traversable.
+        // Recheck it on every operation, without a cache, instead of repeating
+        // mkdir + stat for each ancestor during every small synchronous commit.
+        struct stat suite_stat;
+        if (traced_stat(suite_directory.c_str(), &suite_stat) == 0) {
+            if (!S_ISDIR(suite_stat.st_mode)) { rms_error("RMS directory is unavailable or not a directory"); return; }
+        } else {
+            if (errno != ENOENT) { rms_error("cannot inspect RMS directory"); return; }
+#ifdef __SWITCH__
+            if (!ensure_directory("sdmc:/switch/j2me")) return;
+#endif
+            if (!ensure_directory(directory) || !ensure_directory(directory + "/suites") || !ensure_directory(suite_directory)) return;
+        }
         if (name == "listRecordStores") {
             std::vector<std::string> names;
             if (!j2me_rms::list_stores(suite_directory, names) || names.empty()) { ret_ref(0); return; }

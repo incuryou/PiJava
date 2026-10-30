@@ -52,6 +52,7 @@ struct HeapStorage {
     std::vector<int> g_free;                                 // was src/j2mevm.cpp:181
     std::vector<std::pair<std::vector<Frame>*, JavaThreadContext*>> g_root_stacks;  // was src/j2mevm.cpp:220
     FrameBufferPool<Value> g_frame_buffer_pool;              // was src/runtime/object_model.inc:59
+    PrimitiveBufferPool g_primitive_buffers; // bounded dead primitive bytes; never roots or snapshot state
 };
 }  // namespace j2me_vmstate
 namespace j2me_vmstate {

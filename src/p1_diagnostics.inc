@@ -48,7 +48,7 @@ static void p1_flush(const char* boundary){
     VMS_DIAG(g_p1).queued=0;
     if(VMS_DIAG(g_p1).caught_zero_pending){VMS_DIAG(g_p1).caught_zero_pending=false;p1_dump_caught_last("first_live_to_zero");}
     // Key lifecycle boundaries are durable; a crash can lose the current ring.
-    if(std::strcmp(boundary,"host_turn")&&std::strcmp(boundary,"present"))log_drain();
+    if(std::strcmp(boundary,"host_turn")&&std::strcmp(boundary,"present")&&std::strcmp(boundary,"window"))log_drain();
 }
 static void p1_snapshot(JavaThreadContext& t,const Frame& f,size_t count){
     if(!VMS_DIAG(g_p1).enabled)return;
@@ -87,6 +87,7 @@ static void p1_thread_end(JavaThreadContext& t){
 }
 static void p8_caught_note(int ref,const char* cls,const char* where_cls,const char* where_method,int bci);
 static void p1_caught(int ref,const Frame& f,int handler,Method* origin,int origin_bci,size_t origin_depth){
+    diag_caught(f,handler);
     ++VMS_DIAG(g_p1).caught_count;
     p8_caught_note(ref,ref>0&&VMS_HEAP(g_heap)[ref].cls>=0?VMS_CL(g_classes)[VMS_HEAP(g_heap)[ref].cls].name.c_str():"-",VMS_CL(g_classes)[f.method->class_id].name.c_str(),f.method->name.c_str(),f.op_pc); // P8.2
     if(!VMS_DIAG(g_p1).enabled)return;
@@ -169,6 +170,7 @@ static void p1_new_launch(const std::string& identity,const std::string& main){
     const auto session=VMS_DIAG(g_p1).session_id,launch=VMS_DIAG(g_p1).launch_id+1;const bool enabled=VMS_DIAG(g_p1).enabled;
     VMS_DIAG(g_p1)=P1Diagnostics{};VMS_DIAG(g_p1).session_id=session;VMS_DIAG(g_p1).launch_id=launch;VMS_DIAG(g_p1).enabled=enabled;
     city_diag_launch(identity);
+    diag_launch(identity,main);
     p1_begin_m3g_epoch();
     p1_event("launch begin build=%s suite=%s main=%s profile=%s speed=%d renderer=cpu jit=%d",kVer,identity.c_str(),main.c_str(),VMS_DIAG(g_p1_profile).active?VMS_DIAG(g_p1_profile).id.c_str():"legacy",VMS_EXEC(g_speed_cap),int(VMS_NATIVE(g_native_jit).enabled));
 }

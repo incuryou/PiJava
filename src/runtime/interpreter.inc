@@ -92,6 +92,7 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
         ++guard;
         if (!r4::state.active && (guard > (VMS_EXEC(g_slice_ms) <= 4 ? 250000 : 1000000) || ((guard & 1023) == 0 && monotonic_ms() >= slice_deadline))) {
             city_sync_step(st->back(),st->size(),VMS_EXEC(g_fast_ops)+VMS_EXEC(g_slow_ops));
+            diag_checkpoint(*st);
             guard = 0;
             VMS_EXEC(g_cuts)++;
             if(VMS_RS(g_paint_depth)>0)paint_hotspots241::sample(*st);
@@ -134,11 +135,18 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
             (VMS_EXEC(g_slice_ms)<=4?250000:1000000)-guard+1);
         // P6.2 T2: a compiled region has execute_fast_batch's exact contract (same budget, same stop points);
         // the op count it returns is charged to guard below, so slice length and game pacing are unchanged.
-        if constexpr(!ProfileMethods) if((!r4::state.active||r4::state.cfg.profile=="optimized-v1") && VMS_NATIVE(g_native_jit).enabled && !jitr_skipped(fr)) {   // P6.8: retired pcs skip the table lookup
-            const int compiled=jit_region_try(fr,remaining);
+        const bool region_dispatch = !ProfileMethods && (!r4::state.active||r4::state.cfg.profile=="optimized-v1") &&
+            VMS_NATIVE(g_native_jit).enabled && VMS_NATIVE(g_native_jit).available;
+        bool overlap_deferred=false;
+        if (region_dispatch && !jitr_skipped(fr)) {   // P6.8: retired pcs skip the table lookup
+            const int compiled=jit_region_try(fr,remaining,&overlap_deferred);
             if(compiled){guard+=compiled-1;if(r4::state.active){r4::state.charge(compiled,use_thread);r4_quantum-=compiled;r4::state.jit_ops+=compiled;}continue;}
         }
-        const int fast=(!r4::state.active||r4::state.cfg.profile=="optimized-v1")?execute_fast_batch(fr,remaining):0;
+        // Only a deferred, covered interior needs a handoff to its loop header.
+        // Other failures retain batching: some valid Java loops carry values
+        // the integer region cannot represent, or repeatedly fail a helper.
+        const int fast=(!r4::state.active||r4::state.cfg.profile=="optimized-v1")?
+            (overlap_deferred?execute_fast_batch<true>(fr,remaining):execute_fast_batch(fr,remaining)):0;
         if(fast) {guard+=fast-1;VMS_EXEC(g_fast_ops)+=uint64_t(fast);++VMS_EXEC(g_fast_blocks);if(r4::state.active){r4::state.charge(fast,use_thread);r4_quantum-=fast;r4::state.fast_ops+=fast;}continue;}
 #endif
         if(r4::state.active){r4::state.charge(1,use_thread);--r4_quantum;}
@@ -273,7 +281,9 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
             unsigned r4_cost=0;Value r4_expected;
             bool shortcut_allowed=!r4::state.active;
             if(r4::state.active&&((site.flags>>1)||site.library_intrinsic)&&r4::state.cfg.profile=="optimized-v1") {
-                shortcut_allowed=r4_shortcut_cost(mm,a,n,unsigned(r4::state.available(use_thread,r4_quantum)),r4_cost,r4_expected);
+                // Synchronized library calls retain their complete Java
+                // frame/monitor and exact-fuel path in deterministic mode.
+                shortcut_allowed=!(mm->flags&0x0020)&&r4_shortcut_cost(mm,a,n,unsigned(r4::state.available(use_thread,r4_quantum)),r4_cost,r4_expected);
                 if(!shortcut_allowed)++r4::state.uncertified_fallbacks;
             }
             auto charge_shortcut=[&](const Value& value){
@@ -293,20 +303,29 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
                 }
             }
             if (shortcut_allowed && site.library_intrinsic) {
+                const unsigned original_ops=library_intrinsic_ops(site.library_intrinsic);
+                const unsigned budget=unsigned(std::max(0,std::min(1023-(guard&1023),
+                    (VMS_EXEC(g_slice_ms)<=4?250000:1000000)-guard)));
                 Value result;
-                if (library_intrinsic_dispatch(site.library_intrinsic, mm, a, result)) {
+                if (original_ops<=budget && library_intrinsic_dispatch(site.library_intrinsic, mm, a, result)) {
+                    guard+=int(original_ops);VMS_EXEC(g_fast_ops)+=original_ops;
+                    if(original_ops)++VMS_EXEC(g_fast_blocks);
                     charge_shortcut(result);
                     if constexpr(ProfileMethods)if(!mm->native)VMS_EXEC(g_execution_profile).called(mm->cpu_profile);
                     if (!VMS_EXEC(g_thrown) && !is_void) push(result);
                     return;
                 }
             }
-            if (site.intrinsic) { gfx_intrinsic(site.intrinsic, a); return; }
+            if (site.intrinsic) {
+                if(site.intrinsic>=10&&site.intrinsic<=16)push(Value::of_i(gfx_query_intrinsic(site.intrinsic,a[0].ref,mm)));
+                else gfx_intrinsic(site.intrinsic, a);
+                return;
+            }
             if (mm->native && !(mm->flags & 0x0020) &&
                 VMS_CL(g_classes)[mm->class_id].name == "java/lang/System" &&
                 mm->name == "currentTimeMillis" && mm->desc == "()J") {
                 ++VMS_EXEC(g_poll_calls);
-                if (site.time_gate < 0) {
+                if (site.time_gate == -1) {
                     auto constant = [&](int cp) -> int64_t {
                         return cp > 0 && cp < int(owner.cp.size()) && owner.cp[cp].tag == 5 ? owner.cp[cp].l : 0;
                     };
@@ -324,6 +343,12 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
                         if(cp<=0 || cp>=int(owner.cp.size()) || owner.cp[cp].tag!=9)return false;
                         std::string cls,name,desc;if(!pacing_resolve_member(owner,cp,cls,name,desc))return false;return desc=="J";
                     };
+                    site.bounded_deadline=1;
+                    if(fr.method->desc=="(J)V" && (fr.method->flags&0x0528)==0x0008 &&
+                       fr.method->handlers.empty()&&recognize_bounded_deadline_helper(code,is_clock,is_yield)) {
+                        if(fr.op_pc==1&&fr.pc==4)site.bounded_deadline=2;
+                        else if(fr.op_pc==7&&fr.pc==10)site.bounded_deadline=3;
+                    }
                     auto gate = recognize_time_gate(code, fr.op_pc, fr.pc, constant, is_yield);
                     if(gate.local<0)gate=recognize_field_time_gate(code,fr.op_pc,fr.pc,constant,is_yield,is_clock,
                         is_long_static,[&](int pc){return jvm_op_length(code,pc);});
@@ -344,11 +369,21 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
                     if (gate.local >= 0 || gate.static_field >= 0) {
                         fr.method->time_gates.push_back(gate);
                         site.time_gate = int(fr.method->time_gates.size());
+                    } else {
+                        const int local=recognize_native_deadline_gate(code,fr.op_pc,fr.pc,
+                            [&](int cp){return pacing_loaded_static_integral(owner,cp)!=nullptr;},is_yield,is_clock,
+                            [&](int start,int end){return native_deadline_flow_safe(code,start,end,
+                                !fr.method->handlers.empty(),[&](int pc){return jvm_op_length(code,pc);});});
+                        // Separate cache domain: this must neither certify a
+                        // paced group nor ban JIT through Method::time_gates.
+                        if(local>=0)site.time_gate=-2-local;
                     }
                 }
                 int64_t now = game_current_ms();
+                if(site.cooperative_poll!=0)cooperative_poll_clock(fr,now,site,use_thread,slice_deadline);
                 auto& context = current_context();
                 speed_compensated_clock(fr,now);
+                if(site.event_frame_sleep!=0)speed_event_frame_clock(fr,now,site);
                 if(site.rechecked_deadline!=0)speed_rechecked_clock(fr,now,site);
                 if(site.cached_elapsed!=0)speed_cached_elapsed_clock(fr,now,site);
                 if(speed_period_us()&&!r4::state.active&&!VMS_RS(g_paint_depth)&&VMS_EXEC(g_can_suspend)&&
@@ -362,6 +397,86 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
                         if(gate.static_field>=0&&gate.anchor_clock_pc==fr.op_pc){stored=gate.static_field;break;}
                     if(stored>=0)context.field_gate_anchor.record(fr.method,fr.op_pc,stored,now,paint_clock_us(),context.owned_draws);
                 }
+                if(!r4::state.active&&VMS_EXEC(g_can_suspend)&&VMS_RS(g_paint_depth)==0&&
+                   (VMS_EXEC(g_speed_cap)==0||site.bounded_deadline>1)) {
+                    auto& evidence=context.native_deadline;
+                    const int stored=VMS_EXEC(g_speed_cap)==0?clock_long_local_store(code,fr.pc):-1;
+                    if(stored>=0) {
+                        if(!fr.native_deadline_activation&&context.native_deadline_generation<UINT64_MAX)
+                            fr.native_deadline_activation=++context.native_deadline_generation;
+                        if(VMS_RS(g_current)==VMS_RS(g_shown))
+                            evidence.record(fr.native_deadline_activation,stored,now,VMS_RS(g_current),
+                                            context.owned_draws,VMS_EXEC(g_game_clock).scale);
+                        else evidence.reset();
+                    }
+                    if(site.bounded_deadline==2) {
+                        const bool values=!fr.locals.empty()&&fr.locals[0].is_long&&
+                            fr.stack.size()==1&&fr.stack.back().is_long&&fr.stack.back().l==fr.locals[0].l;
+                        if(!fr.native_deadline_activation&&context.native_deadline_generation<UINT64_MAX)
+                            fr.native_deadline_activation=++context.native_deadline_generation;
+                        if(values&&VMS_RS(g_current)==VMS_RS(g_shown))
+                            evidence.record_bounded_delay(fr.native_deadline_activation,fr.locals[0].l,now,
+                                VMS_RS(g_current),context.owned_draws,VMS_EXEC(g_game_clock).scale);
+                        else evidence.reset();
+                    }
+                    const bool bounded=site.bounded_deadline==3;
+                    if((VMS_EXEC(g_speed_cap)==0&&site.time_gate<=-2)||bounded) {
+                        const int local=bounded?0:-2-site.time_gate;
+                        const bool values=local<int(fr.locals.size())&&fr.locals[local].is_long&&
+                            fr.stack.size()==1&&fr.stack.back().is_long;
+                        const int64_t anchor=bounded?evidence.value:values?fr.locals[local].l:0;
+                        const int64_t target=values?fr.stack.back().l:0;
+                        const bool owned=values&&VMS_RS(g_current)==VMS_RS(g_shown)&&
+                            (bounded?(fr.locals[local].l==target&&evidence.owns_bounded_delay(fr.native_deadline_activation,
+                                target,VMS_RS(g_current),context.owned_draws,VMS_EXEC(g_game_clock).scale,now)):
+                                evidence.owns(fr.native_deadline_activation,local,anchor,VMS_RS(g_current),
+                                    context.owned_draws,VMS_EXEC(g_game_clock).scale));
+                        if(!owned) {if(bounded)evidence.reset();else evidence.poll.reset();}
+                        else {
+                            if(bounded)evidence.last_ms=now;
+                            ++VMS_EXEC(g_poll_gate_reads);
+                            evidence.poll.observe_deadline(fr.method,fr.op_pc,anchor,target,now,true);
+                            const int64_t nap=evidence.poll.wait_us(now,VMS_EXEC(g_game_clock).scale,false);
+                            bool quiet=nap>0&&!VMS_RS(g_repaint)&&!VMS_RS(g_fb_dirty)&&
+                                VMS_EXEC(g_serial_calls).empty()&&!VMS_EXEC(g_notify_paused)&&!VMS_EXEC(g_notify_destroyed);
+                            if(quiet) {
+                                // Even sleeping/blocked Java peers may soon
+                                // become runnable; the new path rejects all.
+                                for(const auto& peer:VMS_EXEC(g_threads))
+                                    if(&peer!=&context&&peer.state!=ThreadState::Terminated){quiet=false;break;}
+                                const auto& main=VMS_EXEC(g_main_thread);
+                                if(&main!=&context&&!main.frames.empty()&&main.state!=ThreadState::Terminated)quiet=false;
+                                for(const auto& monitor:VMS_EXEC(g_monitors))
+                                    if(monitor.second.owner==&context&&monitor.second.depth>0){quiet=false;break;}
+                            }
+                            const int64_t host_left=VMS_EXEC(g_exec_ctx).native_poll_host_deadline_us-paint_clock_us();
+                            if(quiet&&host_left>2000&&!p7_pending_ends()) {
+                                audio_pump();
+                                now=game_current_ms();
+                                if(bounded) {
+                                    if(evidence.owns_bounded_delay(fr.native_deadline_activation,target,VMS_RS(g_current),
+                                        context.owned_draws,VMS_EXEC(g_game_clock).scale,now))evidence.last_ms=now;
+                                    else evidence.reset();
+                                }
+                                const int64_t requested=evidence.poll.wait_us(now,VMS_EXEC(g_game_clock).scale,false);
+                                const int64_t remaining=VMS_EXEC(g_exec_ctx).native_poll_host_deadline_us-paint_clock_us();
+                                if(requested>0&&remaining>2000&&!p7_pending_ends()&&!VMS_RS(g_repaint)&&
+                                   !VMS_RS(g_fb_dirty)&&VMS_EXEC(g_serial_calls).empty()) {
+                                    const int64_t before=paint_clock_us();
+                                    { RuntimeProfileScope wait(VMS_EXEC(g_runtime_profile),RuntimeProfile::Kind::PollWait);
+                                      P7_SCOPE(Idle);std::this_thread::sleep_for(std::chrono::microseconds(requested)); }
+                                    VMS_EXEC(g_poll_wait_us)+=paint_clock_us()-before;++VMS_EXEC(g_poll_waits);
+                                    now=game_current_ms();
+                                    if(bounded) {
+                                        if(evidence.owns_bounded_delay(fr.native_deadline_activation,target,VMS_RS(g_current),
+                                            context.owned_draws,VMS_EXEC(g_game_clock).scale,now))evidence.last_ms=now;
+                                        else evidence.reset();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if(site.time_gate<=-2||site.bounded_deadline>1)context.native_deadline.reset();
                 if (!r4::state.active && site.time_gate > 0 && VMS_RS(g_paint_depth) == 0) {
                     const auto gate = fr.method->time_gates[site.time_gate-1];
                     const int gate_pc=gate.site_pc>=0?gate.site_pc:fr.op_pc;
@@ -418,7 +533,10 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
                                 const int64_t before = paint_clock_us();
                                 { RuntimeProfileScope wait(VMS_EXEC(g_runtime_profile),RuntimeProfile::Kind::PollWait);
                                   P7_SCOPE(Idle); std::this_thread::sleep_for(std::chrono::microseconds(nap)); }
-                                VMS_EXEC(g_poll_wait_us) += paint_clock_us()-before; ++VMS_EXEC(g_poll_waits);
+                                const int64_t observed=paint_clock_us()-before;
+                                if(J2ME_OPT_POLL_MARGIN && paced_verified && context.poll_gate.certified)
+                                    context.poll_gate.note_wait(nap,observed);
+                                VMS_EXEC(g_poll_wait_us) += observed; ++VMS_EXEC(g_poll_waits);
                                 now = game_current_ms();
                                 // Host oversleep can cross the gate. The value
                                 // returned to Java must register that ready
@@ -435,6 +553,12 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
                 return;
             }
             if (mm->native) {
+                if(service_repaints_wait_event(mm,n?a[0].ref:0)){
+                    // No native/paint work has begun. Preserve this exact
+                    // invocation and receiver until the event callback returns.
+                    for(int i=0;i<n;++i)push(a[i]);
+                    fr.pc=fr.op_pc;VMS_EXEC(g_yield)=true;return;
+                }
                 const int paint_monitor=service_repaints_wait_monitor(mm,n?a[0].ref:0);
                 if(paint_monitor && !monitor_enter(paint_monitor)){
                     // Exactly the existing synchronized-native retry contract:

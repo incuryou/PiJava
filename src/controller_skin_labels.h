@@ -45,6 +45,20 @@ inline const std::array<Anchor,16>& game_layout(int bezel){
     }();
     return centered[size_t(bezel-4)];
 }
+// Use exactly the artwork projection for phone-key legends, including the
+// visibility threshold. The caller invalidates Legends when this layout moves.
+inline std::array<Anchor,16> universal_game_layout(const host_menu::UniversalLayout& layout){
+    auto result=game_layout(6);
+    for(size_t n=0;n<result.size();++n){
+        auto& anchor=result[n];const auto& pane=layout.panes[n/8];
+        if(!pane.w){anchor.w=anchor.h=0;continue;}
+        const int right=pane.project_x(anchor.x+anchor.w),bottom=pane.project_y(anchor.y+anchor.h);
+        anchor.x=pane.project_x(anchor.x);anchor.y=pane.project_y(anchor.y);
+        anchor.w=right-anchor.x;anchor.h=bottom-anchor.y;
+        anchor.tag_x=pane.project_x(anchor.tag_x);anchor.tag_y=pane.project_y(anchor.tag_y);
+    }
+    return result;
+}
 class Legends {
     host_keymap::Bindings previous_=host_keymap::empty_bindings();
     int bezel_=-1;bool dirty_=true;uint64_t generation_=0;
@@ -83,7 +97,7 @@ public:
     const Label& label(int input)const{return labels_[size_t(input)];}
     bool update(const host_keymap::Config& config,bool standard,int bezel,const Measure& measure={},const std::array<Anchor,16>* custom_layout=nullptr){
         const auto bindings=host_keymap::effective(config,standard);
-        const auto* selected=custom_layout?custom_layout:mapped_skin(bezel)?&game_layout(bezel):nullptr;
+        const auto* selected=custom_layout?custom_layout:mapped_skin(bezel)?&game_layout(bezel==j2me_present::adaptive_bezel?6:bezel):nullptr;
         if(!dirty_&&bezel==bezel_&&bindings==previous_&&selected==layout_)return false;
         layout_=selected;
         dirty_=false;bezel_=bezel;previous_=bindings;++generation_;
@@ -104,9 +118,10 @@ public:
     }
     void render(uint32_t* frame,size_t pitch,int bezel,const host_menu::Text& text,Context context=Context::Game,const host_menu::CenteredText& center={})const{
         if(!frame||pitch<size_t(host_menu::width)||!mapped_skin(bezel)||bezel!=bezel_||!text)return;
-        const uint32_t base_ink=host_menu::color(bezel==6?0xffffff:0x20252b);
+        const uint32_t base_ink=host_menu::color(bezel>=6?0xffffff:0x20252b);
         if(!layout_)return;
         for(const auto& anchor:*layout_){
+            if(anchor.w<=0||anchor.h<=0)continue;
             const uint32_t ink=bezel==4&&(anchor.input==Menu||anchor.input==Zero)?host_menu::color(0xffffff):base_ink;
             const auto& label=labels_[size_t(anchor.input)];
             if(context==Context::Game&&label.count==0&&anchor.input!=Menu)continue;

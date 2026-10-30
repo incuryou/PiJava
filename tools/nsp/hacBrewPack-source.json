@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/rlaphoenix/hacBrewPack",
+  "download_url": "https://codeload.github.com/rlaphoenix/hacBrewPack/zip/refs/heads/master",
+  "sha256": "b4be2637a3dea687e7503fc88cd317abcdfe9775ac68a38ed1bc99b13067d098",
+  "bytes": 3099877,
+  "source_archive": "hacBrewPack-source.zip",
+  "license": "GPL-2.0; see upstream LICENSE and bundled dependency licenses",
+  "key_material_included": false
+}

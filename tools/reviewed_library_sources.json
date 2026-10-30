@@ -7,5 +7,7 @@
   "java/lang/Short": "0b61bf365511de78c41e08799861eb3ef70036542194279d344b029622d0097d",
   "java/lang/Boolean": "c2d970852798f6a1d697ce58945ced7a0a3e735c9b250d847e88d2db492b9ff4",
   "java/io/ByteArrayInputStream": "b05d2c58812727aaca9899d5ae775e721c508449a0c1072bedebc818f6b76f6c",
-  "java/io/DataInputStream": "db3afac9a529563e2a811b2154ddae8239c3249192399c33f874bb5cf79a64ec"
+  "java/io/DataInputStream": "db3afac9a529563e2a811b2154ddae8239c3249192399c33f874bb5cf79a64ec",
+  "java/lang/String": "5cc6b96e3cac25a6e52de7d6f50baa8a082d2a75f5872b3238286f335587dc0a",
+  "java/util/Vector": "14c5d9a2a4ddd4ecb84b582b0d5f64d40764b18edbd2573d176130eaf53c5ac6"
 }

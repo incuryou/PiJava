@@ -12,6 +12,13 @@ static bool frame_wait_value(const Frame& fr,const FrameWaitValue& source,int64_
         if(size_t(source.local)>=fr.locals.size()||!fr.locals[size_t(source.local)].is_long)return false;
         value=fr.locals[size_t(source.local)].l;return true;
     }
+    if(source.static_field) {
+        const auto* field=pacing_loaded_static_long(VMS_CL(g_classes)[fr.method->class_id],source.static_field);
+        if(!field||(field->flags&0x0040))return false;
+        const auto stored=VMS_CL(g_classes)[field->owner].statics[size_t(field->slot)];
+        if(!stored.is_long)return false;
+        value=stored.l;return true;
+    }
     if(!source.field||fr.locals.empty())return false;
     const auto& cls=VMS_CL(g_classes)[fr.method->class_id];
     std::string c,n,d;if(!pacing_resolve_member(cls,source.field,c,n,d))return false;
@@ -36,6 +43,40 @@ static bool speed_frame_wait_clock(const Frame& fr,int64_t now_ms) {
             [&](int cp){if(cp<=0||size_t(cp)>=cls.cp.size()||cls.cp[size_t(cp)].tag!=9)return false;
                 std::string c,n,d;return pacing_resolve_member(cls,cp,c,n,d)&&d=="J";},
             [&](int cp){return cp>0&&size_t(cp)<cls.cp.size()&&cls.cp[size_t(cp)].tag==5?cls.cp[size_t(cp)].l:int64_t(0);});
+            if(pattern.valid())return pattern;
+            if(!(fr.method->flags&0x0028))pattern=recognize_static_frame_wait(fr.method->code,pc,jvm_op_length,
+                [&](int cp){return member(cp,"java/lang/System","currentTimeMillis","()J");},
+                [&](int cp){return member(cp,"java/lang/Object","wait","(J)V");},
+                [&](int cp)->int64_t {
+                    std::string c,n,d;
+                    if(cp<=0||size_t(cp)>=cls.cp.size()||cls.cp[cp].tag!=9||!pacing_resolve_member(cls,cp,c,n,d))return -1;
+                    if(d!="J")return 0;
+                    const auto* field=pacing_loaded_static_long(cls,cp);
+                    if(!field||(field->flags&0x0040))return -1;
+                    return (int64_t(field->owner+1)<<32)+field->slot+1;
+                },
+                [&](int cp){return cp>0&&size_t(cp)<cls.cp.size()&&cls.cp[cp].tag==5?cls.cp[cp].l:int64_t(0);},
+                [&](int begin,int end,int enter,int leave,int lock) {
+                    const auto& code=fr.method->code;bool cleanup=false;
+                    auto local=[&](int& at,int generic,int compact) {
+                        if(at<0||size_t(at)>=code.size())return -1;
+                        const int op=code[size_t(at++)];
+                        if(op>=compact&&op<compact+4)return op-compact;
+                        return op==generic&&size_t(at)<code.size()?int(code[size_t(at++)]):-1;
+                    };
+                    for(const auto& h:fr.method->handlers) {
+                        const bool releases=h.start==enter+1&&h.end==leave+1;
+                        if(!releases&&!(h.pc>begin&&h.pc<end))continue;
+                        int at=h.pc;const int exception=local(at,0x3a,0x4b);
+                        if(h.catch_cp||exception<0||exception==lock||local(at,0x19,0x2a)!=lock||
+                           size_t(at)>=code.size()||code[size_t(at++)]!=0xc3)return false;
+                        const int released=at;
+                        if(local(at,0x19,0x2a)!=exception||size_t(at)>=code.size()||code[size_t(at)]!=0xbf)return false;
+                        if(releases)cleanup=true;
+                        else if(h.start!=h.pc||h.end!=released)return false;
+                    }
+                    return cleanup;
+                });
             if(pattern.valid())return pattern;
             pattern=recognize_branched_frame_wait(fr.method->code,pc,jvm_op_length,
                 [&](int cp){return member(cp,"java/lang/System","currentTimeMillis","()J");},
@@ -77,6 +118,7 @@ static bool speed_frame_wait_clock(const Frame& fr,int64_t now_ms) {
     const size_t depth=VMS_EXEC(g_active_stack)?VMS_EXEC(g_active_stack)->size():0;
     if(fr.op_pc==s.pattern.start_pc) {
         speed_frame_wait_cancel_request(t);
+        if(s.pattern.start.static_field&&!fr.stack.empty())return true;
         if(s.pattern.period.field) {
             int64_t period=0;
             if(!frame_wait_value(fr,s.pattern.period,period)||period<8||period>120) {s.stable_samples=0;return true;}
@@ -89,6 +131,7 @@ static bool speed_frame_wait_clock(const Frame& fr,int64_t now_ms) {
         int64_t previous=0;
         s.complete=frame_wait_value(fr,s.pattern.start,previous)&&previous==s.started_ms&&now_ms>=previous&&
             now_ms-previous<s.pattern.period_ms&&
+            (!s.pattern.start.static_field||(fr.stack.empty()&&t.owned_draws==s.draws+1))&&
             (s.pattern.repaint_pc>=0?s.requested:(t.owned_draws>s.draws&&t.frame_due_us>0));
         s.elapsed_ms=now_ms-s.started_ms;
     }
@@ -102,6 +145,9 @@ static int64_t speed_frame_wait_wake_us(int ref,int64_t requested_ms,JavaThreadC
     const int period=speed_period_us();
     const bool async=s.pattern.repaint_pc>=0;
     int64_t field_period=0;
+    int64_t static_anchor=0;
+    const bool static_values=!s.pattern.start.static_field||(caller&&frame_wait_value(*caller,s.pattern.start,static_anchor)&&
+        static_anchor==s.started_ms&&t.owned_draws==s.draws+1);
     const bool local_period=s.pattern.period_local<0||(caller&&
         size_t(s.pattern.period_local)<caller->locals.size()&&
         !caller->locals[size_t(s.pattern.period_local)].is_long&&
@@ -111,7 +157,7 @@ static int64_t speed_frame_wait_wake_us(int ref,int64_t requested_ms,JavaThreadC
         s.active&&s.complete&&caller&&caller->method==s.method&&caller->op_pc==s.pattern.wait_pc&&stack->size()==s.depth&&
         !caller->locals.empty()&&caller->locals[0].ref==ref&&ref==VMS_RS(g_current)&&ref==VMS_RS(g_shown)&&
         (async?s.requested:(t.owned_draws>s.draws&&t.frame_due_us>0&&&t==VMS_EXEC(g_speed_budget_owner)))&&
-        stable&&s.canvas==VMS_RS(g_current)&&s.cap_period==period&&
+        stable&&static_values&&s.canvas==VMS_RS(g_current)&&s.cap_period==period&&
         paint_clock_us()-s.started_us<=std::max<int64_t>(120000,int64_t(period)*4)&&
         !t.auto_fps.verified_gate_seen&&!t.timer.queue_wait&&!timer_drawing_task(t,task)&&
         VMS_EXEC(g_game_clock).scale<=1.01&&frame_wait_value(*caller,s.pattern.elapsed,elapsed)&&

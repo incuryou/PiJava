@@ -9,13 +9,14 @@
 #include <string>
 #include <vector>
 #include "resource_version.h"
+#include "primitive_buffer_pool.h"
 
 // The including translation unit must define Value before including this file.
 // Each Java element occupies only its JVM storage width. Floating-point values
 // use Value's integer fields, preserving their raw bits without conversion.
 class ArrayStorage {
 public:
-    bool reset(const std::string& descriptor, std::size_t length) {
+    bool reset(const std::string& descriptor, std::size_t length, PrimitiveBufferPool* pool=nullptr) {
         char kind = 0;
         std::size_t width = 0;
         if (!parse_descriptor(descriptor, kind, width) ||
@@ -26,7 +27,10 @@ public:
         }
         // Invalid requests leave the old contents intact. As with std::vector
         // elsewhere in the VM, allocation failure is fatal with -fno-exceptions.
-        std::vector<uint8_t> replacement(length * width, uint8_t{0});
+        std::vector<uint8_t> replacement;
+        const size_t bytes=length*width;
+        if(pool && kind!='R' && bytes<=PrimitiveBufferPool::MaxBuffer)pool->acquire(replacement,bytes);
+        replacement.resize(bytes,uint8_t{0});
         bytes_.swap(replacement);
         length_ = static_cast<uint32_t>(length);
         width_ = static_cast<uint8_t>(width);
@@ -43,6 +47,12 @@ public:
     size_t last_reference_write() const { return last_reference_write_; }
     std::size_t payload_bytes() const { return bytes_.size(); }
     std::size_t capacity_bytes() const { return bytes_.capacity(); }
+
+    // Only called by GC after this Java array has been proven unreachable.
+    // Reference arrays stay on the ordinary destruction path.
+    void recycle_dead_primitive(PrimitiveBufferPool& pool) {
+        if(kind_ && kind_!='R')pool.release(bytes_);
+    }
 
     Value get(std::size_t index) const {
         assert(index < length_);

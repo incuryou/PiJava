@@ -65,23 +65,33 @@ inline bool read_settings_file(const std::string& path, Settings& out, bool& mis
     if (fps != "show_fps=0\n" && fps != "show_fps=1\n") return false;
     const std::string extra=suffix.substr(11);
     display_filter::Filter filter=display_filter::Filter::Original;
-    if(!extra.empty()){
-        if(legacy||extra.compare(0,7,"filter=")!=0)return false;
-        // A damaged optional filter never discards already validated old
-        // bezel/FPS preferences. Incomplete/unknown values select original.
-        bool valid=extra.size()>8&&extra.back()=='\n';int value=0;
-        for(size_t i=7;valid&&i+1<extra.size();++i){
-            if(extra[i]<'0'||extra[i]>'9'){valid=false;break;}
-            value=value*10+(extra[i]-'0');if(value>=display_filter::count)valid=false;
-        }
-        if(valid)filter=static_cast<display_filter::Filter>(value);
+    int rotation = 0;
+    if (!extra.empty()) {
+        if (legacy || extra.compare(0, 7, "filter=") != 0) return false;
+        // Each optional field is validated independently so damaged rotation
+        // cannot discard already validated bezel, FPS or filter preferences.
+        const auto optional_number = [](const std::string& line, const std::string& key, int count) {
+            if (line.compare(0, key.size(), key) != 0 || line.size() <= key.size() + 1 || line.back() != '\n') return 0;
+            int value = 0;
+            for (size_t i = key.size(); i + 1 < line.size(); ++i) {
+                if (line[i] < '0' || line[i] > '9') return 0;
+                value = value * 10 + line[i] - '0';
+                if (value >= count) return 0;
+            }
+            return value;
+        };
+        const size_t filter_end = extra.find('\n');
+        const std::string filter_line = extra.substr(0, filter_end == std::string::npos ? extra.size() : filter_end + 1);
+        filter = static_cast<display_filter::Filter>(optional_number(filter_line, "filter=", display_filter::count));
+        if (filter_end != std::string::npos && filter_end + 1 < extra.size())
+            rotation = optional_number(extra.substr(filter_end + 1), "rotation=", 4);
     }
     Settings loaded = out;
-    // Retired v1 skins have no identity in the new catalog. Preserve FPS
-    // but migrate the bezel to none instead of assigning a different phone.
-    loaded.bezel = legacy ? 0 : bezel;
+    // Retired phone/no-border IDs migrate to adaptive; Pro IDs 4..6 stay stable.
+    loaded.bezel = legacy || bezel<4 ? j2me_present::adaptive_bezel : bezel;
     loaded.show_fps = fps == "show_fps=1\n";
     loaded.filter = filter;
+    loaded.rotation = rotation;
     out = loaded;
     return true;
 }
@@ -154,11 +164,12 @@ inline bool save_record(const std::string& path, const std::string& record) {
 }
 
 inline bool save_settings(const std::string& path, const Settings& settings) {
-    if (settings.bezel < 0 || settings.bezel >= bezel_count || !display_filter::valid(settings.filter)) return false;
+    if (settings.bezel < 0 || settings.bezel >= bezel_count || !display_filter::valid(settings.filter) || settings.rotation < 0 || settings.rotation >= 4) return false;
     std::string record = "J2ME_MENU 2\nbezel=" +
-        std::to_string(settings.bezel) + "\nshow_fps=" +
+        std::to_string(settings.bezel==0?j2me_present::adaptive_bezel:settings.bezel) + "\nshow_fps=" +
         (settings.show_fps ? "1\n" : "0\n");
-    if(settings.filter!=display_filter::Filter::Original)record+="filter="+std::to_string(int(settings.filter))+"\n";
+    if(settings.filter!=display_filter::Filter::Original || settings.rotation != 0)record+="filter="+std::to_string(int(settings.filter))+"\n";
+    if (settings.rotation != 0) record += "rotation=" + std::to_string(settings.rotation) + "\n";
     return save_record(path, record);
 }
 

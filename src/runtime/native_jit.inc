@@ -1,10 +1,26 @@
 #include "../jit_region.h"
 static void jitstale_log(const char* kind, const char* reason, const Method* m, int entry_pc, int exit_pc, int done, uint32_t expected, uint32_t got, const char* action, bool force = false);
 static void jitstale_session_reset();   // 0.2.114: per-session JITSTALE rate limit (defined after jitstale_log)
+static void jit_install_failure_log(Method* m,int pc,const char* kind) {
+    const auto& eng=VMS_NATIVE(g_native_jit);const auto& pool=jit236::code_pool_stats();
+    const char* mode=eng.last_failure_mode==jit236::InstallMode::Fresh?"Fresh":
+        eng.last_failure_mode==jit236::InstallMode::Dedicated?"Dedicated":"Normal";
+    const std::string who=m?VMS_CL(g_classes)[m->class_id].name+"."+m->name+m->desc:"-";
+    log_line(std::string("JITRESOURCE kind=")+kind+" method="+who+" pc="+std::to_string(pc)+" mode="+mode+
+        " request_bytes="+std::to_string(eng.last_failure_bytes)+" request_pages="+std::to_string((eng.last_failure_bytes+4095)/4096)+
+        " error="+jit236::Executable::last_error()+" result="+std::to_string(jit236::Executable::last_result())+
+        " resource_wait="+std::to_string(eng.resource_paused())+" generation="+std::to_string(eng.admission_generation())+
+        " retirement_seq="+std::to_string(jit236::retirement_sequence())+" blocks="+std::to_string(pool.blocks)+
+        " slices="+std::to_string(pool.slices)+" quarantine_pages="+std::to_string(pool.quarantined_pages)+
+        " releases="+std::to_string(pool.quarantine_releases));
+}
 // Called only for invokestatic after the existing class-initialization check.
 // No Java heap allocation, monitor or callback can occur in admitted leaves.
 static bool jit_try_call(Method* m,const Value* values,int count,unsigned budget,Value& value,unsigned& executed) {
     if(!VMS_NATIVE(g_native_jit).enabled||!VMS_NATIVE(g_native_jit).available||m->native||!(m->flags&8)||count<0||count>16)return false;
+    // Re-arm only resource-wait tickets before the outer negative-cache fast
+    // path and before constructing constants for an already-hot candidate.
+    VMS_NATIVE(g_native_jit).rearm_site(m->jit_site);
     if(m->jit_site.epoch==VMS_NATIVE(g_native_jit).epoch()&&m->jit_site.entry==-2)return false;
     std::vector<jit236::Constant> constants;
     // Constant pool entries are copied only once, after a method becomes hot.
@@ -14,7 +30,11 @@ static bool jit_try_call(Method* m,const Value* values,int count,unsigned budget
     }
     const jit236::Spec spec{m->code.data(),m->code.size(),&m->desc,m->flags,m->max_locals,m->max_stack,
         !m->handlers.empty(),!m->name.empty()&&m->name[0]=='<',&constants};
-    if(!VMS_NATIVE(g_native_jit).prepare(m->jit_site,spec))return false;
+    const uint64_t failures_before=VMS_NATIVE(g_native_jit).stats.permission_failures;
+    if(!VMS_NATIVE(g_native_jit).prepare(m->jit_site,spec)) {
+        if(VMS_NATIVE(g_native_jit).stats.permission_failures!=failures_before)jit_install_failure_log(m,0,"leaf");
+        return false;
+    }
     int32_t args[16]{};for(int i=0;i<count;++i){if(values[i].ref||values[i].is_long)return false;args[i]=values[i].i;}
     int32_t result=0;if(!VMS_NATIVE(g_native_jit).call(m->jit_site,args,unsigned(count),budget,result,executed)){
         auto& st=VMS_NATIVE(g_native_jit).last_stale;   // 0.2.113: one JITSTALE line per caught stale leaf call
@@ -29,6 +49,17 @@ static uint64_t jitr_h_getfield(int32_t ref, int32_t slot, int32_t) {
     if (ref <= 0 || size_t(ref) >= VMS_HEAP(g_heap).size() || slot < 0 || size_t(slot) >= VMS_HEAP(g_heap)[ref].fields.size()) return jitr::Bail;
     const Value& v = VMS_HEAP(g_heap)[ref].fields[size_t(slot)];
     if (v.is_long || v.l != 0 || v.ref < 0) return jitr::Bail;          // only (i,ref) values are representable
+    return jitr::pack(v.i, v.ref);
+}
+// Resolved static reads only. Class/slot indices belong to this engine epoch;
+// reset/restore clears regions with the existing epoch boundary. Never cache a
+// Value/address: another Java instruction may have changed the static meanwhile.
+static uint64_t jitr_h_getstatic(int32_t cls, int32_t slot, int32_t) {
+    if (cls < 0 || size_t(cls) >= VMS_CL(g_classes).size() || slot < 0) return jitr::Bail;
+    const auto& c = VMS_CL(g_classes)[size_t(cls)];
+    if (c.init_state != 2 || size_t(slot) >= c.statics.size()) return jitr::Bail;
+    const Value& v = c.statics[size_t(slot)];
+    if (v.is_long || v.l != 0 || v.ref < 0) return jitr::Bail;
     return jitr::pack(v.i, v.ref);
 }
 static uint64_t jitr_h_aload(int32_t ref, int32_t idx, int32_t) {
@@ -62,12 +93,24 @@ static uint64_t jitr_h_icget(int32_t ref, int32_t cls, int32_t slot) {
     if (jitr_h_icchk(ref, cls, 0) == jitr::Bail) return jitr::Bail;
     return jitr_h_getfield(ref, slot, 0);
 }
-// fillRect ONLY (gfx kind 3: never throws, never allocates Java objects, no callbacks). Graphics intrinsic via the same gfx_intrinsic() the interpreter uses. Args are read from the live region slots
+// Exact arities of the synchronous Graphics intrinsics. Image and RGB-colour
+// guards below exclude every Java exception before calling the rasterizer.
+static unsigned jitr_gfx_argc(unsigned id) {
+    switch(id) {
+    case 1:case 3:case 6:case 7:case 9:return 4;
+    case 2:return 9;
+    case 4:return 1;
+    case 5:return 3;
+    case 8:return 2;
+    default:return 0;
+    }
+}
+// Graphics intrinsics use the same gfx_intrinsic() as the interpreter. Args are read from the live region slots
 // (g_jitr_slots); a class miss or null returns Bail so the invoke is re-executed by the interpreter.
 static uint64_t g_jitr_gfx_bail_slots = 0, g_jitr_gfx_bail_cls = 0, g_jitr_gfx_ok = 0;
 static uint64_t jitr_h_icgfx(int32_t ref, int32_t cls, int32_t pack) {
     const unsigned argc = (uint32_t(pack) >> 8) & 0xff, depth = (uint32_t(pack) >> 16) & 0xffff, id = uint32_t(pack) & 0xff;
-    if (!g_jitr_slots || id != 3 || argc > 8 || depth < argc + 1) {
+    if (!g_jitr_slots || !jitr_gfx_argc(id) || argc != jitr_gfx_argc(id) || depth < argc + 1 || depth > jitr::MaxStack) {
         ++g_jitr_gfx_bail_slots;
         
         return jitr::Bail; }
@@ -75,9 +118,34 @@ static uint64_t jitr_h_icgfx(int32_t ref, int32_t cls, int32_t pack) {
         ++g_jitr_gfx_bail_cls;
         
         return jitr::Bail; }
-    Value a[9]; const unsigned base = depth - argc - 1;
+    Value a[10]; const unsigned base = depth - argc - 1;
     for (unsigned i = 0; i <= argc; ++i) { a[i].i = g_jitr_slots[2 + 2 * (g_jitr_locals + base + i)]; a[i].ref = g_jitr_slots[3 + 2 * (g_jitr_locals + base + i)]; }
+    // Slots are not GC roots. No throwing operation, counter increment or
+    // pixel/state write may precede these checks. The interpreter owns errors.
+    if(id==5) {
+        for(unsigned i=1;i<=3;++i)if(a[i].i<0||a[i].i>255)return jitr::Bail;
+    } else if(id==1||id==2) {
+        const int image=a[1].ref;
+        if(image<=0||size_t(image)>=VMS_HEAP(g_heap).size())return jitr::Bail;
+        const auto& src=VMS_HEAP(g_heap)[image];
+        if(src.is_array||src.cls<0)return jitr::Bail;
+        if(!gfx_anchor_ok(a[id==1?4:9].i,false))return jitr::Bail;
+        if(id==2) {
+            const auto target=VMS_RS(g_gfx_target).find(ref);
+            if((target!=VMS_RS(g_gfx_target).end()&&target->second==image)||
+               a[2].i<0||a[3].i<0||a[4].i<0||a[5].i<0||
+               int64_t(a[2].i)+a[4].i>src.width||int64_t(a[3].i)+a[5].i>src.height||
+               a[6].i<0||a[6].i>7)return jitr::Bail;
+        }
+    }
+    // drawLine diagnostics and existing image compatibility guards need the
+    // precise invocation BCI. Restore the live frame before returning to JIT.
+    Frame* caller=nullptr;
+    if((id==1||id==2||id==9) && VMS_EXEC(g_active_stack) && !VMS_EXEC(g_active_stack)->empty())caller=&VMS_EXEC(g_active_stack)->back();
+    const int previous_pc=caller?caller->op_pc:0;
+    if(caller)caller->op_pc=g_jitr_slots[0];
     gfx_intrinsic(uint8_t(id), a);
+    if(caller)caller->op_pc=previous_pc;
     if (VMS_EXEC(g_thrown)) return jitr::Bail;
     ++g_jitr_gfx_ok; return 0;
 }
@@ -116,14 +184,18 @@ static jitr::IcSite jitr_ic_for(const Method* caller, int pc) {
     jitr::IcSite ic; const auto& c = caller->code; const int op = c[size_t(pc)];
     if (size_t(pc) >= caller->quick.size()) return ic;
     const QuickSite& q = caller->quick[size_t(pc)];
+    // Interface calls share the resolved virtual target/class guard. Their
+    // count/reserved operands are part of a five-byte instruction; only the
+    // existing non-wide, bounded callees below can be represented here.
+    if (op == 185 && (size_t(pc) + 4 >= c.size() || c[size_t(pc) + 3] != unsigned(q.argc) + 1 || c[size_t(pc) + 4] != 0)) return ic;
     if ((q.flags >> 1) || q.library_intrinsic) return ic;
-    if (q.intrinsic) {   // monomorphic IC of Graphics.drawImage/drawRegion/fillRect (same gfx_intrinsic as interpreter)
-        if (!(q.flags & 1) || q.argc != 4 || q.intrinsic != 3) return ic;    // fillRect(IIII)V only: drawImage/Region can throw NPE
+    if (q.intrinsic) {   // Checked synchronous calls; failure exits before effects.
+        if (!(q.flags & 1) || !jitr_gfx_argc(q.intrinsic) || q.argc != jitr_gfx_argc(q.intrinsic)) return ic;
         if (op == 182 && q.kind == 4 && q.vclass >= 0) { ic.kind = jitr::IC_GFX; ic.argc = q.argc; ic.cls = q.vclass; ic.value = q.intrinsic; ic.cost = 1; }
         return ic;
     }
     Method* t = nullptr; int cls = -2;
-    if (op == 182 && q.kind == 4 && q.vclass >= 0) { t = method_at((uint32_t(q.va) << 16) | uint32_t(q.vb)); cls = q.vclass; }
+    if ((op == 182 || op == 185) && q.kind == 4 && q.vclass >= 0) { t = method_at((uint32_t(q.va) << 16) | uint32_t(q.vb)); cls = q.vclass; }
     else if (op == 183 && q.kind == 3) { t = method_at((uint32_t(q.a) << 16) | uint32_t(q.b)); cls = -2; }
     if (!t || t->native || (t->flags & (0x0008 | 0x0020 | 0x0400 | 0x0100)) || t->name == "<init>" || t->name == "<clinit>" || !t->handlers.empty()) return ic;
     if (city_method_traced_name(t)) return ic;
@@ -148,11 +220,18 @@ static jitr::IcSite jitr_ic_for(const Method* caller, int pc) {
 }
 struct JitRegionStatsT3 { uint64_t ic_sites = 0, cast_sites = 0, stack_entries = 0, recompiles = 0; };
 static JitRegionStatsT3 g_jit_region_t3;
+struct JitRegionOp { uint16_t pc, cost; }; // VM IC costs are at most four bytecodes.
 struct JitRegionEntry { int16_t entry_depth = -1; uint32_t hits = 0; uint8_t state = 0; uint32_t runs = 0; uint64_t run_ops = 0; jit236::Executable exe; std::vector<int16_t> depth; std::vector<uint8_t> stored; std::vector<int> cast_idx; std::vector<uint8_t> ic_kind; uint8_t recompiles = 0; bool stale = false; unsigned locals = 0; bool fresh_page = false; uint32_t stale_events = 0;
+    bool resource_wait=false;uint64_t resource_generation=0;
+    std::vector<JitRegionOp> compiled_ops; // Actual K_OP PCs only: depth also describes K_EXITs.
+    int overlap_owner = -1; uint32_t overlap_id = 0; bool overlap_bailed = false;
+    uint32_t overlap_runs = 0, overlap_progress_id = 0; uint64_t overlap_ops = 0;
     bool writes = true;   // 0.2.114: region contains an op with effects outside the frame (int[] store / fillRect); set at install
     int32_t maj_pc = -1; uint32_t maj_cnt = 0, inv_exits = 0; };   // P6.7: per-region exit statistics (majority exit pc, exits at non-IC invokes)
-struct JitRegionMethod { uint64_t epoch = 0; bool scanned = false; std::vector<uint8_t> banned; std::vector<uint8_t> dead; std::unordered_map<int, JitRegionEntry> at; };
+struct JitRegionMethod { uint64_t epoch = 0; bool scanned = false; std::vector<uint8_t> banned; std::vector<uint8_t> dead; std::vector<uint8_t> loop_headers; std::unordered_map<int, JitRegionEntry> at; };
 struct JitRegionStats { uint64_t skip_marked = 0, full_skipped = 0, retired_invoke = 0, retired_short = 0, compiled = 0, rejected = 0, banned_wait = 0, entries = 0, ops = 0, zero = 0, bytes = 0, resident = 0;
+    uint64_t overlap_deferred = 0, overlap_hits = 0, overlap_reopened = 0;
+    uint64_t backedge_handoffs = 0; // Fast batches returning at eligible loop entries.
     uint64_t stale_id = 0, stale_exit = 0, stale_recompiles = 0;   // 0.2.113: caught stale / mismatched code events
     uint64_t stale_fatal = 0; };   // 0.2.114: bad exits of regions with side effects (VM stopped, never re-run)
 static std::unordered_map<const Method*, JitRegionMethod> g_jit_regions; static const Method* g_jit_region_last_m = nullptr; static JitRegionMethod* g_jit_region_last = nullptr; static JitRegionStats g_jit_region_stats; static uint64_t g_jit_region_epoch = 0;
@@ -177,14 +256,29 @@ static void jit_region_reset() {
 // epoch (restore / clear bumps it), so a stale bit is never honoured; never serialized (not part of J2S5).
 static inline void jitr_mark_skip(Method* m, int pc) {
     const uint64_t ep = VMS_NATIVE(g_native_jit).epoch();
-    if (m->jitr_skip_epoch != ep) { m->jitr_skip.assign(m->code.size(), 0); m->jitr_skip_epoch = ep; }
+    if (m->jitr_skip_epoch != ep) { m->jitr_skip.assign(m->code.size(), 0); m->jitr_skip_epoch = ep;
+        m->jitr_resource_generation=VMS_NATIVE(g_native_jit).admission_generation(); }
     if (size_t(pc) < m->jitr_skip.size()) m->jitr_skip[size_t(pc)] = 1;
 }
+static inline void jitr_mark_resource_skip(Method* m,int pc) {
+    const auto& eng=VMS_NATIVE(g_native_jit);
+    if(m->jitr_skip_epoch!=eng.epoch()) {
+        m->jitr_skip.assign(m->code.size(),0);m->jitr_skip_epoch=eng.epoch();
+        m->jitr_resource_generation=eng.admission_generation();
+    }
+    if(size_t(pc)<m->jitr_skip.size()&&m->jitr_skip[size_t(pc)]!=1)m->jitr_skip[size_t(pc)]=2;
+}
 static inline bool jitr_skipped(const Frame& fr) {
-    const Method* m = fr.method;
-    return m->jitr_skip_epoch == VMS_NATIVE(g_native_jit).epoch() && size_t(fr.pc) < m->jitr_skip.size() && m->jitr_skip[size_t(fr.pc)];
+    auto& eng=VMS_NATIVE(g_native_jit);eng.refresh_admission();Method* m=fr.method;
+    if(m->jitr_skip_epoch!=eng.epoch()||size_t(fr.pc)>=m->jitr_skip.size())return false;
+    if(m->jitr_skip[size_t(fr.pc)]==2&&m->jitr_resource_generation!=eng.admission_generation()) {
+        for(auto& flag:m->jitr_skip)if(flag==2)flag=0;
+        m->jitr_resource_generation=eng.admission_generation();
+    }
+    return m->jitr_skip[size_t(fr.pc)]!=0;
 }
 constexpr uint32_t JitRegionInvokeRetireOps = 32; constexpr uint32_t JitRegionHot = 64; constexpr size_t JitRegionMaxBytes = jit_budget::RegionBytes; constexpr size_t JitRegionMax = jit_budget::RegionEntries;
+constexpr size_t JitOverlapPressureBytes = 1024*1024; // Preserve normal admission while live code is small.
 static int jvm_op_length(const std::vector<uint8_t>& c, size_t pc) {
     static const int8_t len[256] = {
         1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 2,3,2,3,3,2,2,2,2,2,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,2,2,2,2,2,1,1,1,1,1,
@@ -203,11 +297,20 @@ static int jvm_op_length(const std::vector<uint8_t>& c, size_t pc) {
 // wait is banned, and methods with poll/time-gate patterns are banned entirely.
 static void jit_region_scan(const Method* m, JitRegionMethod& rm) {
     rm.scanned = true; rm.banned.assign(m->code.size(), 0); rm.dead.assign(m->code.size(), 0);
+    rm.loop_headers.assign(m->code.size(), 0);
     if (!m->time_gates.empty()) { std::fill(rm.banned.begin(), rm.banned.end(), 1); return; }
     const Class& owner = VMS_CL(g_classes)[m->class_id]; const auto& c = m->code;
     std::vector<int> waits;
-    for (size_t pc = 0; pc + 2 < c.size(); ) {
-        const int op = c[pc]; const int len = jvm_op_length(c, pc); if (len <= 0) { std::fill(rm.banned.begin(), rm.banned.end(), 1); return; }
+    for (size_t pc = 0; pc < c.size(); ) {
+        const int op = c[pc]; const int len = jvm_op_length(c, pc); if (len <= 0 || size_t(len) > c.size()-pc) { std::fill(rm.banned.begin(), rm.banned.end(), 1); return; }
+        auto backward = [&](int64_t target) { if (target >= 0 && uint64_t(target) <= pc) rm.loop_headers[size_t(target)] = 1; };
+        if ((op >= 153 && op <= 168) || op == 198 || op == 199) backward(int64_t(pc) + jitr::s16(c.data()+pc+1));
+        else if (op == 200 || op == 201) backward(int64_t(pc) + jitr::s32(c.data()+pc+1));
+        else if (op == 170 || op == 171) {
+            const size_t base = (pc+4)&~size_t(3); backward(int64_t(pc)+jitr::s32(c.data()+base));
+            const size_t first = base+12, stride = op == 170 ? 4 : 8;
+            for (size_t q = first; q+4 <= pc+size_t(len); q += stride) backward(int64_t(pc)+jitr::s32(c.data()+q));
+        }
         if (op >= 182 && op <= 185) { std::string cls, name, desc; resolve_member(owner, (c[pc + 1] << 8) | c[pc + 2], cls, name, desc);
             if ((cls == "java/lang/System" && (name == "currentTimeMillis" || name == "nanoTime")) || (cls == "java/lang/Thread" && (name == "yield" || name == "sleep")) || name == "wait")
                 waits.push_back(int(pc)); }
@@ -222,6 +325,33 @@ static void jit_region_scan(const Method* m, JitRegionMethod& rm) {
         }
         pc += size_t(len);
     }
+}
+// A guard/helper exit at a compiled op is evidence that structural coverage did
+// not provide progress there. Never use that install as an overlap owner again.
+static unsigned jitr_overlap_cost(const JitRegionEntry& e, int pc) {
+    auto op = std::lower_bound(e.compiled_ops.begin(), e.compiled_ops.end(), pc,
+                              [](const JitRegionOp& n, int at) { return n.pc < at; });
+    return op != e.compiled_ops.end() && op->pc == pc ? op->cost : 0;
+}
+static bool jitr_overlap_healthy(const JitRegionEntry& e) {
+    return e.state == 1 && e.exe.id && e.exe.executable() && !e.stale && !e.fresh_page &&
+           !e.overlap_bailed && e.overlap_progress_id == e.exe.id && e.overlap_runs >= 8 && e.overlap_ops >= uint64_t(e.overlap_runs)*8;
+}
+static bool jitr_overlap_new(const JitRegionEntry& e) {
+    return !e.exe.size && !e.stale && !e.fresh_page && !e.stale_events && !e.recompiles;
+}
+static bool jitr_overlap_defer(JitRegionMethod& rm, int entry, JitRegionEntry& e, const jitr::Region& r) {
+    if (jit236::code_pool_stats().used_bytes < JitOverlapPressureBytes || !jitr_overlap_new(e) || rm.loop_headers[size_t(entry)]) return false;
+    for (const auto& item : rm.at) {
+        const auto& owner = item.second;
+        if (!jitr_overlap_healthy(owner)) continue;
+        bool covered = true;
+        for (const auto& n : r.ins) if (n.kind == jitr::K_OP &&
+            (size_t(n.pc) >= owner.depth.size() || owner.depth[size_t(n.pc)] != n.depth ||
+             !jitr_overlap_cost(owner, n.pc))) { covered = false; break; }
+        if (covered) { e.overlap_owner = item.first; e.overlap_id = owner.exe.id; return true; }
+    }
+    return false;
 }
 // 0.2.112 F3: one line written just before an operand-stack underflow aborts the VM (no switch, no recovery).
 static void underflow_log(const char* kind, const Frame& fr, int need, const std::string& callee) {
@@ -280,7 +410,8 @@ static void jitstale_log(const char* kind, const char* reason, const Method* m, 
     if (++L.pending >= JitStaleSummaryEvery) jitstale_summary(false);
 }
 // Runs a compiled region from fr.pc (operand stack must be empty). Returns ops executed (0 = nothing done).
-static int jit_region_try(Frame& fr, int budget) {
+static int jit_region_try(Frame& fr, int budget, bool* overlap_deferred = nullptr) {
+    if(overlap_deferred)*overlap_deferred=false;
     auto& eng = VMS_NATIVE(g_native_jit); if (!eng.enabled || !eng.available || budget <= 0) return 0;
     if (fr.stack.size() > fr.method->max_stack) return 0;
     for (const Value& v : fr.stack) if (v.is_long || v.l != 0 || v.ref < 0) return 0;   // only plain (i,ref) stack values
@@ -291,12 +422,31 @@ static int jit_region_try(Frame& fr, int budget) {
     if (rm.banned[size_t(fr.pc)] || rm.dead[size_t(fr.pc)]) { jitr_mark_skip(m, fr.pc); ++g_jit_region_stats.skip_marked; return 0; }   // O(1) reject for wait loops / retired pcs
     // P6.8 B: once the code budget is full, no new candidates are collected: a pc without compiled code is marked
     // 'do not try' until the next epoch (no budget increase, no eviction).
-    const bool budget_full = eng.admission_closed || g_jit_region_stats.resident >= JitRegionMax || g_jit_region_stats.bytes >= JitRegionMaxBytes;
-    if (budget_full) { auto it = rm.at.find(fr.pc); if (it == rm.at.end() || it->second.state != 1) { jitr_mark_skip(m, fr.pc); ++g_jit_region_stats.full_skipped; return 0; } }
+    eng.refresh_admission();
+    const bool region_limit=g_jit_region_stats.resident>=JitRegionMax||g_jit_region_stats.bytes>=JitRegionMaxBytes;
+    const bool budget_full = eng.admission_closed || region_limit;
+    if (budget_full) { auto it = rm.at.find(fr.pc); if (it == rm.at.end() || it->second.state != 1) {
+        if(eng.resource_paused()&&!region_limit)jitr_mark_resource_skip(m,fr.pc);else jitr_mark_skip(m,fr.pc);
+        ++g_jit_region_stats.full_skipped; return 0; } }
     auto& e = rm.at[fr.pc];
+    if(e.resource_wait&&!eng.admission_closed&&e.resource_generation!=eng.admission_generation()) {
+        e.resource_wait=false;e.state=0;e.hits=JitRegionHot-1;
+    }
     if (e.state == 2) { rm.dead[size_t(fr.pc)] = 1; jitr_mark_skip(m, fr.pc); return 0; }
     if (e.entry_depth < 0) e.entry_depth = int16_t(fr.stack.size());
     if (size_t(e.entry_depth) != fr.stack.size()) { e.state = 2; rm.dead[size_t(fr.pc)] = 1; jitr_mark_skip(m, fr.pc); return 0; }   // verifier guarantees one depth
+    if (e.overlap_id) {
+        const auto owner = rm.at.find(e.overlap_owner);
+        if (jit236::code_pool_stats().used_bytes >= JitOverlapPressureBytes && jitr_overlap_new(e) && !rm.loop_headers[size_t(fr.pc)] && owner != rm.at.end() &&
+            owner->second.exe.id == e.overlap_id && jitr_overlap_healthy(owner->second)) {
+            ++g_jit_region_stats.overlap_hits;
+            if(overlap_deferred)*overlap_deferred=true;
+            return 0;
+        }
+        // Lower pressure, owner retirement, recovery or replacement reopens admission.
+        ++g_jit_region_stats.overlap_reopened;
+        e.overlap_id = 0; e.overlap_owner = -1; e.hits = JitRegionHot-1;
+    }
     if (e.state == 1 && e.stale && e.recompiles < 2 && !eng.admission_closed) { e.state = 0; e.stale = false; ++e.recompiles; e.hits = JitRegionHot - 1; ++g_jit_region_t3.recompiles; }
     if (e.state == 0) {
         if (++e.hits < JitRegionHot) return 0;
@@ -306,39 +456,53 @@ static int jit_region_try(Frame& fr, int budget) {
         const auto& cp = VMS_CL(g_classes)[m->class_id].cp; std::vector<jit236::Constant> consts(cp.size());
         for (size_t i = 0; i < cp.size(); ++i) if (cp[i].tag == 3) consts[i] = {true, int32_t(cp[i].a)};
         std::vector<int> fslot(m->code.size(), -1);
+        std::vector<jitr::StaticSite> statics(m->code.size());
         for (size_t pc = 0; pc < m->quick.size() && pc < m->code.size(); ++pc) { const auto& q = m->quick[pc];
+            if (m->code[pc] == 178 && q.kind == 1 && q.a >= 0 && size_t(q.a) < VMS_CL(g_classes).size() && q.b >= 0) statics[pc] = {q.a, q.b};
             if (m->code[pc] == 180 && q.kind == 1 && q.a >= 0 && size_t(q.a) < VMS_CL(g_classes).size() && q.b >= 0) fslot[pc] = q.b;
         }
         std::vector<jitr::IcSite> ics(m->code.size()); std::vector<int> casts(m->code.size(), -1);
         for (size_t pc = 0; pc < m->code.size(); ) { const int op = m->code[pc]; const int len = jvm_op_length(m->code, pc); if (len <= 0) break;
-            if ((op == 182 || op == 183) && pc + 2 < m->code.size()) { ics[pc] = jitr_ic_for(m, int(pc)); if (ics[pc].kind) ++g_jit_region_t3.ic_sites; }
+            if ((op == 182 || op == 183 || op == 185) && pc + 2 < m->code.size()) { ics[pc] = jitr_ic_for(m, int(pc)); if (ics[pc].kind) ++g_jit_region_t3.ic_sites; }
             if ((op == 192 || op == 193) && pc + 2 < m->code.size()) { const std::string nm = cp_class(VMS_CL(g_classes)[m->class_id], (m->code[pc + 1] << 8) | m->code[pc + 2]);
                 if (!nm.empty() && nm[0] != '[') { casts[pc] = int(g_jitr_casts.size()); g_jitr_casts.push_back({nm, -1, -1}); ++g_jit_region_t3.cast_sites; } }
             pc += size_t(len); }
         jitr::Spec s; s.code = m->code.data(); s.size = m->code.size(); s.entry = fr.pc; s.max_locals = m->max_locals; s.max_stack = m->max_stack; s.constants = &consts; s.field_slot = &fslot;
-        s.entry_depth = unsigned(e.entry_depth); s.ic = &ics; s.cast_site = &casts; s.int_array_stores = true;
+        s.entry_depth = unsigned(e.entry_depth); s.ic = &ics; s.cast_site = &casts; s.int_array_stores = true; s.static_site = &statics;
         jitr::Region r;
         bool ok = jitr::build(s, r);
         // a banned (wait-loop) pc must never be compiled code, so the region stops before it
         if (ok) for (const auto& n : r.ins) if (n.kind == jitr::K_OP && rm.banned[size_t(n.pc)]) { ok = false; ++g_jit_region_stats.banned_wait; break; }
-        if (ok) { const jitr::Helpers h{jitr_h_getfield, jitr_h_aload, jitr_h_alen, jitr_h_icget, jitr_h_icchk, jitr_h_cast, jitr_h_inst, jitr_h_icgfx, jitr_h_iastore};
+        if (ok && jitr_overlap_defer(rm, fr.pc, e, r)) {
+            ++g_jit_region_stats.overlap_deferred; e.state = 0;
+            if(overlap_deferred)*overlap_deferred=true;
+            return 0;
+        }
+        if (ok) { const jitr::Helpers h{jitr_h_getfield, jitr_h_aload, jitr_h_alen, jitr_h_icget, jitr_h_icchk, jitr_h_cast, jitr_h_inst, jitr_h_icgfx, jitr_h_iastore, jitr_h_getstatic};
             const uint32_t code_id = jit236::next_install_id(); auto bytes = jitr::emit_host(r, h, code_id);
             const size_t pages=(bytes.size()+4095)&~size_t(4095);
             if(bytes.empty() || pages>JitRegionMaxBytes-(g_jit_region_stats.bytes-old_bytes)) {++g_jit_region_stats.rejected;return 0;}
             // install replaces the old executable, including on allocation failure.
             // a region recompiled after a stale event goes to a never-used page (0.2.113)
-            ok=e.exe.install(bytes,code_id,e.fresh_page?jit236::InstallMode::Fresh:jit236::InstallMode::Normal); e.fresh_page=false;
+            ok=e.exe.install(bytes,code_id,e.fresh_page?jit236::InstallMode::Fresh:jit236::InstallMode::Normal);
+            if(ok)e.fresh_page=false;
             g_jit_region_stats.bytes-=old_bytes;
             if(old_bytes)--g_jit_region_stats.resident;
-            if(!ok){eng.admission_closed=true;++eng.stats.permission_failures;} }
+            if(!ok){eng.installation_failed(bytes.size(),e.fresh_page?jit236::InstallMode::Fresh:jit236::InstallMode::Normal);
+                jit_install_failure_log(m,fr.pc,"region");
+                if(eng.resource_paused()) {e.resource_wait=true;e.resource_generation=eng.admission_generation();e.state=0;jitr_mark_resource_skip(m,fr.pc);}
+            } }
         if (!ok) { ++g_jit_region_stats.rejected; return 0; }
         e.writes = !jitr::region_pure(r);   // 0.2.114: decided per install from the compiled op list (whitelist)
+        e.compiled_ops.clear(); for (const auto& n : r.ins) if (n.kind == jitr::K_OP) e.compiled_ops.push_back({uint16_t(n.pc), uint16_t(n.cost)});
+        std::sort(e.compiled_ops.begin(), e.compiled_ops.end(), [](const JitRegionOp& a, const JitRegionOp& b) { return a.pc < b.pc; }); e.overlap_bailed = false;
+        e.overlap_runs = 0; e.overlap_ops = 0; e.overlap_progress_id = 0;
         e.depth = std::move(r.depth); e.stored = std::move(r.stored); e.cast_idx = std::move(casts); e.ic_kind.assign(m->code.size(), 0); for (size_t q = 0; q < ics.size(); ++q) e.ic_kind[q] = ics[q].kind; e.locals = r.locals; e.state = 1;
         ++g_jit_region_stats.compiled; ++g_jit_region_stats.resident; g_jit_region_stats.bytes += e.exe.size;
     }
     // stored locals must hold plain (i,ref) values at entry; the region never writes long/double slots
-    if (fr.locals.size() < e.locals) return 0;
-    for (unsigned k = 0; k < e.locals; ++k) if (e.stored[k] && (fr.locals[k].is_long || fr.locals[k].l != 0)) return 0;
+    if (fr.locals.size() < e.locals) { e.overlap_bailed = true; return 0; }
+    for (unsigned k = 0; k < e.locals; ++k) if (e.stored[k] && (fr.locals[k].is_long || fr.locals[k].l != 0)) { e.overlap_bailed = true; return 0; }
     static thread_local std::vector<int32_t> slots; const size_t need = 2 + 2 * (size_t(e.locals) + m->max_stack + 1); if (slots.size() < need) slots.resize(need);
     for (unsigned k = 0; k < e.locals; ++k) { slots[2 + 2 * k] = fr.locals[k].i; slots[3 + 2 * k] = fr.locals[k].ref; }
     for (size_t d = 0; d < fr.stack.size(); ++d) { slots[2 + 2 * (e.locals + d)] = fr.stack[d].i; slots[3 + 2 * (e.locals + d)] = fr.stack[d].ref; }
@@ -370,6 +534,11 @@ static int jit_region_try(Frame& fr, int budget) {
         }
         return stale_recompile("bad_exit", exit_pc, done, e.exe.id);   // pure region or done==0: as 0.2.113
     }
+    const unsigned exit_cost = jitr_overlap_cost(e, exit_pc);
+    // An IC represents several bytecodes atomically. Insufficient remaining
+    // budget (including done==0 at entry) is normal, not a failed helper guard.
+    if ((!done && !exit_cost) || (exit_cost && unsigned(budget-done) >= exit_cost)) e.overlap_bailed = true;
+    ++e.overlap_runs; e.overlap_ops += uint64_t(done); e.overlap_progress_id = e.exe.id;
 #if defined(J2ME_JITR_EXITS)
     jitr_exit_hook(m, exit_pc, done, budget, slots.data(), e.locals, e.depth, e.ic_kind);   // test-side histogram only
 #endif
@@ -403,7 +572,7 @@ static int jit_region_try(Frame& fr, int budget) {
     // resolved it, recompile the region (at most twice) so the site can use the monomorphic IC.
     if (!e.stale && e.recompiles < 2 && size_t(exit_pc) < e.ic_kind.size() && !e.ic_kind[size_t(exit_pc)]) {
         const int xo = m->code[size_t(exit_pc)];
-        if ((xo == 182 || xo == 183) && jitr_ic_for(m, exit_pc).kind != jitr::IC_NONE) e.stale = true; }
+        if ((xo == 182 || xo == 183 || xo == 185) && jitr_ic_for(m, exit_pc).kind != jitr::IC_NONE) e.stale = true; }
     if (depth > 0 && size_t(exit_pc) < e.cast_idx.size() && e.cast_idx[size_t(exit_pc)] >= 0)   // learn before interpreter runs it
         jitr_learn_cast(e.cast_idx[size_t(exit_pc)], slots[3 + 2 * (e.locals + unsigned(depth - 1))]); g_jit_region_stats.ops += uint64_t(done); eng.stats.ops += uint64_t(done);
     return done;

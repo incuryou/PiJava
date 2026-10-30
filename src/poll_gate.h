@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -11,6 +12,85 @@ struct TimeGatePattern {
     int64_t millis = 0;
     int static_field = -1, anchor_clock_pc = -1, site_pc = -1;
 };
+
+// Entire static (J)V helper: add this invocation's current clock to its long
+// argument, then only compare/yield until that absolute deadline. The caller
+// also rejects synchronized methods and handlers. No Java instruction is
+// skipped, and this proof is independent of paced-frame certification.
+template<class IsClock,class IsYield>
+bool recognize_bounded_deadline_helper(const std::vector<uint8_t>& code,
+                                      IsClock is_clock,IsYield is_yield) {
+    if(code.size()!=21)return false;
+    static constexpr uint8_t shape[]={0x1e,0xb8,0,0,0x61,0x3f,0x1e,0xb8,0,0,
+                                      0x94,0x9e,0,9,0xb8,0,0,0xa7,0xff,0xf5,0xb1};
+    for(size_t i=0;i<code.size();++i) {
+        if(i==2||i==3||i==8||i==9||i==15||i==16)continue;
+        if(code[i]!=shape[i])return false;
+    }
+    auto cp=[&](int at){return (int(code[at+1])<<8)|code[at+2];};
+    return is_clock(cp(1))&&is_clock(cp(7))&&is_yield(cp(14));
+}
+
+// Native-speed only: recognize one narrowly bounded deadline loop. The static
+// integral field is validated as already loaded and non-volatile by the caller;
+// its value is never cached. Control-flow/handler safety is checked separately.
+template<class IsStaticIntegral, class IsYield, class IsClock, class SafeFlow>
+int recognize_native_deadline_gate(const std::vector<uint8_t>& code,int clock_pc,int next_pc,
+        IsStaticIntegral is_static_integral,IsYield is_yield,IsClock is_clock,SafeFlow safe_flow) {
+    const int n=int(code.size());
+    auto op=[&](int p,int v){return p>=0&&p<n&&code[p]==v;};
+    auto operand=[&](int p){return p>=0&&p+2<n?(int(code[p+1])<<8)|code[p+2]:-1;};
+    auto jump=[&](int p){const int v=operand(p);return v<0?-1:p+int16_t(v);};
+    if(!op(clock_pc,0xb8)||!is_clock(operand(clock_pc))||next_pc!=clock_pc+3||
+       !op(next_pc,0x94)||!op(next_pc+1,0x9e))return -1; // lcmp; ifle ready
+    const int branch=next_pc+1,yield_pc=branch+3,back=yield_pc+3,end=back+3;
+    if(!op(yield_pc,0xb8)||!is_yield(operand(yield_pc))||!op(back,0xa7)||
+       jump(branch)!=end||end>=n)return -1;
+    const int start=jump(back);int p=start,local=-1;
+    if(p<0||p>=n)return -1;
+    if(code[p]>=0x1e&&code[p]<=0x21)local=int(code[p++])-0x1e;
+    else if(op(p,0x16)&&p+1<n){local=code[p+1];p+=2;}
+    else return -1;
+    if(!op(p,0xb2)||!is_static_integral(operand(p)))return -1;
+    p+=3;
+    if(!op(p,0x85)||!op(p+1,0x61)||p+2!=clock_pc)return -1;
+    if(!safe_flow(start,end))return -1;
+    return local;
+}
+
+// No switches, subroutines, handler entries or alternative branches into the
+// middle of a proof are accepted. This runs once when a call site is decoded.
+template<class OpLength>
+bool native_deadline_flow_safe(const std::vector<uint8_t>& code,int start,int end,
+                              bool has_handlers,OpLength length) {
+    const int n=int(code.size());
+    if(has_handlers||start<0||end<=start||end>=n)return false;
+    std::vector<bool> boundary(size_t(n)+1,false);
+    std::vector<std::pair<int,int>> edges;
+    for(int p=0;p<n;) {
+        const int len=length(p);if(len<=0||len>n-p)return false;
+        boundary[size_t(p)]=true;const int op=code[p];
+        if(op==0xa8||op==0xa9||op==0xaa||op==0xab||op==0xc4||op==0xc8||op==0xc9)return false;
+        if((op>=0x99&&op<=0xa7)||op==0xc6||op==0xc7) {
+            if(len!=3)return false;
+            edges.push_back({p,p+int16_t((int(code[p+1])<<8)|code[p+2])});
+        }
+        p+=len;
+    }
+    if(!boundary[size_t(start)]||!boundary[size_t(end)])return false;
+    for(const auto& edge:edges) {
+        if(edge.second<0||edge.second>=n||!boundary[size_t(edge.second)])return false;
+        if(edge.second>start&&edge.second<end&&(edge.first<start||edge.first>=end))return false;
+    }
+    return true;
+}
+
+inline int clock_long_local_store(const std::vector<uint8_t>& code,int next_pc) {
+    if(next_pc<0||next_pc>=int(code.size()))return -1;
+    const int op=code[next_pc];
+    if(op>=0x3f&&op<=0x42)return op-0x3f;
+    return op==0x37&&next_pc+1<int(code.size())?code[next_pc+1]:-1;
+}
 
 // This is a value provenance record, not a gate proof. A short Java sleep can
 // discard polling evidence while the same update still owns its clock anchor.
@@ -145,13 +225,25 @@ struct PollGateState {
     int64_t previous_ms = 0, deadline_ms = 0;
     unsigned reads = 0;
     bool waiting = false, certified = false, fresh_ready = false;
+    // Only actual naps of a certified paced gate contribute latency. Age by
+    // gate cycle so a large margin cannot keep itself alive by preventing naps.
+    std::array<int64_t, 8> nap_late_us{};
+    unsigned nap_next = 0;
+    void note_wait(int64_t requested, int64_t observed) {
+        if(requested<=0 || observed<requested)return;
+        nap_late_us[nap_next]=std::max(nap_late_us[nap_next],std::min<int64_t>(2000,observed-requested));
+    }
+    int64_t nap_margin_us() const { return 250+*std::max_element(nap_late_us.begin(),nap_late_us.end()); }
     void reset() { *this = {}; }
     bool observe(const void* owner, int site, int64_t previous, int64_t period,
                  int64_t now_ms, bool has_drawn) {
         fresh_ready=false;
         if (!has_drawn || previous < 0 || period > INT64_MAX - previous) { reset(); return false; }
         if (method != owner || pc != site) { reset(); method = owner; pc = site; }
-        if (previous_ms != previous) { previous_ms = previous; reads = 0; waiting = false; }
+        if (previous_ms != previous) {
+            previous_ms = previous; reads = 0; waiting = false;
+            nap_next=(nap_next+1)%nap_late_us.size();nap_late_us[nap_next]=0;
+        }
         deadline_ms = previous + period;
         if (now_ms < deadline_ms) {
             waiting = true; reads = std::min(1000000u, reads+1); return false;
@@ -162,13 +254,57 @@ struct PollGateState {
         waiting = false; reads = 0;
         return verified;
     }
+    bool observe_deadline(const void* owner,int site,int64_t anchor,int64_t deadline,
+                          int64_t now_ms,bool has_drawn) {
+        if(!has_drawn||anchor<0||deadline<anchor||now_ms<anchor||deadline-anchor<2||deadline-anchor>120) {
+            reset();return false;
+        }
+        // A non-final Java period may change while the anchor remains the same.
+        if(method==owner&&pc==site&&previous_ms==anchor&&deadline_ms!=deadline)reset();
+        return observe(owner,site,anchor,deadline-anchor,now_ms,has_drawn);
+    }
     int64_t wait_us(int64_t now_ms, double scale, bool paced_verified = false) const {
         if (!waiting || reads < 4 || !std::isfinite(scale) || scale < 1.0 || now_ms >= deadline_ms) return 0;
         const double remaining = double(deadline_ms-now_ms)*1000.0/scale;
         // Only a certified gate owned by the paced drawing thread earns the
-        // smaller busy margin. Native and unverified loops retain one ms.
+        // measured margin. Native and unverified loops retain one ms.
         // Each bounded nap still returns to Java and services audio normally.
-        const double margin = paced_verified && certified ? 250.0 : 1000.0;
+        const double margin = paced_verified && certified ? double(nap_margin_us()) : 1000.0;
         return remaining > margin ? int64_t(std::min(500.0, remaining-margin)) : 0;
+    }
+};
+
+// All fields are transient numeric provenance, not Java roots or save data.
+// The static-field deadline requires a completed owner paint after its anchor.
+// The whole pure helper instead requires a prior owner paint and an unchanged
+// draw count throughout this fresh bounded invocation.
+struct NativeDeadlineEvidence {
+    uint64_t activation=0,draws=0;
+    int local=-1,canvas=0;
+    int64_t value=0;
+    double scale=0;
+    bool bounded_delay=false;
+    int64_t target_ms=0,last_ms=0;
+    PollGateState poll;
+    void reset(){*this={};}
+    void record(uint64_t id,int slot,int64_t time,int shown,uint64_t count,double rate) {
+        reset();
+        if(!id||slot<0||time<0||shown<=0||!std::isfinite(rate)||rate<1.0)return;
+        activation=id;local=slot;value=time;canvas=shown;draws=count;scale=rate;
+    }
+    bool owns(uint64_t id,int slot,int64_t time,int shown,uint64_t count,double rate) const {
+        return !bounded_delay&&activation&&id==activation&&slot==local&&time==value&&shown==canvas&&
+            count>draws&&rate==scale&&std::isfinite(rate)&&rate>=1.0;
+    }
+    void record_bounded_delay(uint64_t id,int64_t delay,int64_t now,int shown,uint64_t count,double rate) {
+        reset();
+        if(delay<2||delay>120||now<0||now>INT64_MAX-delay||!count)return;
+        record(id,0,now,shown,count,rate);
+        if(!activation)return;
+        bounded_delay=true;target_ms=now+delay;last_ms=now;
+    }
+    bool owns_bounded_delay(uint64_t id,int64_t target,int shown,uint64_t count,double rate,int64_t now) const {
+        return bounded_delay&&activation&&id==activation&&target==target_ms&&shown==canvas&&
+            count==draws&&rate==scale&&std::isfinite(rate)&&rate>=1.0&&now>=last_ms;
     }
 };

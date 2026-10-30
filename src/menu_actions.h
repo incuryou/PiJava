@@ -30,7 +30,7 @@ struct Repeat {
     }
 };
 enum class Action { Up,Down,Confirm,Back };
-enum class Result { None,DeleteGame,DeleteInstant };
+enum class Result { None,DeleteGame,DeleteInstant,InheritSave };
 struct Deletion {
     bool open=false,confirming=false;int selection=0;
     std::string path,label;
@@ -42,9 +42,10 @@ struct Deletion {
         if(!open)return Result::None;
         if(action==Action::Back){if(confirming)confirming=false;else open=false;}
         else if(action==Action::Confirm){
-            if(!confirming)confirming=true;
+            if(selection==2){open=false;return Result::InheritSave;}
+            else if(!confirming)confirming=true;
             else{open=false;return selection==0?Result::DeleteGame:Result::DeleteInstant;}
-        }else if(!confirming)selection=1-selection;
+        }else if(!confirming)selection=move(selection,action==Action::Up?-1:1,3);
         return Result::None;
     }
 };

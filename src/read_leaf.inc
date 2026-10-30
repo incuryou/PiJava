@@ -37,11 +37,62 @@ static bool classify_read_leaf(const Method& m) {
     return true;
 #endif
 }
+// Two exact read-only bodies avoid scratch-vector/frame setup. All declines
+// retain the generic interpreter below; neither arguments nor output change.
+static bool execute_read_leaf_fused(Method* m,const Value* args,int count,unsigned budget,Value& result,unsigned& executed) {
+#ifdef J2ME_P61_PROF
+    return false;
+#else
+    if(!m||!args||m->class_id<0||size_t(m->class_id)>=VMS_CL(g_classes).size())return false;
+    const auto& b=m->code;
+    const bool field=b.size()==5&&b[0]==42&&b[1]==180&&(b[4]==172||b[4]==176)&&count==1&&m->desc.size()>=3&&m->desc[0]=='('&&m->desc[1]==')';
+    const bool short_mask=(b.size()==10||b.size()==11)&&b[0]==42&&b[1]==180&&b[4]==27&&b[5]==53&&
+        ((b.size()==10&&b[6]==18&&b[8]==126&&b[9]==172)||(b.size()==11&&b[6]==19&&b[9]==126&&b[10]==172))&&count==2&&m->desc=="(I)I";
+    const unsigned cost=field?3:7;
+    if((!field&&!short_mask)||budget<cost||m->quick.size()<2)return false;
+    const auto& q=m->quick[1];
+    if(q.kind!=1||q.a<0||size_t(q.a)>=VMS_CL(g_classes).size()||q.b<0)return false;
+    const int self=args[0].ref;
+    if(self<=0||size_t(self)>=VMS_HEAP(g_heap).size())return false;
+    const auto& object=VMS_HEAP(g_heap)[self];
+    // Inherited receivers retain the general path; dispatch has already chosen
+    // the actual method, and no speculative call-site/JIT receiver is cached.
+    if(object.is_array||object.cls!=m->class_id||size_t(q.b)>=object.fields.size())return false;
+    const auto& cp=VMS_CL(g_classes)[m->class_id].cp;
+    const unsigned index=(unsigned(b[2])<<8)|b[3];
+    auto tagged=[&](int i,int tag){return i>0&&size_t(i)<cp.size()&&cp[size_t(i)].tag==tag;};
+    if(!tagged(int(index),9))return false;
+    const auto& ref=cp[index];
+    if(!tagged(ref.a,7)||!tagged(ref.b,12))return false;
+    const auto& nt=cp[size_t(ref.b)];
+    if(!tagged(cp[size_t(ref.a)].a,1)||!tagged(nt.a,1)||!tagged(nt.b,1))return false;
+    const auto& type=cp[size_t(nt.b)].utf;const Value value=object.fields[size_t(q.b)];
+    if(field) {
+        auto integral=[](char c){return c=='I'||c=='B'||c=='C'||c=='S'||c=='Z';};
+        const bool integer=type.size()==1&&integral(type[0]);
+        const bool reference=!type.empty()&&(type[0]=='L'||type[0]=='[');
+        const char returned=m->desc[2];
+        if(value.is_long||(b[4]==172?(!integer||!integral(returned)):(!reference||(returned!='L'&&returned!='['))))return false;
+        result=value;
+    } else {
+        if(type!="[S"||value.i||value.l||value.is_long||args[1].ref||args[1].l||args[1].is_long)return false;
+        const unsigned mask=b[6]==18?b[7]:(unsigned(b[7])<<8)|b[8];
+        if(!tagged(int(mask),3)||cp[mask].a!=65535)return false;
+        const int array=value.ref,at=args[1].i;
+        if(array<=0||size_t(array)>=VMS_HEAP(g_heap).size()||at<0)return false;
+        const auto& source=VMS_HEAP(g_heap)[array];
+        if(!source.is_array||source.array_desc!="[S"||size_t(at)>=source.elems.size()||source.elems.payload_bytes()!=source.elems.size()*2)return false;
+        result=Value::of_i(source.elems.get(size_t(at)).i&65535);
+    }
+    executed=cost;return true;
+#endif
+}
 static bool execute_read_leaf(Method* m,const Value* args,int count,unsigned budget,Value& result,unsigned& executed) {
     executed=0;
     if(!m || count<1 || count>8 || !budget)return false;
     if(!m->read_leaf_kind)m->read_leaf_kind=classify_read_leaf(*m)?1:2;
     if(m->read_leaf_kind!=1)return false;
+    if(execute_read_leaf_fused(m,args,count,budget,result,executed)){++m->read_leaf_calls;return true;}
     struct Scratch {std::vector<Value> locals,stack;};
     static thread_local Scratch scratch;
     Frame frame;frame.method=m;frame.locals.swap(scratch.locals);frame.stack.swap(scratch.stack);

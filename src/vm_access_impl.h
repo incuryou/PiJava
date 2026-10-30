@@ -104,6 +104,7 @@ static inline std::deque<Obj>& heap_g_heap() noexcept { return J2ME_VMS_ROUTE(he
 static inline std::vector<int>& heap_g_free() noexcept { return J2ME_VMS_ROUTE(heap, g_free); }
 static inline std::vector<std::pair<std::vector<Frame>*, JavaThreadContext*>>& heap_g_root_stacks() noexcept { return J2ME_VMS_ROUTE(heap, g_root_stacks); }
 static inline FrameBufferPool<Value>& heap_g_frame_buffer_pool() noexcept { return J2ME_VMS_ROUTE(heap, g_frame_buffer_pool); }
+static inline PrimitiveBufferPool& heap_g_primitive_buffers() noexcept { return J2ME_VMS_ROUTE(heap, g_primitive_buffers); }
 static inline std::ofstream& platform_g_log() noexcept { return J2ME_VMS_ROUTE(platform, g_log); }
 static inline int64_t& platform_g_boot_ms() noexcept { return J2ME_VMS_ROUTE(platform, g_boot_ms); }
 static inline bool& platform_g_host_frozen236() noexcept { return J2ME_VMS_ROUTE(platform, g_host_frozen236); }

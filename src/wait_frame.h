@@ -7,8 +7,8 @@
 // elapsed=clock-start; if(elapsed<P) synchronized(this){wait(P-elapsed);}.
 // Conditional waits, arbitrary timeouts and repeated waits do not qualify.
 struct FrameWaitValue {
-    int local=-1, field=0;
-    bool same(const FrameWaitValue& x) const {return local==x.local&&field==x.field;}
+    int local=-1, field=0, static_field=0;
+    bool same(const FrameWaitValue& x) const {return local==x.local&&field==x.field&&static_field==x.static_field;}
 };
 struct FrameWaitPattern {
     int start_pc=-1,end_pc=-1,wait_pc=-1,repaint_pc=-1;
@@ -105,6 +105,119 @@ FrameWaitPattern recognize_frame_wait(const std::vector<uint8_t>& code,int clock
         }
         if(!loops||!byte(ready,0xb8)||ready+2>=size||!is_yield(cp(ready+1)))return {};
         result.end_pc=end;return result;
+    }
+    return {};
+}
+
+// Static timestamps with the comparison inside the drawing Canvas's monitor:
+// start=clock; work; elapsed=clock-start;
+// synchronized(this){if(elapsed<P)wait(P-elapsed);else wait(short_overtime);}.
+// Only the remainder arm earns frame pacing. Work may contain loops/switches;
+// every edge is decoded and none may enter the timestamp/wait tail midway.
+template<class OpLength,class IsClock,class IsWait,class FieldKey,class LongConstant,class SafeHandlers>
+FrameWaitPattern recognize_static_frame_wait(const std::vector<uint8_t>& code,int clock_pc,
+    OpLength length,IsClock is_clock,IsWait is_wait,FieldKey field_key,LongConstant constant,SafeHandlers safe_handlers) {
+    const int size=int(code.size());
+    auto byte=[&](int p,int op){return p>=0&&p<size&&code[size_t(p)]==op;};
+    auto cp=[&](int p){return p>=0&&p+1<size?(int(code[size_t(p)])<<8)|code[size_t(p+1)]:0;};
+    auto i32=[&](int p){return int32_t((uint32_t(cp(p))<<16)|uint32_t(cp(p+2)));};
+    auto jump=[&](int p){return p+int16_t(cp(p+1));};
+    auto local=[&](int& p,int generic,int compact) {
+        if(p<0||p>=size)return -1;
+        if(byte(p,generic)&&p+1<size){p+=2;return int(code[size_t(p-1)]);}
+        if(code[size_t(p)]>=compact&&code[size_t(p)]<compact+4)return int(code[size_t(p++)])-compact;
+        return -1;
+    };
+    auto number=[&](int& p)->int64_t {
+        if(byte(p,0x09)||byte(p,0x0a))return code[size_t(p++)]-0x09;
+        if(byte(p,0x14)&&p+2<size){const auto value=constant(cp(p+1));p+=3;return value;}
+        return -1;
+    };
+    if(!byte(clock_pc,0xb8)||!is_clock(cp(clock_pc+1))||!byte(clock_pc+3,0xb3))return {};
+    const int anchor_cp=cp(clock_pc+4);const int64_t anchor_key=field_key(anchor_cp);
+    if(anchor_key<=0)return {};
+    const int work_begin=clock_pc+6;
+    std::vector<int> boundaries(size_t(size),0);
+    std::vector<std::pair<int,int>> edges;
+    for(int p=0;p<size;) {
+        const int len=length(code,size_t(p)),op=code[size_t(p)];
+        if(len<=0||len>size-p)return {};
+        boundaries[size_t(p)]=len;
+        if((op>=0x99&&op<=0xa7)||op==0xc6||op==0xc7)edges.emplace_back(p,jump(p));
+        else if(op==0xaa||op==0xab) {
+            int q=(p+4)&~3;
+            if(q+7>=size||(op==0xaa&&q+11>=size))return {};
+            auto edge=[&](int at) {
+                if(at<0||at+3>=size)return false;
+                const int64_t target=int64_t(p)+i32(at);
+                if(target<0||target>=size)return false;
+                edges.emplace_back(p,int(target));return true;
+            };
+            if(!edge(q))return {};
+            const int64_t count=op==0xaa?int64_t(i32(q+8))-i32(q+4)+1:i32(q+4);
+            if(count<0||count>size)return {};
+            q+=op==0xaa?12:8;
+            for(int n=0;n<count;++n)if(!edge(q+n*(op==0xaa?4:8)+(op==0xaa?0:4)))return {};
+        } else if(op==0xa8||op==0xa9||op==0xc8||op==0xc9)return {};
+        p+=len;
+    }
+    if(clock_pc<0||clock_pc>=size||!boundaries[size_t(clock_pc)])return {};
+    for(const auto& edge:edges)if(edge.second<0||edge.second>=size||!boundaries[size_t(edge.second)])return {};
+    for(int end=work_begin;end<size;end+=boundaries[size_t(end)]) {
+        const int op=code[size_t(end)];
+        if(byte(end,0xb8)&&is_clock(cp(end+1))&&byte(end+3,0xb2)&&field_key(cp(end+4))==anchor_key&&
+           byte(end+6,0x65)&&byte(end+7,0xb3)) {
+            FrameWaitPattern result;result.start_pc=clock_pc;result.end_pc=end;
+            result.start.static_field=anchor_cp;result.elapsed.static_field=cp(end+8);
+            const int64_t elapsed_key=field_key(result.elapsed.static_field);
+            if(elapsed_key<=0||elapsed_key==anchor_key)return {};
+            auto load_elapsed=[&](int& q) {
+                if(!byte(q,0xb2)||field_key(cp(q+1))!=elapsed_key)return false;
+                q+=3;return true;
+            };
+            int q=end+10;
+            if(!byte(q++,0x2a)||!byte(q++,0x59))return {};
+            const int lock=local(q,0x3a,0x4b),enter=q;
+            if(lock<0||!byte(q++,0xc2)||!load_elapsed(q))return {};
+            result.period_ms=number(q);
+            if(result.period_ms<8||result.period_ms>120||!byte(q++,0x94)||!byte(q,0x9c))return {};
+            const int condition=q,overtime=jump(q);q+=3;
+            if(!byte(q++,0x2a)||number(q)!=result.period_ms||!load_elapsed(q)||!byte(q++,0x65)||
+               !byte(q,0xb6)||!is_wait(cp(q+1)))return {};
+            result.wait_pc=q;q+=3;
+            if(!byte(q,0xa7))return {};
+            const int remainder_exit=q,join=jump(q);q+=3;
+            if(q!=overtime||!byte(q++,0x2a))return {};
+            const int64_t floor=number(q);
+            if(floor<1||floor>7||!byte(q,0xb6)||!is_wait(cp(q+1)))return {};
+            q+=3;
+            if(q!=join||local(q,0x19,0x2a)!=lock)return {};
+            const int leave=q;if(!byte(q++,0xc3))return {};
+            std::vector<int> tail_branches{condition,remainder_exit};
+            int tail_end=-1;
+            for(int n=0;n<5;++n) {
+                if(!byte(q,0xa7)||q+2>=size)return {};
+                tail_branches.push_back(q);const int target=jump(q);
+                if(target>=0&&target<=clock_pc){tail_end=q+3;break;}
+                if(target<=q||target>=size||!boundaries[size_t(target)])return {};
+                q=target;
+            }
+            if(tail_end<0||!safe_handlers(clock_pc,tail_end,enter,leave,lock))return {};
+            for(const auto& edge:edges) {
+                const int from=edge.first,to=edge.second;
+                if(from>=work_begin&&from<end) {
+                    if(to<work_begin||to>end)return {};
+                } else if(from>=end&&from<tail_end) {
+                    if(std::find(tail_branches.begin(),tail_branches.end(),from)==tail_branches.end())return {};
+                } else if(to>clock_pc&&to<tail_end)return {};
+            }
+            return result;
+        }
+        // Explicit timestamp rewrites, monitor/condition waits and abnormal
+        // work exits cannot silently become frame timing evidence.
+        if(op==0xb3) {const auto key=field_key(cp(end+1));if(key<0||key==anchor_key)return {};}
+        if((op>=0xac&&op<=0xb1)||op==0xbf||op==0xc2||op==0xc3||op==0xc4||
+           (op==0xb6&&is_wait(cp(end+1))))return {};
     }
     return {};
 }

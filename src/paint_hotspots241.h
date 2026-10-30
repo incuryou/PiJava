@@ -1,5 +1,6 @@
 #pragma once
 #include "vm_rs_fallback.h"
+#include "runtime_profile.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Fixed-space checkpoint sampler. No per-bytecode clock or allocation, and no
 // Java callbacks, GC roots or yield policy changes. Sampling is biased toward
@@ -7,7 +8,7 @@
 namespace paint_hotspots241 {
 constexpr size_t Capacity=64;
 struct Hit {Method* method=nullptr;Method* caller=nullptr;Method* phase=nullptr;uint64_t count=0;int pc=0;};
-struct Snapshot {Hit hits[Capacity];size_t used=0;uint64_t samples=0,dropped=0;int64_t wall_us=0;};
+struct Snapshot {Hit hits[Capacity];size_t used=0;uint64_t samples=0,dropped=0;int64_t wall_us=0;RuntimePaintAttribution attribution;};
  VMS_RS_NSREF(vms_ref_current, current, Snapshot) VMS_RS_NSREF(vms_ref_pending, pending, Snapshot)
  VMS_RS_NSREF(vms_ref_active, active, bool) VMS_RS_NSREF(vms_ref_have_pending, have_pending, bool)
  VMS_RS_NSREF(vms_ref_paints, paints, uint64_t) VMS_RS_NSREF(vms_ref_slow_paints, slow_paints, uint64_t) VMS_RS_NSREF(vms_ref_total_samples, total_samples, uint64_t) VMS_RS_NSREF(vms_ref_omitted_slow, omitted_slow, uint64_t)
@@ -39,8 +40,8 @@ static void sample_worker(const std::vector<Frame>& stack){
     if(worker.used==Capacity){++worker.dropped;return;}
     worker.hits[worker.used++]={m,caller,nullptr,1,stack.back().pc};
 }
-static void finish(int64_t wall_us){
-    if(!active)return;active=false;++paints;current.wall_us=std::max<int64_t>(0,wall_us);
+static void finish(int64_t wall_us,const RuntimePaintAttribution& attribution={}){
+    if(!active)return;active=false;++paints;current.wall_us=std::max<int64_t>(0,wall_us);current.attribution=attribution;
     longest_us=std::max(longest_us,current.wall_us);
     if(current.wall_us<50000)return;
     ++slow_paints;
@@ -65,6 +66,11 @@ static void report(){
     std::sort(pending.hits,pending.hits+pending.used,[](const Hit& a,const Hit& b){return a.count>b.count;});
     log_line("PAINTSLOW schema=1 wall_us="+std::to_string(pending.wall_us)+" samples="+std::to_string(pending.samples)+
         " overflow_samples="+std::to_string(pending.dropped)+" unique_sites="+std::to_string(pending.used)+
+        " cpu_ns="+std::to_string(pending.attribution.cpu_ns)+" worker_scope="+std::to_string(pending.attribution.worker)+
+        " observed_capwait_us="+std::to_string(pending.attribution.waits.cap_us)+" observed_capwait_count="+std::to_string(pending.attribution.waits.cap_count)+
+        " observed_pollwait_us="+std::to_string(pending.attribution.waits.poll_us)+" observed_pollwait_count="+std::to_string(pending.attribution.waits.poll_count)+
+        " observed_nativewait_us="+std::to_string(pending.attribution.waits.native_us)+" observed_nativewait_count="+std::to_string(pending.attribution.waits.native_count)+
+        " observed_waits_exclusive=0 observed_waits_cover_OS_IO=0 cpu_scope=paint_inclusive_on_host_thread cpu_unavailable=-1"+
         " selection=longest_since_report native_time=not_attributed logic_fps=unavailable");
     for(size_t i=0;i<std::min<size_t>(8,pending.used);++i){const auto& h=pending.hits[i];
         log_line("PAINTHOT rank="+std::to_string(i+1)+" samples="+std::to_string(h.count)+" pc="+std::to_string(h.pc)+

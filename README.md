@@ -6,13 +6,35 @@
 
 [下载 NRO / NSP](https://github.com/incuryou/PiJava/releases/latest) · [English](README.en.md) · [构建](docs/BUILDING.md) · [使用](docs/USAGE.md) · [架构与路线](docs/ROADMAP.md) · [许可](THIRD_PARTY.md)
 
-当前发布：**KeyUI6 / GPUF5 / Save1**。程序内部构建标识沿用 `0.2.114-keyui5-gpuf5-save1`，NACP 短版本为 `0.2.114-k5-sv1`；KeyUI6 表示映射界面的后续布局修订。仓库地址保留 `incuryou/PiJava`，项目展示名称为 **Pi Java模拟器**。
+当前发布：**Fit30 / KeyUI7 / GPUF5**。构建标识 `0.2.114-keyui7-gpuf5-fit30`，NACP `0.2.114-k7-f30`。应用 Title ID 沿用 `05004A324D450000`。
+
+[下载 Fit30](https://github.com/incuryou/PiJava/releases/tag/v0.2.114-keyui7-gpuf5-fit30) · [Fit30 变更与验证](docs/FIT30.md)
 
 项目以 C++17 实现 VM 和宿主功能，附带 Java 类库与所需字体、皮肤及着色器资源。Switch 是主要平台，Linux 桌面入口用于无窗口开发诊断。兼容性仍需逐游戏验证，能启动不等于全部关卡、音频与存档都通过。
 
-## 本次新增与调整
+## Fit30 更新
 
-- **KeyUI6 映射界面**：删除手机参考图片及其加载/高亮代码，将手机键网格、Pro 手柄预览和映射槽居中排列；保留实时映射预览、长按循环、未绑定留空和现有按键操作。
+- 保留此前绘图查询直达、标准流字段缓存和完整椭圆绘制改进。
+- 为两种通用只读取值方法省去重复解释准备，保持原操作预算和异常回退。
+- 补齐同一次慢 paint 的 CPU／等待诊断，不修改游戏主动等待、时钟倍率或存档格式。
+- 受控原版精灵回放 CPU 改善中位数约1.6%；不是实体 Switch 整局帧率结论，也不保证所有游戏60帧。
+
+## 运行画面
+
+以下两张带遮罩画面截自用户提供的视频（00:01:16.131、00:03:34.554）。视频版本未核定，属于界面展示，不作为 Fit30 或实体 Switch 性能证据。
+
+![带遮罩运行画面1](docs/screenshots/fit30/video-mask-01.png)
+![带遮罩运行画面2](docs/screenshots/fit30/video-mask-02.png)
+
+下面是 Fit30 的主机 VM 正常按键回放，仅显示游戏画面，不是实体 Switch 截图。
+
+| 蜘蛛侠 | 刺客信条兄弟会 | 生化惊悚2 |
+|---|---|---|
+| ![蜘蛛侠](docs/screenshots/fit30/spider-host.png) | ![刺客信条](docs/screenshots/fit30/assassin-host.png) | ![生化惊悚2](docs/screenshots/fit30/biohazard2-host.png) |
+
+## 保留的功能
+
+- **按键映射界面**：删除手机参考图片及其加载/高亮代码，将手机键网格、Pro 手柄预览和映射槽居中排列；保留实时映射预览、长按循环、未绑定留空和现有按键操作。
 - **GPUF5 五种 GPU 滤镜**：双线性、Scale2x、LCD、CRT、ScanlinesDX 自动选择 GPU；关闭滤镜时使用 CPU 呈现。包含显示槽、fence、缓存失效与可恢复的 CPU 后备路径。
 - **Save1 跨章节存档继承**：在游戏列表选中下一章，按 Y 选择上一章，将游戏内 RMS 存档显式复制到目标，并备份目标旧目录；不修改来源，不自动转换游戏私有存档格式，不跨 JAR 继承即时存档。
 - **统一应用图标**：NRO 与 NSP 均使用新的 Pi Java 图标。
@@ -34,9 +56,9 @@
 
 ## 下载与使用
 
-请在 [Releases](https://github.com/incuryou/PiJava/releases/latest) 下载最新 `.nro` 或 `.nsp`，按自己的自制软件运行环境使用。二者是本次提交的现成构建，未在公开整理时重编译；NSP 为独立应用包。游戏、用户 RMS、即时存档、密钥及 SDK 均不随仓库或 Release 分发。
+请在 [Releases](https://github.com/incuryou/PiJava/releases/latest) 下载最新 `.nro` 或 `.nsp`，按自己的自制软件运行环境使用。Fit30使用已校验的同源构建；NSP为独立应用包。游戏、用户 RMS、即时存档、密钥及 SDK 均不随仓库或 Release 分发。
 
-本版交付报告记录了构建、针对性检查及 20 款游戏的短时抽样；这不代表全部游戏、完整关卡或设备性能验收。公开发布时核对了输入哈希、NRO 内嵌资源与源码一致性，以及 NSP 容器和内容 ID；没有新增实体 Switch 安装启动验收。更多使用和备份事项见[使用说明](docs/USAGE.md)。
+Fit30完成64条组合主机检查、九项原版游戏短场景检查及NSP内容校验。短检查不能代替完整关卡或实体Switch性能验收；详见[Fit30报告](docs/FIT30.md)。
 
 ## 从源码构建
 
@@ -52,7 +74,7 @@ DEVKITPRO=/opt/devkitpro python3 -B tools/build.py --switch --frozen-java
 
 需要重编 Java 类库时可去掉 `--frozen-java`。着色器从 `shaders/` 离线编译；构建所需完整依赖见[构建文档](docs/BUILDING.md)。
 
-公开树仅包含生产源码、构建工具、必需资源、许可证和说明；测试类、测试报告、运行日志、测试截图、样例游戏与私有 CI 未上传。`romfs/classes/` 是运行时 Java 类库，不是游戏测试类。
+公开树保留生产源码、构建工具、必需资源、许可证、说明及选定展示截图。完整Fit30源码包另含回归夹具；原始用户日志、商业游戏、存档、密钥和私有CI不上传。`romfs/classes/` 是运行时 Java 类库，不是游戏测试类。
 
 ## 后续计划
 

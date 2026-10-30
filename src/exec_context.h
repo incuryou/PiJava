@@ -11,9 +11,16 @@ struct ExecutionContext {
     int g_run_depth = 0;
     int g_pump_depth = 0;
     int g_repaint_owner_ref = 0;
+    // Transient owner of a serialized MIDP event callback. The callback's
+    // own synchronous paint is allowed; a foreign worker must wait for it.
+    JavaThreadContext* event_callback_owner = nullptr;
+    // The actual in-progress paint receiver can differ from g_current if
+    // paint itself changes the Display. Transient; rooted by repaint_current.
+    int active_paint_canvas = 0;
     // At most one coalesced repaint has an async timed-wait certificate.
     // A Java ref, rather than a host pointer, survives scheduler reentry.
     int frame_wait_request_owner = 0;
+    int64_t native_poll_host_deadline_us = 0; // transient enclosing worker budget, never serialized
     int g_repaint_owner_yields = 0;
     int g_repaint_yield_canvas = 0;
     bool g_repaint_yield_handoff = false;

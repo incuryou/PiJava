@@ -4,16 +4,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string_view>
 #include <vector>
 
 namespace j2me_runtime {
 // A derived index, not an owning Java collection. Slots contain immutable scalar
-// values and original dense-array positions. Original Java arrays remain the
+// values/hashes and original dense-array positions. Original Java arrays remain the
 // sole authority for contents/order, synchronization, enumeration and snapshots.
 struct ScalarKey {
+    static constexpr uint32_t string_kind = 10;
     uint64_t value = 0;
     uint32_t kind = 0;
-    bool operator==(const ScalarKey& b) const { return value==b.value && kind==b.kind; }
+    // Borrowed for this find call only; slots never retain a String pointer.
+    std::string_view text;
+    bool operator==(const ScalarKey& b) const {
+        return value==b.value && kind==b.kind && (kind!=string_kind || text==b.text);
+    }
 };
 class LibraryIndex {
     struct Slot { uint64_t value=0; uint32_t kind=0; uint32_t position=0; };
@@ -24,7 +30,7 @@ class LibraryIndex {
     };
 public:
     struct Stats { uint64_t lookups=0,hits=0,rebuilds=0,appended=0,fallbacks=0,probes=0; };
-    static constexpr size_t max_tables=32, max_keys=16384, budget=2*1024*1024;
+    static constexpr size_t max_tables=32, max_keys=16384, budget=2*1024*1024, max_string_bytes=1024;
     static constexpr int fallback=-2;
     size_t retained_bytes() const { size_t n=0;for(const auto& t:tables_)n+=t.slots.capacity()*sizeof(Slot);return n; }
     size_t byte_budget() const { return budget; }
@@ -55,7 +61,7 @@ public:
             if(append){
                 ScalarKey k;
                 if(!read(count-1,k)||!k.kind){reject(*t,count,version,key_epoch);++stats_.fallbacks;return fallback;}
-                insert(*t,k,uint32_t(count-1));++stats_.appended;
+                if(!insert(*t,k,uint32_t(count-1),read)){reject(*t,count,version,key_epoch);++stats_.fallbacks;return fallback;}++stats_.appended;
             }else{
                 size_t capacity=2;while(capacity<count*2)capacity*=2;
                 // Account vector capacity, not size; evict before allocation.
@@ -70,7 +76,7 @@ public:
                 for(size_t i=0;i<count;++i){
                     ScalarKey k;
                     if(!read(i,k)||!k.kind){reject(*t,count,version,key_epoch);++stats_.fallbacks;return fallback;}
-                    insert(*t,k,uint32_t(i));
+                    if(!insert(*t,k,uint32_t(i),read)){reject(*t,count,version,key_epoch);++stats_.fallbacks;return fallback;}
                 }
                 ++stats_.rebuilds;
             }
@@ -80,7 +86,12 @@ public:
         for(size_t probes=0;probes<t->slots.size();++probes,at=(at+1)&mask){
             ++stats_.probes;const auto& slot=t->slots[at];
             if(!slot.kind)return -1;
-            if(slot.kind==key.kind&&slot.value==key.value)return int(slot.position);
+            if(slot.kind==key.kind&&slot.value==key.value){
+                if(key.kind!=ScalarKey::string_kind)return int(slot.position);
+                ScalarKey stored;
+                if(!read(slot.position,stored)){reject(*t,count,version,key_epoch);++stats_.fallbacks;return fallback;}
+                if(stored==key)return int(slot.position);
+            }
         }
         ++stats_.fallbacks;return fallback; // Cannot happen at <=50% load; fail closed.
     }
@@ -89,15 +100,21 @@ private:
         uint64_t x=key.value^(uint64_t(key.kind)*0x9e3779b97f4a7c15ULL);
         x^=x>>30;x*=0xbf58476d1ce4e5b9ULL;x^=x>>27;x*=0x94d049bb133111ebULL;return x^(x>>31);
     }
-    static void insert(Table& t,const ScalarKey& key,uint32_t index){
+    template<class Reader>
+    static bool insert(Table& t,const ScalarKey& key,uint32_t index,Reader& read){
         const size_t mask=t.slots.size()-1;size_t at=hash(key)&mask;
         for(size_t n=0;n<t.slots.size();++n,at=(at+1)&mask){
             auto& s=t.slots[at];
-            if(!s.kind){s={key.value,key.kind,index};return;}
+            if(!s.kind){s={key.value,key.kind,index};return true;}
             // Dense legacy semantics choose the FIRST equal key even if malformed
             // input arrays contain duplicates. Never overwrite that position.
-            if(s.kind==key.kind&&s.value==key.value)return;
+            if(s.kind==key.kind&&s.value==key.value){
+                if(key.kind!=ScalarKey::string_kind)return true;
+                ScalarKey stored;if(!read(s.position,stored))return false;
+                if(stored==key)return true;
+            }
         }
+        return false;
     }
     static void reject(Table& t,size_t count,uint64_t version,uint64_t epoch){
         std::vector<Slot>().swap(t.slots);t.count=count;t.version=version;t.key_epoch=epoch;t.valid=false;t.rejected=true;

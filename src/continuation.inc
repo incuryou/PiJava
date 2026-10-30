@@ -55,7 +55,7 @@ static void cont_run_serial(int ref, size_t queue_size_before_pop){
     if(!m){ c.phase=ContPhase::Completed; ++g_cont.completed; return; }
     c.phase=ContPhase::Running; g_cont.running.push_back(&c);
     const int unhandled_before=current_context().unhandled;
-    c.result=run(m,{Value::of_ref(ref)});
+    c.result=run_event_callback(m,{Value::of_ref(ref)});
     g_cont.running.pop_back();
     if(current_context().unhandled && current_context().unhandled!=unhandled_before){ c.pendingException=current_context().unhandled; c.phase=ContPhase::Faulted; ++g_cont.faulted; }
     else { c.phase=ContPhase::Completed; ++g_cont.completed; }

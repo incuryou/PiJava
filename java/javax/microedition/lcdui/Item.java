@@ -8,7 +8,7 @@ public class Item {
     String label;
     Displayable owner;
     private int layout;
-    private int preferredWidth = -1, preferredHeight = -1;
+    int preferredWidth = -1, preferredHeight = -1;
     private Command[] commands = new Command[4];
     private int commandCount;
     private Command defaultCommand;
