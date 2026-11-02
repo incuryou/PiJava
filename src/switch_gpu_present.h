@@ -13,9 +13,15 @@
 #include "presentation/viewport.h"
 #include "presentation/gpu_filter_assets.h"
 #include "suite_identity.h"
+#include "switch_m3g_gpu.h"
 
 class SwitchGpuPresent {
 public:
+    enum class Stage {Begin,Acquire,AcquireDone,Fence,Upload,Commands,Submit,Present,Done,Finish,Close};
+    using StageCallback=void(*)(Stage);
+    // Configure before this presenter/its owner starts. Optional number-only
+    // observation; no callback is installed by standalone/backend callers.
+    void set_stage_callback(StageCallback callback){stage_callback_=callback;}
     struct Timings {
         uint64_t acquire_wait_us=0,gpu_wait_us=0,upload_us=0;
         uint64_t acquire_before_present_us=0;
@@ -31,8 +37,9 @@ public:
         if(ready_)return true;close();if(!window)window=nwindowGetDefault();
         if(!window||!nwindowIsValid(window))return false;
         DkDeviceMaker dm;dkDeviceMakerDefaults(&dm);device_=dkDeviceCreate(&dm);if(!device_)return fail();
-        DkQueueMaker qm;dkQueueMakerDefaults(&qm,device_);qm.flags=DkQueueFlags_Graphics|DkQueueFlags_DisableZcull;
+        DkQueueMaker qm;dkQueueMakerDefaults(&qm,device_);qm.flags=DkQueueFlags_Graphics|DkQueueFlags_Compute|DkQueueFlags_DisableZcull;
         queue_=dkQueueCreate(&qm);if(!queue_)return fail();
+        m3gGpu_.attach(device_,queue_);
         if(!loadShader("romfs:/shaders/filter.vert.dksh",vertexCode_,vertexShader_,j2me_present::gpu_filter::vert_asset)||
            !loadShader("romfs:/shaders/filter.frag.dksh",fragmentCode_,fragmentShader_,j2me_present::gpu_filter::frag_asset))return fail();
         gainsMemory_=memory(kGainsBytes,DkMemBlockFlags_CpuCached|DkMemBlockFlags_GpuCached);
@@ -75,7 +82,9 @@ public:
     bool acquire_frame(){
         if(!ready_||dkQueueIsInErrorState(queue_))return false;
         if(acquired_index_>=0)return true;
+        trace(Stage::Acquire);
         const auto start=Clock::now();const int index=dkQueueAcquireImage(queue_,swapchain_);
+        trace(Stage::AcquireDone);
         acquired_wait_us_=elapsed(start);
         if(index<0||index>=int(kSlots)||dkQueueIsInErrorState(queue_))return false;
         acquired_index_=index;return true;
@@ -86,9 +95,11 @@ public:
     bool present_layers(const uint8_t* canvas,uint64_t generation,const uint8_t* game=nullptr,
                         const uint32_t* raw=nullptr,const j2me_present::gpu_filter::FrameKey* key=nullptr,
                         const j2me_present::Viewport* overlay=nullptr){
+        trace(Stage::Begin);
+        struct EndStage{StageCallback callback;~EndStage(){if(callback)callback(Stage::Done);}} end_stage{stage_callback_};
         timings_={};if(!ready_||!canvas||(overlay&&!j2me_present::valid_viewport(*overlay)))return false;
         if(raw){
-            if(game||!key||!j2me_present::gpu_filter::supported(key->filter)||!logical_screen::valid_extent(key->w,key->h)||
+            if(game||!key||!display_filter::valid(key->filter)||!logical_screen::valid_extent(key->w,key->h)||
                raw[0]!=unsigned(key->w)||raw[1]!=unsigned(key->h)||raw[2]!=unsigned(key->filter)||raw[3]!=(key->adaptive?1u:0u))return false;
         }else invalidate_game();
         const bool acquired_before=acquired_index_>=0;
@@ -99,8 +110,10 @@ public:
         auto& s=slots_[index];auto start=Clock::now();
         // Never mutate staging bytes or command memory still referenced by GPU.
         // Wait only for the reused slot, NOT for every queued frame to go idle.
+        trace(Stage::Fence);
         if(s.pending && dkFenceWait(&s.fence,1000000000LL)!=DkResult_Success)return false;
         timings_.gpu_wait_us=elapsed(start);s.pending=false;start=Clock::now();
+        trace(Stage::Upload);
         if(s.generation.needs_upload(generation)){
             std::memcpy(s.staging+chromeOffset_,canvas,kChromeBytes);
             if(dkMemBlockFlushCpuCache(s.stagingMemory,chromeOffset_,kChromeBytes)!=DkResult_Success)return false;
@@ -114,7 +127,7 @@ public:
             if(dkMemBlockFlushCpuCache(s.inputMemory,0,bytes)!=DkResult_Success)return false;
             s.frame.committed(*key);timings_.frame_upload_bytes=bytes;
         }
-        timings_.upload_us=elapsed(start);dkCmdBufClear(s.commands);
+        timings_.upload_us=elapsed(start);trace(Stage::Commands);dkCmdBufClear(s.commands);
         DkImageView chromeView,gameView,outView;dkImageViewDefaults(&chromeView,&s.chrome);
         dkImageViewDefaults(&gameView,&s.game);dkImageViewDefaults(&outView,&s.output);
         const DkImageRect canvasRect={0,0,0,j2me_present::output_w,j2me_present::output_h,1};
@@ -132,14 +145,23 @@ public:
             dkCmdBufBlitImage(s.commands,&chromeView,&rect,&outView,&rect,flags,0);
         }
         dkCmdBufBarrier(s.commands,DkBarrier_Full,0);dkCmdBufSignalFence(s.commands,&s.fence,true);
-        dkQueueSubmitCommands(queue_,dkCmdBufFinishList(s.commands));s.pending=true;
-        dkQueuePresentImage(queue_,swapchain_,index);return !dkQueueIsInErrorState(queue_);
+        trace(Stage::Submit);dkQueueSubmitCommands(queue_,dkCmdBufFinishList(s.commands));s.pending=true;
+        trace(Stage::Present);dkQueuePresentImage(queue_,swapchain_,index);return !dkQueueIsInErrorState(queue_);
     }
     // Invalidation changes metadata only. Memory is still written exclusively
     // after the corresponding slot fence, including transitions and restores.
     void invalidate_game(){for(auto& s:slots_)s.frame.invalidate();}
+    // Lifecycle boundary only. Normal submissions keep three GPU slots in
+    // flight; the owner CPU queue has its own independent one-pending bound.
+    bool finish(){
+        if(!ready_||!queue_)return false;
+        trace(Stage::Finish);dkQueueWaitIdle(queue_);trace(Stage::Done);
+        for(auto& s:slots_)s.pending=false;
+        return !dkQueueIsInErrorState(queue_);
+    }
     void close(){
-        ready_=false;if(queue_)dkQueueWaitIdle(queue_);
+        ready_=false;if(queue_){trace(Stage::Close);dkQueueWaitIdle(queue_);trace(Stage::Done);}
+        m3gGpu_.close();
         if(swapchain_){dkSwapchainDestroy(swapchain_);swapchain_=nullptr;}
         if(queue_){dkQueueDestroy(queue_);queue_=nullptr;}
         for(auto& s:slots_){
@@ -157,11 +179,23 @@ public:
         chromeOffset_=stagingBytes_=0;timings_={};acquired_index_=-1;acquired_wait_us_=0;
     }
     bool ready()const{return ready_;}
+    // Called exclusively by the existing render owner request dispatcher.
+    m3g_gpu::GeometryResult execute_geometry(const m3g_gpu::GeometryRequest& q){
+        if(!ready_)return {m3g_gpu::Code::Unavailable,"present_device_unavailable",{}, {}};
+        return m3gGpu_.execute_geometry(q);
+    }
+    m3g_gpu::SkinResult execute_skin(const m3g_gpu::SkinRequest& q){
+        if(!ready_)return {m3g_gpu::Code::Unavailable,"present_device_unavailable",{}, {}};
+        return m3gGpu_.execute_skin(q);
+    }
+    const SwitchM3GGpu::Metrics& m3g_metrics()const{return m3gGpu_.metrics();}
     const Timings& lastTimings()const{return timings_;}
     uint64_t staging_bytes()const{return uint64_t(stagingBytes_+alignUp(j2me_present::gpu_filter::max_input_bytes,DK_MEMBLOCK_ALIGNMENT))*kSlots;}
 private:
+    StageCallback stage_callback_=nullptr;
+    void trace(Stage s){if(stage_callback_)stage_callback_(s);}
     using Clock=std::chrono::steady_clock;
-    enum :uint32_t{kSlots=3,kCommandBytes=65536,kGameBytes=j2me_present::game_w*j2me_present::game_h*4,kChromeBytes=j2me_present::output_w*j2me_present::output_h*4,kGainsBytes=48*64*4};
+    enum :uint32_t{kSlots=3,kCommandBytes=1048576,kGameBytes=j2me_present::game_w*j2me_present::game_h*4,kChromeBytes=j2me_present::output_w*j2me_present::output_h*4,kGainsBytes=48*64*4};
     struct Slot{
         DkCmdBuf commands=nullptr;DkMemBlock commandMemory=nullptr,stagingMemory=nullptr,outputMemory=nullptr,inputMemory=nullptr;
         DkImage game={},chrome={},output={};DkFence fence={};uint8_t* staging=nullptr;bool pending=false;
@@ -214,6 +248,7 @@ private:
     void linear(DkImageLayout& l,uint32_t w,uint32_t h){DkImageLayoutMaker m;dkImageLayoutMakerDefaults(&m,device_);m.flags=DkImageFlags_PitchLinear|DkImageFlags_Usage2DEngine;m.format=DkImageFormat_RGBA8_Unorm;m.dimensions[0]=w;m.dimensions[1]=h;m.pitchStride=w*4;dkImageLayoutInitialize(&l,&m);}
     bool fail(){close();return false;}
     Slot slots_[kSlots];DkDevice device_=nullptr;DkQueue queue_=nullptr;DkSwapchain swapchain_=nullptr;
+    SwitchM3GGpu m3gGpu_;
     DkMemBlock vertexCode_=nullptr,fragmentCode_=nullptr,gainsMemory_=nullptr;DkShader vertexShader_={},fragmentShader_={};
     uint32_t chromeOffset_=0,stagingBytes_=0;bool ready_=false;Timings timings_;
     int acquired_index_=-1;uint64_t acquired_wait_us_=0;

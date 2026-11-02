@@ -53,6 +53,34 @@ public class AffineTrans {
     }
     public final void multiply(AffineTrans a) { mul(a); }
     public final void multiply(AffineTrans a,AffineTrans b) { mul(a,b); }
+    // Internal renderer fp12 arithmetic adapted from MascotME (MIT),
+    // Copyright (c) 2026 Roman Lahin and Yury Kharchenko. See licenses/mascotme.txt.
+    // Keep its rounded arithmetic separate from the existing public mul contract.
+    final void mulA2(AffineTrans a,AffineTrans b) {
+        set(roundedDot(a.m00,a.m01,a.m02,b.m00,b.m10,b.m20),
+            roundedDot(a.m00,a.m01,a.m02,b.m01,b.m11,b.m21),
+            roundedDot(a.m00,a.m01,a.m02,b.m02,b.m12,b.m22),
+            roundedDot(a.m00,a.m01,a.m02,b.m03,b.m13,b.m23)+a.m03,
+            roundedDot(a.m10,a.m11,a.m12,b.m00,b.m10,b.m20),
+            roundedDot(a.m10,a.m11,a.m12,b.m01,b.m11,b.m21),
+            roundedDot(a.m10,a.m11,a.m12,b.m02,b.m12,b.m22),
+            roundedDot(a.m10,a.m11,a.m12,b.m03,b.m13,b.m23)+a.m13,
+            roundedDot(a.m20,a.m21,a.m22,b.m00,b.m10,b.m20),
+            roundedDot(a.m20,a.m21,a.m22,b.m01,b.m11,b.m21),
+            roundedDot(a.m20,a.m21,a.m22,b.m02,b.m12,b.m22),
+            roundedDot(a.m20,a.m21,a.m22,b.m03,b.m13,b.m23)+a.m23);
+    }
+    private static int roundedDot(int a,int b,int c,int x,int y,int z) {
+        return (int)(((long)a*x+(long)b*y+(long)c*z+2048)>>12);
+    }
+    final void scale(Vector3D v) {
+        m00=(int)(((long)m00*v.x+2048)>>12);m01=(int)(((long)m01*v.y+2048)>>12);m02=(int)(((long)m02*v.z+2048)>>12);
+        m10=(int)(((long)m10*v.x+2048)>>12);m11=(int)(((long)m11*v.y+2048)>>12);m12=(int)(((long)m12*v.z+2048)>>12);
+        m20=(int)(((long)m20*v.x+2048)>>12);m21=(int)(((long)m21*v.y+2048)>>12);m22=(int)(((long)m22*v.z+2048)>>12);
+    }
+    final boolean isIdentity() {
+        return m00==4096&&m01==0&&m02==0&&m03==0&&m10==0&&m11==4096&&m12==0&&m13==0&&m20==0&&m21==0&&m22==4096&&m23==0;
+    }
     public final void rotationX(int r) {
         int c=Util3D.sine(r+1024,4096),s=Util3D.sine(r,4096);
         set(4096,0,0,m03,0,c,-s,m13,0,s,c,m23);
@@ -80,10 +108,15 @@ public class AffineTrans {
     }
     public final void rotationV(Vector3D v,int r) { setRotation(v,r); }
     public final void lookAt(Vector3D pos,Vector3D look,Vector3D up) {
-        Vector3D forward=new Vector3D(look.x-pos.x,look.y-pos.y,look.z-pos.z);
+        // Native v3 callers supply a line-of-sight direction (often normalized
+        // to4096), independently of the camera position. This is verified by
+        // actual game call sites; the archived English "reference point" label
+        // is ambiguous. Screen Y points down, so right = forward cross up.
+        if(pos==null||look==null||up==null)throw new NullPointerException();
+        Vector3D forward=new Vector3D(look);
         if((forward.x|forward.y|forward.z)==0)throw new IllegalArgumentException();
         forward.unit();
-        Vector3D right=Vector3D.outerProduct(up,forward);
+        Vector3D right=Vector3D.outerProduct(forward,up);
         if((right.x|right.y|right.z)==0)throw new IllegalArgumentException();
         right.unit();Vector3D vertical=Vector3D.outerProduct(forward,right);vertical.unit();
         set(right.x,right.y,right.z,-dot(right.x,right.y,right.z,pos.x,pos.y,pos.z),

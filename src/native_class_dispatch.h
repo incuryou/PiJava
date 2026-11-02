@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <string>
 // A class name is immutable after loading. IDs are runtime-only, never saved.
-enum class NativeClassId : int16_t { Unresolved=-1, Other=0, C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13, C14, C15, C16, C17, C18, C19, C20, C21, C22, C23, C24, C25, C26, C27, Mesh242 };
+enum class NativeClassId : int16_t { Unresolved=-1, Other=0, C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13, C14, C15, C16, C17, C18, C19, C20, C21, C22, C23, C24, C25, C26, C27, Mesh242, Micro3D };
 inline NativeClassId native_class_id(const std::string& name) {
     if(name=="javax/microedition/m3g/Transform")return NativeClassId::C1;
     if(name=="javax/microedition/m3g/Graphics3D")return NativeClassId::C2;
@@ -32,5 +32,6 @@ inline NativeClassId native_class_id(const std::string& name) {
     if(name=="javax/microedition/midlet/MIDlet")return NativeClassId::C26;
     if(name=="javax/microedition/rms/RecordStore")return NativeClassId::C27;
     if(name=="javax/microedition/m3g/M3GMesh242")return NativeClassId::Mesh242;
+    if(name=="com/mascotcapsule/micro3d/v3/Graphics3D")return NativeClassId::Micro3D;
     return NativeClassId::Other;
 }

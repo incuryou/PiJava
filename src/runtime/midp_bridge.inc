@@ -17,6 +17,16 @@ static void call_native_impl(Method* m, Frame& fr) { P61_SCOPE(2, m);
     auto ret_ref = [&](int r) { fr.stack.push_back(Value::of_ref(r)); };
     auto ret_i = [&](int v) { fr.stack.push_back(Value::of_i(v)); };
     auto ret_l = [&](int64_t v) { fr.stack.push_back(Value::of_l(v)); };
+    if(native_match(NativeClassId::Micro3D,"com/mascotcapsule/micro3d/v3/Graphics3D")&&(m->flags&0x0008)){
+        if((name=="_targetWidth"||name=="_targetHeight")&&m->desc=="(Ljavax/microedition/lcdui/Graphics;)I")
+            ret_i(micro3d_target_dimension(arg(0).ref,name=="_targetHeight"));
+        else if(name=="_readTarget"&&m->desc=="(Ljavax/microedition/lcdui/Graphics;[I)Z")
+            ret_i(micro3d_read_target(arg(0).ref,arg(1).ref));
+        else if(name=="_writeTarget"&&m->desc=="(Ljavax/microedition/lcdui/Graphics;[IIIII)Z")
+            ret_i(micro3d_write_target(arg(0).ref,arg(1).ref,arg(2).i,arg(3).i,arg(4).i,arg(5).i));
+        else die("native Micro3D.Graphics3D."+name);
+        return;
+    }
     if(native_match(NativeClassId::Mesh242,"javax/microedition/m3g/M3GMesh242") && (m->flags&0x0008)) {
         if(name=="enabled" && m->desc=="()Z")ret_i(VMS_RS(g_m3g_mesh242_enabled));
         else if(name=="eligible" && m->desc=="(Ljavax/microedition/m3g/VertexArray;Ljavax/microedition/m3g/VertexArray;Ljavax/microedition/m3g/VertexArray;Ljavax/microedition/m3g/VertexArray;Ljavax/microedition/m3g/VertexBuffer;)Z")
@@ -74,8 +84,7 @@ static void call_native_impl(Method* m, Frame& fr) { P61_SCOPE(2, m);
             ret_i(m3g_row240::draw(gfx,m->class_id,in));
         }
         else if(name=="_clearToTarget")ret_i(m3g_clear_to_target(gfx,arg(1).ref,arg(2).ref,arg(3).i!=0));
-        else if(name=="_drawTriangle")ret_i(m3g_draw_triangle(gfx,arg(1).ref,arg(2).ref,arg(3).i,
-            arg(4).i!=0,arg(5).i!=0,arg(6).i!=0));
+        else if(name=="_drawTriangle") {bool accepted=m3g_draw_triangle(gfx,arg(1).ref,arg(2).ref,arg(3).i,arg(4).i!=0,arg(5).i!=0,arg(6).i!=0);if(!accepted)cpu_raster_boundary(m3g_raster_scope::Boundary::Fallback);ret_i(accepted);}
         else if(name=="_readTarget")ret_ref(m3g_read_target(gfx));
         else if(name=="_targetWidth"||name=="_targetHeight") {
             int w=0,h=0;pixels_of(m3g_target(gfx),w,h);ret_i(name=="_targetWidth"?w:h);

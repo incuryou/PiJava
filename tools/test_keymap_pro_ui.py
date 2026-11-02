@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 def held_harness():
     source=(ROOT/'src/platform/switch_host.inc').read_text(encoding='utf-8')
-    start=source.index('static bool update_keymap_editor(');start=source.index('{',start)+1
+    start=source.index('static bool update_keymap_editor(');start=source.index('    const auto previous_page=',start)
     branch=source[start:source.index('    if(previous_page!=',start)]
     start=source.index('if(!focused)');brace=source.index('{',start);depth=1;end=brace+1
     while depth:depth+=(source[end]=='{')-(source[end]=='}');end+=1
@@ -36,7 +36,7 @@ int main(){using namespace host_keymap;Store store;auto& e=g_keymap_editor;e.beg
  e.choice=InputCount;tick=480;step(0,HidNpadButton_AnyDown);require(e.choice==0,"held movement wraps last to first");tick=481;step(HidNpadButton_AnyUp,HidNpadButton_AnyUp);require(e.choice==InputCount,"direction reversal is immediate and wraps first to last");tick=482;step(0,0);tick=900;step(0,0);require(e.choice==InputCount,"released direction never repeats");
  tick=901;step(HidNpadButton_AnyDown,HidNpadButton_AnyDown);const int chosen=e.choice;tick=1221;step(HidNpadButton_A,HidNpadButton_AnyDown|HidNpadButton_A);require(e.phase==Phase::Slot&&e.choice==chosen,"simultaneous A takes priority over due held repeat");
  e.phase=Phase::Phone;const int phone=e.phone;tick=2000;step(0,HidNpadButton_AnyDown);require(e.phone==phone,"phone phase does not inherit held repeat");e.phase=Phase::Choice;tick=2001;step(0,HidNpadButton_AnyDown);const int resumed=e.choice;tick=2320;step(0,HidNpadButton_AnyDown);require(e.choice==resumed,"phase change resets the initial repeat delay");
- step(HidNpadButton_R,HidNpadButton_AnyDown);require(e.page==Page::SaveExit,"page action retains real R binding");const int save=e.save_selection;tick=3000;step(0,HidNpadButton_AnyDown);require(e.save_selection==save,"SaveExit never receives held-repeat moves");
+ step(HidNpadButton_R,HidNpadButton_AnyDown);require(e.page==Page::Data,"page action retains real R binding across three tabs");const int save=e.save_selection;tick=3000;step(0,HidNpadButton_AnyDown);require(e.save_selection==save,"Data page never receives mapping held-repeat moves");
  e.page=Page::Keymap;e.phase=Phase::Choice;tick=4000;step(HidNpadButton_AnyDown,HidNpadButton_AnyDown);focus_step(false);tick=5000;step(0,HidNpadButton_AnyDown);const int refocused=e.choice;tick=5319;step(0,HidNpadButton_AnyDown);require(e.choice==refocused,"actual focus loss resets the initial repeat timer");
  step(HidNpadButton_StickL,HidNpadButton_AnyDown);e.open=false;tick=6000;step(0,HidNpadButton_AnyDown);const int closed=e.choice;tick=7000;step(0,HidNpadButton_AnyDown);require(e.choice==closed,"closed editor never receives held moves");e.begin(store,std::string(64,'a'),"reopen",false,false);e.page=Page::Keymap;e.phase=Phase::Choice;tick=7001;step(0,HidNpadButton_AnyDown);const int reopened=e.choice;tick=7320;step(0,HidNpadButton_AnyDown);require(e.choice==reopened,"new open resets initial delay");
  std::puts("PASS KeymapChoiceHeld: real Switch held branch, 320/80 ms boundaries, wrap, release, phase/page reset and A priority");

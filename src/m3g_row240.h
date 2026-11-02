@@ -78,8 +78,11 @@ static bool draw(int g,int cid,const Input& in) {
         colors[k]=uint32_t(delta[k]->i);steps[k]=uint32_t(s->i);
     }
     if(timed)prepared=paint_clock_us();
-    uint32_t output[MaxPixels]={};int z_out[MaxPixels]={};
-    bool color_write[MaxPixels]={},depth_write[MaxPixels]={};
+    // Values are read only after the matching write flag is set below. Keep
+    // scratch transactional, but clear flags for the actual row length only.
+    uint32_t output[MaxPixels];int z_out[MaxPixels];
+    bool color_write[MaxPixels],depth_write[MaxPixels];
+    std::fill_n(color_write,in.count,false);std::fill_n(depth_write,in.count,false);
     uint32_t p=uint32_t(paint->i),fog=uint32_t(in.fog);
     float z=in.z,pw=in.pw,inv=in.inv_pw,inv_step=in.inv_pw_step;
     int fog_step=in.fog_step;

@@ -895,8 +895,9 @@ public class Graphics3D
 		else
 		{
 			// Degenerate range (near == far): depth collapses to a constant.
-			tr.postScale(vieww * 0.5f, -viewh * 0.5f, 1.0f);
-			tr.postTranslate(1f, -1f, this.near * 32200.0f);
+			tr.postTranslate(0f, 0f, this.near * 32200.0f);
+			tr.postScale(vieww * 0.5f, -viewh * 0.5f, 0.0f);
+			tr.postTranslate(1f, -1f, 0f);
 		}
 
 		// -> Screen space
@@ -1245,17 +1246,17 @@ public class Graphics3D
 
 	public void setLight(int index, Light light, Transform transform)
 	{
-		/* As per JSR-184, throw IndexOutOfBoundsException if index < 0 or index > CurrentAmountOfLights. */
-		if (index < 0 || index >= MAX_LIGHTS) { throw new IndexOutOfBoundsException("Tried to modify a Light on an out-of-bounds index."); }
+		/* Indices address the current array, including empty slots. */
+		if (index < 0 || index >= this.currLights.size()) { throw new IndexOutOfBoundsException("Tried to modify a Light on an out-of-bounds index."); }
 
-		/* If no transform is received, use the identity matrix. */
-		if (transform == null) { transform = new Transform(); }
+		/* Copy the transform just as addLight does; null means identity. */
+		Transform lightTransform = transform == null ? new Transform() : new Transform(transform);
 
 		// Indices are NOT supposed to change here,
 		// so we're simply updating the arrays at the index,
 		// even if any new value is null.
 		this.currLights.set(index, light);
-		this.currLightTrans.set(index, transform);
+		this.currLightTrans.set(index, lightTransform);
 	}
 
 	public void setViewport(int x, int y, int width, int height)
@@ -2083,10 +2084,19 @@ public class Graphics3D
 		{
 			int newCapacity = renderIndices.length * 2;
 			if (newCapacity < minCapacity) { newCapacity = minCapacity; }
-			renderIndices = new int[newCapacity];
-			renderIntData = new int[newCapacity * 3];
-			renderObjData = new Object[newCapacity * 4];
-			renderAlphaData = new int[newCapacity];
+			int[] indices = new int[newCapacity];
+			int[] intData = new int[newCapacity * 3];
+			Object[] objData = new Object[newCapacity * 4];
+			int[] alphaData = new int[newCapacity];
+			System.arraycopy(renderIndices, 0, indices, 0, renderIndices.length);
+			System.arraycopy(renderIntData, 0, intData, 0, renderIntData.length);
+			System.arraycopy(renderObjData, 0, objData, 0, renderObjData.length);
+			System.arraycopy(renderAlphaData, 0, alphaData, 0, renderAlphaData.length);
+			// Publish only after every allocation and copy has succeeded.
+			renderIndices = indices;
+			renderIntData = intData;
+			renderObjData = objData;
+			renderAlphaData = alphaData;
 		}
 	}
 

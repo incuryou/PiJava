@@ -26,9 +26,19 @@
 #else
 #include <chrono>
 #include <thread>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sched.h>
 #include <pthread.h>
 #include <time.h>
+#endif
 #endif
 
 namespace p7 {
@@ -39,7 +49,12 @@ inline const char* cat_name(int c) {
     static const char* n[CatCount] = {"java_exec", "audio_mix_midi", "audio_out", "audio_wait", "gc", "gc_wait", "decode", "present_blit", "present_wait", "idle_sleep", "worker_task"};
     return n[c];
 }
-constexpr int MaxSlots = 3; // slot 0 = main host thread, 1..2 = workers
+constexpr int RenderSlot = 3;
+constexpr int MaxSlots = 4; // logical roles, NOT CPU ids: main, worker1, worker2, independent renderer
+inline const char* slot_name(int slot) {
+    static const char* names[MaxSlots] = {"main", "w1", "w2", "render"};
+    return names[slot];
+}
 
 inline uint64_t ticks() {
 #ifdef __SWITCH__
@@ -68,36 +83,101 @@ inline std::atomic<uint64_t> g_window_start{0};
 inline bool g_scope_on = false; // P8.2: scopes tick when P7COUNT or P8FRAME is on
 inline bool g_count_on = false; // P7.3: counters default OFF (p7-count.enable / J2ME_P7_COUNT=1); set once at startup
 inline thread_local int t_slot = 0;
-// P7.3: per-thread CPU time (the P7 acceptance metric is main-thread workload). Registered once per thread.
+// Registration belongs to the measured thread. Publish a complete clock under the same mutex used
+// by readers and retirement, so a sampler can never read an unpublished or already closed handle.
+// Retain retired CPU totals: summaries after owner/pool shutdown must still include their work.
+struct ThreadClocks {
+    std::mutex mutex;
+    bool active[MaxSlots] = {};
+    uint64_t origin_us[MaxSlots] = {}, retired_us[MaxSlots] = {};
 #ifdef __SWITCH__
-inline Handle g_thread_handle[3] = {0, 0, 0};   // slot 0 is read only from the main thread via CUR_THREAD_HANDLE
+    Handle handle[MaxSlots] = {}; // borrowed real Thread handles; unregister before threadClose
+#elif defined(_WIN32)
+    HANDLE handle[MaxSlots] = {}; // owned duplicates, never GetCurrentThread pseudo handles
+    ~ThreadClocks() { for (auto h : handle) if (h) CloseHandle(h); }
 #else
-inline clockid_t g_thread_clock[3] = {};
-inline bool g_thread_clock_ok[3] = {false, false, false};
+    clockid_t clock[MaxSlots] = {};
 #endif
-inline uint64_t g_cpu_start_us[3] = {0, 0, 0};
-inline void register_thread_clock(int slot) {
-#ifndef __SWITCH__
-    g_thread_clock_ok[slot] = pthread_getcpuclockid(pthread_self(), &g_thread_clock[slot]) == 0;
-#else
-    (void)slot;
-#endif
-}
-inline uint64_t thread_cpu_us(int slot) {
-#ifdef __SWITCH__
-    u64 ticks = 0;
-    const Handle h = slot == 0 ? CUR_THREAD_HANDLE : g_thread_handle[slot];
-    if (!h || R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, h, -1))) return 0;
-    return armTicksToNs(ticks) / 1000;
-#else
-    if (!g_thread_clock_ok[slot]) return 0;
-    timespec ts{}; if (clock_gettime(g_thread_clock[slot], &ts) != 0) return 0;
-    return uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) / 1000ull;
-#endif
-}
+};
+inline ThreadClocks g_thread_clocks;
+inline uint64_t g_cpu_start_us[MaxSlots] = {};
+inline thread_local int t_registered_slot = -1;
 inline thread_local int t_cur = -1;
 inline thread_local uint64_t t_mark = 0;
 
+// mutex must be held; all returned CPU values use microseconds, independent of wall ticks.
+inline uint64_t live_thread_cpu_us(int slot) {
+#ifdef __SWITCH__
+    u64 value = 0;
+    if (R_FAILED(svcGetInfo(&value, InfoType_ThreadTickCount, g_thread_clocks.handle[slot], -1))) return 0;
+    return armTicksToNs(value) / 1000;
+#elif defined(_WIN32)
+    FILETIME create{}, exit{}, kernel{}, user{};
+    if (!GetThreadTimes(g_thread_clocks.handle[slot], &create, &exit, &kernel, &user)) return 0;
+    const uint64_t k = (uint64_t(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime;
+    const uint64_t u = (uint64_t(user.dwHighDateTime) << 32) | user.dwLowDateTime;
+    return (k + u) / 10; // FILETIME counts 100 ns units
+#else
+    timespec ts{};
+    if (clock_gettime(g_thread_clocks.clock[slot], &ts) != 0) return 0;
+    return uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) / 1000ull;
+#endif
+}
+
+// Must run before the first P7_SCOPE, including owner init, and finish before publishing readiness.
+// Switch callers supply their real Thread.handle; a pseudo handle would sample the reader instead.
+inline bool register_thread_clock(int slot
+#ifdef __SWITCH__
+    , Handle handle
+#endif
+) {
+    if (slot < 0 || slot >= MaxSlots || t_cur >= 0) return false;
+    if (t_registered_slot == slot) return true;
+    if (t_registered_slot >= 0) return false;
+    std::lock_guard<std::mutex> lock(g_thread_clocks.mutex);
+    if (g_thread_clocks.active[slot]) return false; // preserve the slot's single writer
+#ifdef __SWITCH__
+    if (!handle || handle == CUR_THREAD_HANDLE) return false;
+    g_thread_clocks.handle[slot] = handle;
+#elif defined(_WIN32)
+    HANDLE handle = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+                         THREAD_QUERY_INFORMATION, FALSE, 0)) return false;
+    g_thread_clocks.handle[slot] = handle;
+#else
+    if (pthread_getcpuclockid(pthread_self(), &g_thread_clocks.clock[slot]) != 0) return false;
+#endif
+    g_thread_clocks.origin_us[slot] = live_thread_cpu_us(slot);
+    g_thread_clocks.active[slot] = true;
+    t_slot = t_registered_slot = slot;
+    return true;
+}
+
+// On the owning thread, after final callbacks and after every P7_SCOPE has unwound, before exit.
+inline void unregister_thread_clock(int slot) {
+    if (slot < 0 || slot >= MaxSlots || t_registered_slot != slot || t_cur >= 0) return;
+    std::lock_guard<std::mutex> lock(g_thread_clocks.mutex);
+    const uint64_t value = live_thread_cpu_us(slot), origin = g_thread_clocks.origin_us[slot];
+    if (value > origin) g_thread_clocks.retired_us[slot] += value - origin;
+    g_thread_clocks.active[slot] = false;
+#if defined(_WIN32) && !defined(__SWITCH__)
+    CloseHandle(g_thread_clocks.handle[slot]);
+    g_thread_clocks.handle[slot] = nullptr;
+#elif defined(__SWITCH__)
+    g_thread_clocks.handle[slot] = 0;
+#endif
+    t_registered_slot = -1;
+}
+inline uint64_t thread_cpu_us(int slot) {
+    if (slot < 0 || slot >= MaxSlots) return 0;
+    std::lock_guard<std::mutex> lock(g_thread_clocks.mutex);
+    uint64_t result = g_thread_clocks.retired_us[slot];
+    if (g_thread_clocks.active[slot]) {
+        const uint64_t value = live_thread_cpu_us(slot), origin = g_thread_clocks.origin_us[slot];
+        if (value > origin) result += value - origin;
+    }
+    return result;
+}
 struct Scope {
     int prev;
     // Same-category nesting (run() inside thread_resume(), nested run()) is already being timed by the outer
@@ -147,21 +227,28 @@ inline std::string counters_summary(const char* reason) {
     }
     const uint64_t other = wall > main_sum ? wall - main_sum : 0;
     std::snprintf(buf, sizeof buf, " host_other=%lluus", (unsigned long long)other); out += buf;
-    // P7.3 acceptance view: CPU time per host thread in this window (main, worker1, worker2, total)
-    uint64_t total = 0;
+    // Keep schema=2 and existing field order. Renderer fields are appended; cpu_total includes all roles.
+    uint64_t total = 0, cpu_us[MaxSlots] = {};
     for (int s = 0; s < MaxSlots; ++s) {
         const uint64_t now_cpu = thread_cpu_us(s), cpu = now_cpu > g_cpu_start_us[s] ? now_cpu - g_cpu_start_us[s] : 0;
-        total += cpu;
+        total += cpu; cpu_us[s] = cpu;
+        if (s == RenderSlot) continue;
         const unsigned long long pm = wall ? (unsigned long long)(cpu * 1000ull / wall) : 0ull;
-        std::snprintf(buf, sizeof buf, " cpu_%s=%lluus/%llu.%llu%%", s == 0 ? "main" : (s == 1 ? "w1" : "w2"), (unsigned long long)cpu, pm / 10, pm % 10);
+        std::snprintf(buf, sizeof buf, " cpu_%s=%lluus/%llu.%llu%%", slot_name(s), (unsigned long long)cpu, pm / 10, pm % 10);
         out += buf;
     }
     std::snprintf(buf, sizeof buf, " cpu_total=%lluus", (unsigned long long)total); out += buf;
     for (int s = 1; s < MaxSlots; ++s) {
+        if (s == RenderSlot) {
+            const uint64_t cpu = cpu_us[s];
+            const unsigned long long pm = wall ? (unsigned long long)(cpu * 1000ull / wall) : 0ull;
+            std::snprintf(buf, sizeof buf, " cpu_render=%lluus/%llu.%llu%%", (unsigned long long)cpu, pm / 10, pm % 10);
+            out += buf;
+        }
         for (int c = 0; c < CatCount; ++c) {
             const uint64_t n = g_slots[s].n[c].load(std::memory_order_relaxed);
-            if (!n && c != Worker) continue;
-            std::snprintf(buf, sizeof buf, " w%d_%s=%lluus/%llu", s, cat_name(c),
+            if (!n && (s == RenderSlot || c != Worker)) continue;
+            std::snprintf(buf, sizeof buf, " %s_%s=%lluus/%llu", slot_name(s), cat_name(c),
                           (unsigned long long)ticks_to_us(g_slots[s].t[c].load(std::memory_order_relaxed)), (unsigned long long)n);
             out += buf;
         }
@@ -172,6 +259,8 @@ inline std::string counters_summary(const char* reason) {
 inline int current_core() {
 #ifdef __SWITCH__
     return (int)svcGetCurrentProcessorNumber();
+#elif defined(_WIN32)
+    return (int)GetCurrentProcessorNumber();
 #else
     return sched_getcpu();
 #endif
@@ -205,9 +294,6 @@ public:
             if (R_FAILED(rc)) { threadClose(&w.thread); status_ = "threadStart_failed core=" + std::to_string(i + 1) + " rc=" + std::to_string(rc); break; }
 #else
             w.thread = std::thread(&Pool::entry, &w); // -fno-exceptions: a failed create terminates loudly
-#endif
-#ifdef __SWITCH__
-            g_thread_handle[1 + i] = w.thread.handle;
 #endif
             ++started_;
         }
@@ -306,12 +392,17 @@ private:
     static void entry(W* w) { w->pool->loop(*w); }
 #endif
     void loop(W& w) {
-        t_slot = 1 + w.index; t_cur = -1; register_thread_clock(t_slot);
+        t_slot = 1 + w.index; // retain correct scope role even if platform CPU clock acquisition fails
+        register_thread_clock(t_slot
+#ifdef __SWITCH__
+            , w.thread.handle
+#endif
+        );
         w.core.store(current_core(), std::memory_order_release);
         std::unique_lock<std::mutex> lk(m_);
         for (;;) {
             w.cv.wait(lk, [&] { return stop_ || !w.q.empty(); });
-            if (w.q.empty()) { if (stop_) return; continue; }
+            if (w.q.empty()) { if (stop_) { unregister_thread_clock(1 + w.index); return; } continue; }
             Item item = std::move(w.q.front()); w.q.pop_front();
             ++running_; running_tickets_.push_back(item.ticket);
             lk.unlock();
@@ -351,7 +442,11 @@ inline Pool& pool() { static Pool p; return p; }
 
 // Startup: read the switch, start workers, run the core self-test. Returns the log line.
 inline std::string configure(bool requested, uint32_t epoch) {
-    register_thread_clock(0); // main thread
+    register_thread_clock(0
+#ifdef __SWITCH__
+        , threadGetCurHandle()
+#endif
+    ); // main thread
     if (!requested) return "P7WORKER schema=1 requested=0 enabled=0 reason=disabled";
     Pool& p = pool();
     if (!p.start()) return "P7WORKER schema=1 requested=1 enabled=0 reason=" + p.status();

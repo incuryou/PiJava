@@ -39,6 +39,7 @@ struct RunScope {
     bool previous_can_suspend;
     JavaThreadContext* owner;
     RunScope(std::vector<Frame>* stack, bool resumable): prev(VMS_EXEC(g_active_stack)), previous_can_suspend(VMS_EXEC(g_can_suspend)), owner(&current_context()) {
+        cpu_raster_boundary(m3g_raster_scope::Boundary::Reentry);
         ++VMS_EXEC(g_save_clock).exec_epoch;
         ++VMS_EXEC(g_run_depth); VMS_EXEC(g_active_stack) = stack; VMS_EXEC(g_can_suspend) = resumable;
         VMS_HEAP(g_root_stacks).push_back({stack,owner});
@@ -47,7 +48,7 @@ struct RunScope {
         for (size_t i=0;i+1<VMS_HEAP(g_root_stacks).size();++i) if (VMS_HEAP(g_root_stacks)[i].second == owner) return true;
         return false;
     }
-    ~RunScope() { VMS_HEAP(g_root_stacks).pop_back(); VMS_EXEC(g_active_stack) = prev; VMS_EXEC(g_can_suspend) = previous_can_suspend; --VMS_EXEC(g_run_depth); }
+    ~RunScope() { cpu_raster_boundary(m3g_raster_scope::Boundary::Return); VMS_HEAP(g_root_stacks).pop_back(); VMS_EXEC(g_active_stack) = prev; VMS_EXEC(g_can_suspend) = previous_can_suspend; --VMS_EXEC(g_run_depth); }
 };
 static int64_t thread_deadline(int64_t timeout) {
     int64_t now=monotonic_ms();
@@ -177,6 +178,7 @@ static void update_thread_live() {
     for(auto& t:VMS_EXEC(g_threads)) if(t.state!=ThreadState::Terminated) { VMS_EXEC(g_thread_live)=true; break; }
 }
 static void finish_thread(JavaThreadContext& t) {
+    cpu_raster_boundary(m3g_raster_scope::Boundary::Lifecycle);
     t.service_repaints_deferred=false;
     diag_sleep_cancel(t,runtime_cause::CancelReason::Terminated);
     speed_timer_block(t);
@@ -202,6 +204,7 @@ static void deliver_interrupt() {
     }
 }
 static bool pump_one_thread() {
+    cpu_raster_boundary(m3g_raster_scope::Boundary::Yield);
     if(r4::state.active&&r4::state.worker_phase&&r4::state.worker_left<=0)return false;
     refresh_thread(VMS_EXEC(g_main_thread));
     for(auto& t:VMS_EXEC(g_threads)) refresh_thread(t);
@@ -249,6 +252,7 @@ static bool pump_one_thread() {
     return false;
 }
 static void suspend_current(bool run_others) {
+    cpu_raster_boundary(m3g_raster_scope::Boundary::Yield);
     CityWaitSpan city_wait;
     ++VMS_EXEC(g_runtime_profile).pending.worker_suspends;
     auto& t=current_context();

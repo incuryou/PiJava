@@ -6,13 +6,27 @@
 
 [下载 NRO / NSP](https://github.com/incuryou/PiJava/releases/latest) · [English](README.en.md) · [构建](docs/BUILDING.md) · [使用](docs/USAGE.md) · [架构与路线](docs/ROADMAP.md) · [许可](THIRD_PARTY.md)
 
-当前发布：**Fit30 / KeyUI7 / GPUF5**。构建标识 `0.2.114-keyui7-gpuf5-fit30`，NACP `0.2.114-k7-f30`。应用 Title ID 沿用 `05004A324D450000`。
+当前发布：**Fit41-menu7 / KeyUI7 / GPUF5**。构建标识 `0.2.114-keyui7-gpuf5-fit41-menu7`，NACP `0.2.114-k7-f41n`。应用 Title ID 沿用 `05004A324D450000`。
 
-[下载 Fit30](https://github.com/incuryou/PiJava/releases/tag/v0.2.114-keyui7-gpuf5-fit30) · [Fit30 变更与验证](docs/FIT30.md)
+[下载 Fit41-menu7](https://github.com/incuryou/PiJava/releases/tag/v0.2.114-keyui7-gpuf5-fit41-menu7) · [新增功能与验证](docs/FIT41.md)
 
 项目以 C++17 实现 VM 和宿主功能，附带 Java 类库与所需字体、皮肤及着色器资源。Switch 是主要平台，Linux 桌面入口用于无窗口开发诊断。兼容性仍需逐游戏验证，能启动不等于全部关卡、音频与存档都通过。
 
-## Fit30 更新
+## Fit41-menu7 更新
+
+- 10 项游戏列表、收藏 / 全部列表、Y 切换与 − 收藏操作。
+- 更多设置支持搜索、中文重命名、存档继承与删除操作，长按上下循环。
+- 游戏内 L3 菜单增加整数搜索、多轮筛选与候选值修改。
+- 改进 Micro3D / M3G 兼容性，完善原生图片预处理、画面呈现分工与等待空转处理。
+- 保留现有存档与配置兼容路径。详细功能、默认配置和测试范围见[更新说明](docs/FIT41.md)。
+
+| 主菜单 | 更多设置 |
+|---|---|
+| ![主菜单预览](docs/screenshots/fit41/main-menu.png) | ![更多设置预览](docs/screenshots/fit41/more-settings.png) |
+
+以上为原生宿主 UI 预览，不是 Switch 实机截图。以下 Fit30 内容与运行画面保留作历史记录。
+
+## Fit30 更新（历史）
 
 - 保留此前绘图查询直达、标准流字段缓存和完整椭圆绘制改进。
 - 为两种通用只读取值方法省去重复解释准备，保持原操作预算和异常回退。
@@ -35,15 +49,15 @@
 ## 保留的功能
 
 - **按键映射界面**：删除手机参考图片及其加载/高亮代码，将手机键网格、Pro 手柄预览和映射槽居中排列；保留实时映射预览、长按循环、未绑定留空和现有按键操作。
-- **GPUF5 五种 GPU 滤镜**：双线性、Scale2x、LCD、CRT、ScanlinesDX 自动选择 GPU；关闭滤镜时使用 CPU 呈现。包含显示槽、fence、缓存失效与可恢复的 CPU 后备路径。
-- **Save1 跨章节存档继承**：在游戏列表选中下一章，按 Y 选择上一章，将游戏内 RMS 存档显式复制到目标，并备份目标旧目录；不修改来源，不自动转换游戏私有存档格式，不跨 JAR 继承即时存档。
+- **GPUF5 五种 GPU 滤镜**：双线性、Scale2x、LCD、CRT、ScanlinesDX 自动选择 GPU；原图、滤镜与呈现保留可恢复的 CPU 后备路径。
+- **Save1 跨章节存档继承**：在游戏列表选中下一章，通过“更多设置 → 继承存档”选择上一章，将游戏内 RMS 存档显式复制到目标，并备份目标旧目录；不修改来源，不自动转换游戏私有存档格式，不跨 JAR 继承即时存档。
 - **统一应用图标**：NRO 与 NSP 均使用新的 Pi Java 图标。
 
-## 三 CPU 核心与 GPU 分工
+## CPU 与 GPU 分工
 
-当前 Switch 后端采用**三个 CPU 核心参与的宿主分工，并调用 GPU 执行显示滤镜与呈现**。已发布 NSP 的主线程默认运行于 CPU 0；两个工作线程分别绑定 CPU 1、CPU 2，承担音频、GC 跟踪和部分 CPU 像素准备等任务，异步日志线程复用 CPU 2。NRO 的主线程亲和性还取决于 hbloader 启动环境。
+Java 执行及可变游戏状态仍由其所属线程管理；原生图片预处理、音频、GC 跟踪和画面呈现按各自任务分工。图片预处理与 render-owner 默认开启，具体收益取决于游戏负载与同步开销，并不表示所有核心始终满载。
 
-这里的三核分工不等于三个 Java 执行器并行运行游戏，也不表示三个核心始终满载。GPU 路径通过 deko3d 执行上述五种显示滤镜；原画、菜单及部分合成仍有 CPU 工作。当前不能把 GPU 滤镜等同于完整的 3D 游戏硬件加速。
+GPU 显示滤镜和呈现使用 deko3d。M3G CPU worker 与实验性 GPU 3D 需显式开启；这不等于所有 3D 游戏已获得硬件加速。
 
 ## 主要功能
 
@@ -56,7 +70,7 @@
 
 ## 下载与使用
 
-请在 [Releases](https://github.com/incuryou/PiJava/releases/latest) 下载最新 `.nro` 或 `.nsp`，按自己的自制软件运行环境使用。Fit30使用已校验的同源构建；NSP为独立应用包。游戏、用户 RMS、即时存档、密钥及 SDK 均不随仓库或 Release 分发。
+请在 [Releases](https://github.com/incuryou/PiJava/releases/latest) 下载最新 `.nro` 或 `.nsp`，按自己的自制软件运行环境使用。Fit41-menu7使用已校验的同源构建；NSP为独立应用包。游戏、用户 RMS、即时存档、密钥及 SDK 均不随仓库或 Release 分发。
 
 Fit30完成64条组合主机检查、九项原版游戏短场景检查及NSP内容校验。短检查不能代替完整关卡或实体Switch性能验收；详见[Fit30报告](docs/FIT30.md)。
 
@@ -74,7 +88,7 @@ DEVKITPRO=/opt/devkitpro python3 -B tools/build.py --switch --frozen-java
 
 需要重编 Java 类库时可去掉 `--frozen-java`。着色器从 `shaders/` 离线编译；构建所需完整依赖见[构建文档](docs/BUILDING.md)。
 
-公开树保留生产源码、构建工具、必需资源、许可证、说明及选定展示截图。完整Fit30源码包另含回归夹具；原始用户日志、商业游戏、存档、密钥和私有CI不上传。`romfs/classes/` 是运行时 Java 类库，不是游戏测试类。
+公开树保留生产源码、构建工具、必需资源、许可证、说明及选定展示截图。完整Fit41-menu7源码包另含回归夹具；原始用户日志、商业游戏、存档、密钥和私有CI不上传。`romfs/classes/` 是运行时 Java 类库，不是游戏测试类。
 
 ## 后续计划
 

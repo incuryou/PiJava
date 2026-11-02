@@ -15,6 +15,8 @@ static void layout_class(int id) {
 static int load_class_bytes(const std::string& name, const std::vector<uint8_t>& data);
 static int load_class_file(const std::string& name, bool fatal) {
     if (VMS_CL(g_class_index).count(name)) return VMS_CL(g_class_index)[name];
+    // Keep an owned reference while parsing: a failed binding may invalidate the store.
+    if(auto sealed=m3g_gpu_bridge::sealed_class_bytes(name))return load_class_bytes(name,*sealed);
     for (const auto& dir : VMS_CL(g_classpath)) {
         std::ifstream in(dir + "/" + name + ".class", std::ios::binary);
         if (!in) continue;
@@ -125,6 +127,7 @@ static int load_class_bytes(const std::string& name, const std::vector<uint8_t>&
     }
     layout_class(id);
     bind_library_layout(id, data);
+    m3g_gpu_bridge::bind_class(id, data, name);
     Class& c = VMS_CL(g_classes)[id];
     for (auto& f : c.fields) if (f.is_static && f.const_idx > 0 && f.const_idx < (int)c.cp.size()) {
         const CpEntry& e = c.cp[f.const_idx];

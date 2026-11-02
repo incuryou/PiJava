@@ -475,25 +475,35 @@ static int sav_owner(const SavState& s, const SavClass& c) {
 // while preparing classes, and the live class cache may belong to another JAR.
 // Swapping deques preserves the live Method pointers held by suspended frames.
 struct SavPreflightScope {
+    bool ready=false;
     std::deque<Class> classes;
     std::unordered_map<std::string, int> class_index;
     std::deque<Obj> heap;
     std::vector<int> free_list;
     int alloc_since = VMS_HEAP(g_alloc_since);
     SavPreflightScope() {
+        if(!host_render_lifecycle::epoch_changed(uint64_t(resver::g_epoch)+1))return;
         VMS_CL(g_classes).swap(classes); VMS_CL(g_class_index).swap(class_index);
-        VMS_HEAP(g_heap).swap(heap); VMS_HEAP(g_free).swap(free_list); resver::bump_epoch(); p7::pool().epoch_clear(resver::g_epoch);
+        VMS_HEAP(g_heap).swap(heap); VMS_HEAP(g_free).swap(free_list); resver::bump_epoch(); native_prep_runtime::epoch_changed(resver::g_epoch); p7::pool().epoch_clear(resver::g_epoch);
         VMS_HEAP(g_heap).emplace_back();
+        ready=true;
     }
     ~SavPreflightScope() {
+        if(!ready)return;
+        // Always restore the live VM. The platform hook fail-closes its native
+        // owner before reporting an error; no worker borrows these heap tables.
+        if(!host_render_lifecycle::epoch_changed(uint64_t(resver::g_epoch)+1))
+            log_line("RENDEROWNER preflight rollback: native owner unavailable");
         VMS_CL(g_classes).swap(classes); VMS_CL(g_class_index).swap(class_index);
-        VMS_HEAP(g_heap).swap(heap); VMS_HEAP(g_free).swap(free_list); resver::bump_epoch(); p7::pool().epoch_clear(resver::g_epoch);
+        VMS_HEAP(g_heap).swap(heap); VMS_HEAP(g_free).swap(free_list); resver::bump_epoch(); native_prep_runtime::epoch_changed(resver::g_epoch); p7::pool().epoch_clear(resver::g_epoch);
         VMS_HEAP(g_alloc_since) = alloc_since;
     }
 };
 // Preflight finishes before stop_thread or replacing any live objects/stacks.
 static bool validate_state(const SavState& s,bool use_saved_size=false) {
+    if(!host_render_lifecycle::barrier(m3g_raster_scope::Boundary::Save))return false;
     SavPreflightScope scope;
+    if(!scope.ready)return false;
     auto reject = [](const std::string& why) { log_line(std::string("SAVE invalid state: ") + why); return false; };
     if(s.current>0&&size_t(s.current)<s.heap.size()) {
         const ScreenMeta m=screen_meta(s.heap[s.current].text);
@@ -742,6 +752,7 @@ static void restore_media_rates() {
 }
 static bool apply_state(const SavState& s,bool use_saved_size=false) {
     if (!validate_state(s,use_saved_size)) return false;
+    if(!host_render_lifecycle::barrier(m3g_raster_scope::Boundary::Save)||!host_render_lifecycle::epoch_changed(uint64_t(resver::g_epoch)+1))return false;
     std::unordered_set<std::string> names;
     for (auto& c : s.classes) if (!c.name.empty()) names.insert(c.name);
     for (auto& o : s.heap) if (!o.cls.empty()) names.insert(o.cls);
@@ -761,7 +772,7 @@ static bool apply_state(const SavState& s,bool use_saved_size=false) {
     VMS_EXEC(g_execution_profile).reset();VMS_HEAP(g_frame_buffer_pool).clear();VMS_HEAP(g_primitive_buffers).clear();
     VMS_HEAP(g_gc_mark_scratch).clear();VMS_HEAP(g_gc_work_scratch).clear();
     VMS_CL(g_classes).clear(); VMS_CL(g_class_index).clear();
-    VMS_HEAP(g_heap).assign(1, Obj{}); VMS_HEAP(g_free).clear(); resver::bump_epoch(); p7::pool().epoch_clear(resver::g_epoch); // P2.5 restore
+    VMS_HEAP(g_heap).assign(1, Obj{}); VMS_HEAP(g_free).clear(); resver::bump_epoch(); native_prep_runtime::epoch_changed(resver::g_epoch); p7::pool().epoch_clear(resver::g_epoch); // P2.5 restore
     VMS_RS(g_gfx_color).clear(); VMS_RS(g_gfx_target).clear(); VMS_RS(g_gfx_tx).clear(); VMS_RS(g_gfx_ty).clear(); VMS_RS(g_clip).clear(); VMS_RS(g_offscreen).clear();
     VMS_RS(g_current) = VMS_RS(g_display) = VMS_EXEC(g_midlet) = VMS_RS(g_shown) = VMS_RS(g_alert_return) = 0;
     for (auto& name : names) ensure_class(name);
@@ -884,6 +895,8 @@ J2ME_ISP_DECL_LAUNCHED_PATH
 // (snapshot_freezable / SnapshotCheckStats live in src/p2s5_rootscope.inc so desktop builds report them too.)
 static bool save_instant_state(const std::string& jar) {
     if(r4::state.active){log_line("R4 save unsupported before I/O");return false;}
+    if(!host_render_lifecycle::barrier(m3g_raster_scope::Boundary::Save)){log_line("SAVE deferred: renderer not quiescent");return false;}
+    native_prep_runtime::Pause prep_pause;
     p7::pool().drain(); // P7.2: workers quiesced before J2S5 capture
     if (jar.empty() || VMS_EXEC(g_midlet) <= 0) return false;
     S0_HOOK(s0_assert_snapshot_safe());
@@ -940,6 +953,8 @@ static bool delete_instant_state(const std::string& jar) {
 }
 static bool restore_instant_state(const std::string& jar, const std::string& expected_identity = "") {
     if(r4::state.active){log_line("R4 restore unsupported before I/O");return false;}
+    if(!host_render_lifecycle::barrier(m3g_raster_scope::Boundary::Save)){log_line("RESTORE deferred: renderer not quiescent");return false;}
+    native_prep_runtime::Pause prep_pause;
     p7::pool().drain(); // P7.2: workers quiesced before J2S5 restore
     std::string bytes;
     if (!instant_state_file::load(instant_state_path(jar), bytes)) return false;
@@ -977,7 +992,7 @@ static bool restore_instant_state(const std::string& jar, const std::string& exp
     { auto& c = VMS_EXEC(g_save_clock); c.anchor_epoch = c.exec_epoch; c.valid = true; }  // logical time stands still until the VM executes
     p8_caught_reset(); p8_count_open_continue(); // P8.2: continue sessions get a P7COUNT window too
     const int diagnostic_midlet=VMS_EXEC(g_midlet);
-    diag_launch(identity,diagnostic_midlet>0&&size_t(diagnostic_midlet)<VMS_HEAP(g_heap).size()&&VMS_HEAP(g_heap)[diagnostic_midlet].cls>=0?VMS_CL(g_classes)[VMS_HEAP(g_heap)[diagnostic_midlet].cls].name:"restored_midlet");
+    p1_new_launch(identity,diagnostic_midlet>0&&size_t(diagnostic_midlet)<VMS_HEAP(g_heap).size()&&VMS_HEAP(g_heap)[diagnostic_midlet].cls>=0?VMS_CL(g_classes)[VMS_HEAP(g_heap)[diagnostic_midlet].cls].name:"restored_midlet");
     log_line("DIAGRESTORE identity_bound=1 saved_format=J2S5 diagnostic_state=transient_only");
     return true;
 }

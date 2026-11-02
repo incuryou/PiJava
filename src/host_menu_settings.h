@@ -46,7 +46,8 @@ inline bool read_settings_file(const std::string& path, Settings& out, bool& mis
     if (failed || close_failed || size > 1024) return false;
     const std::string record(buffer, size);
     const bool legacy = record.compare(0, 12, "J2ME_MENU 1\n") == 0;
-    const std::string prefix = legacy ? "J2ME_MENU 1\nbezel=" : "J2ME_MENU 2\nbezel=";
+    const bool version3 = record.compare(0, 12, "J2ME_MENU 3\n") == 0;
+    const std::string prefix = legacy ? "J2ME_MENU 1\nbezel=" : version3 ? "J2ME_MENU 3\nbezel=" : "J2ME_MENU 2\nbezel=";
     const int record_count = legacy ? 7 : bezel_count;
     if (record.compare(0, prefix.size(), prefix) != 0) return false;
     const std::size_t bezel_end = record.find('\n', prefix.size());
@@ -63,7 +64,15 @@ inline bool read_settings_file(const std::string& path, Settings& out, bool& mis
     const std::string suffix = record.substr(bezel_end + 1);
     const std::string fps=suffix.substr(0,11);
     if (fps != "show_fps=0\n" && fps != "show_fps=1\n") return false;
-    const std::string extra=suffix.substr(11);
+    std::string extra=suffix.substr(11);
+    if(version3){
+        // Accept the retired V3 field, but discard it; the feature no longer exists.
+        constexpr size_t length=10;
+        if(extra.size()<length||(extra.size()>length&&extra[extra.size()-length-1]!='\n'))return false;
+        const auto field=extra.substr(extra.size()-length);
+        if(field!="hd_font=0\n"&&field!="hd_font=1\n")return false;
+        extra.resize(extra.size()-length);
+    }
     display_filter::Filter filter=display_filter::Filter::Original;
     int rotation = 0;
     if (!extra.empty()) {

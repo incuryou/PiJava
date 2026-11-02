@@ -13,6 +13,10 @@ struct State {
     std::vector<uint8_t> saved_known;
     bool dirty = true, name_pending = false;
     int selected = -1;
+    std::string title(const std::string& path,const std::string& fallback)const {
+        const auto found=names.names.find(path);
+        return found==names.names.end()||found->second.empty()?fallback:found->second;
+    }
 
     template<class Entries>
     void rebuild(const Entries& items, std::vector<std::string>& labels,

@@ -6,6 +6,9 @@
  */
 #include "optimization_config.h"
 #include "p7_worker.h"
+#include "native_prep_runtime.h"
+#include "host_render_lifecycle.h"
+#include "m3g_raster_scope.h"
 #include "p7_audio.h"
 #include "p7_gc.h"
 #include "p7_present.h"
@@ -15,6 +18,7 @@
 #include "frame_buffer_pool.h"
 #include "execution_profile.h"
 #include "frame_metrics.h"
+#include "menu_stall.h"
 #include "rgb_fill.h"
 #include "decoded_image_cache.h"
 #include "font8x8_basic.h"
@@ -34,7 +38,7 @@
 #include "farm_startup.h"
 #include "audio_engine.h"
 #include "audio_ffmpeg236.h"
-#include "jpeg_decoder.h"
+#include "native_image_jobs.h"
 #include "frame_schedule.h"
 #include "pace.h"
 #include "frame_prep.h"
@@ -548,7 +552,7 @@ static void audio_event(const std::string& message) {
 }
 [[noreturn]] static void r4_abort(const char* reason) {
     std::fprintf(stderr,"R4 failure %s tick=%lld\n",reason,(long long)r4::state.tick);
-    p7audio::fence();p7::pool().shutdown();r4::finish("INCOMPLETE",reason);std::exit(70);
+    p7audio::fence();native_prep_runtime::shutdown();p7::pool().shutdown();r4::finish("INCOMPLETE",reason);std::exit(70);
 }
 static void die(const std::string& m) {
     diag_fault("VM_FATAL",m.c_str()); // Before longjmp, cleanup or frame destruction.
@@ -558,6 +562,7 @@ static void die(const std::string& m) {
     if (g_die_catch) longjmp(g_die_jmp, 1);
     std::exit(1);
 }
+static void cpu_raster_boundary(m3g_raster_scope::Boundary reason){if(!m3g_raster_scope::flush_all(reason))die("CPU_RASTER boundary flush failed");}
 static uint16_t ru16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static uint32_t ru32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 static int16_t rs16(const uint8_t* p) { return (int16_t)ru16(p); }
@@ -982,6 +987,7 @@ static bool type_compatible(int ref, const std::string& want) {
     return descriptor_assignable(o.is_array ? o.array_desc : VMS_CL(g_classes)[o.cls].name, want);
 }
 static void throw_ref(int ref) {
+    cpu_raster_boundary(m3g_raster_scope::Boundary::Exception);
     diag_exception(ref); // Actual throw origin, before searching/unwinding handlers.
     current_context().compensated_sleep.cancel();
     current_context().rechecked_deadline.cancel(); // Same-method catches must earn fresh frame evidence.
@@ -1113,6 +1119,7 @@ static void fill_rect(int gfx, int target, int64_t x, int64_t y, int w, int h, i
     auto b=raster_primitives::intersect(gfx_bounds(gfx,tw,th),{x,y,x+w,y+h});
     if(b.left>=b.right||b.top>=b.bottom) return;
     auto surface=gfx_surface(gfx,target,*px,tw,th);
+
     if(surface.opacity!=255||surface.alpha) {
         for(int64_t yy=b.top;yy<b.bottom;++yy)for(int64_t xx=b.left;xx<b.right;++xx)surface.put(xx,yy,uint32_t(rgb));
         return;
@@ -1169,6 +1176,7 @@ static void draw_string(int gfx, int target, int x, int y, int color, const std:
     auto surface=gfx_surface(gfx,target,*px,tw,th);
     const MidpFont font=midp_font(gfx,true);
     const int h=font.pixels();int64_t cx=x;size_t i=0;
+
     while(i<s.size()) {
         const int cp=utf8_next(s,i),cell=font.cell(cp),advance=font.advance(cp);
         const uint8_t* cjk=cp>=128?find_cjk(cp):nullptr;
@@ -1603,279 +1611,22 @@ static void reset_game_keys(int canvas) {
 }
 #define J2ME_WAR_DOUBLETAP_VM
 #undef J2ME_WAR_DOUBLETAP_VM
-static bool decode_png(const std::vector<uint8_t>& png, std::vector<uint8_t>& rgb, std::vector<uint8_t>& alpha, int& w, int& h, std::string& err) {
-    static const uint8_t signature[8]={137,80,78,71,13,10,26,10};
-    if(png.size()<8||std::memcmp(png.data(),signature,8)!=0){err="not png";return false;}
-    int bit_depth = 0, color = 0, interlace = 0;
-    std::vector<uint8_t> idat, plte, trns;
-    size_t i = 8;
-    while (i + 12 <= png.size()) {
-        uint32_t n = ru32(&png[i]);
-        if (n > png.size() - i - 12) { err = "bad png chunk"; return false; }
-        std::string type((const char*)&png[i + 4], 4);
-        const uint8_t* body = &png[i + 8];
-        if(type=="IHDR") {
-            if(n!=13||body[10]!=0||body[11]!=0||body[12]>1){err="bad png header";return false;}
-            w=(int)ru32(body);h=(int)ru32(body+4);bit_depth=body[8];color=body[9];interlace=body[12];
-        }
-        else if (type == "PLTE") plte.assign(body, body + n);
-        else if (type == "tRNS") trns.assign(body, body + n);
-        else if (type == "IDAT") idat.insert(idat.end(), body, body + n);
-        else if (type == "IEND") break;
-        i += 12 + n;
-    }
-    int channels = color == 2 ? 3 : color == 4 ? 2 : color == 6 ? 4 : 1;
-    if (w <= 0 || h <= 0 || w > 4096 || h > 4096 || (color != 0 && color != 2 && color != 3 && color != 4 && color != 6)) {
-        err = "png format c" + std::to_string(color) + " d" + std::to_string(bit_depth) + " i" + std::to_string(interlace);
-        return false;
-    }
-    if ((color == 2 || color == 4 || color == 6) && bit_depth != 8) { err = "png depth"; return false; }
-    if (bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8) { err = "png depth"; return false; }
-    // PNG permits all zlib window sizes up to 32 KiB, not only CMF 0x78.
-    if (idat.size() < 8 || (idat[0] & 15) != 8 || (idat[0] >> 4) > 7 ||
-        (((unsigned)idat[0] << 8) | idat[1]) % 31 != 0 || (idat[1] & 32)) {
-        err = "png zlib"; return false;
-    }
-    static const int a7r[7] = {0, 0, 4, 0, 2, 0, 1};
-    static const int a7c[7] = {0, 4, 0, 2, 0, 1, 0};
-    static const int a7ri[7] = {8, 8, 8, 4, 4, 2, 2};
-    static const int a7ci[7] = {8, 8, 4, 4, 2, 2, 1};
-    int passes = interlace ? 7 : 1;
-    auto pass_dim = [&](int pass, int& rows, int& cols) {
-        if (!interlace) { rows = h; cols = w; return; }
-        rows = h > a7r[pass] ? (h - a7r[pass] + a7ri[pass] - 1) / a7ri[pass] : 0;
-        cols = w > a7c[pass] ? (w - a7c[pass] + a7ci[pass] - 1) / a7ci[pass] : 0;
-    };
-    size_t raw_size = 0;
-    for (int pass = 0; pass < passes; ++pass) {
-        int rows = 0, cols = 0; pass_dim(pass, rows, cols);
-        if (!rows || !cols) continue;
-        raw_size += (size_t)rows * (1 + (cols * channels * bit_depth + 7) / 8);
-    }
-    std::vector<uint8_t> raw(raw_size ? raw_size : 1);
-    unsigned long dlen = raw.size(), slen = idat.size() - 6;
-    bool inflated=false;
-#if J2ME_OPT_FAST_PNG
-    // Reuse the already bundled stb decoder's bounded Huffman fast table.
-    // Keep the existing PNG parser (palettes, Adam7, filters and tRNS), and
-    // the strict ZIP decompressor unchanged. Adler mismatch/unsupported input
-    // falls back to puff rather than silently changing legacy compatibility.
-    if(raw_size<=size_t(INT_MAX) && slen<=unsigned(INT_MAX)) {
-        const int got=stbi_zlib_decode_noheader_buffer(reinterpret_cast<char*>(raw.data()),int(raw_size),
-            reinterpret_cast<const char*>(idat.data()+2),int(slen));
-        if(got>=0 && size_t(got)==raw_size) {
-            uint32_t a=1,b=0;
-            for(size_t off=0;off<raw_size;) {
-                const size_t end=std::min(raw_size,off+5552);
-                while(off<end){a+=raw[off++];b+=a;}
-                a%=65521u;b%=65521u;
-            }
-            inflated=((b<<16)|a)==ru32(idat.data()+idat.size()-4);
-            if(inflated)++VMS_RS(g_png_fast);
-        }
-    }
-#endif
-    if(!inflated) {
-        ++VMS_RS(g_png_fallback);
-        if (puff(raw.data(), &dlen, idat.data() + 2, &slen) != 0 || dlen < raw_size) { err = "png inflate"; return false; }
-    }
-    rgb.assign((size_t)w * h * 3, 0);
-    alpha.assign((size_t)w * h, 255);
-    auto paeth = [](int a, int b, int c) {
-        int pp = a + b - c, pa = std::abs(pp - a), pb = std::abs(pp - b), pc = std::abs(pp - c);
-        if (pa <= pb && pa <= pc) return a;
-        return pb <= pc ? b : c;
-    };
-    size_t p = 0;
-    for (int pass = 0; pass < passes; ++pass) {
-        int rows = 0, cols = 0; pass_dim(pass, rows, cols);
-        if (!rows || !cols) continue;
-        int row_bytes = (cols * channels * bit_depth + 7) / 8;
-        int filter_bpp = std::max(1, (channels * bit_depth) / 8);
-        std::vector<uint8_t> prev(row_bytes, 0), cur(row_bytes, 0);
-        for (int ry = 0; ry < rows; ++ry) {
-            if (p >= raw.size()) { err = "png short"; return false; }
-            int filter = raw[p++];
-            for (int x = 0; x < row_bytes; ++x) {
-                int v = raw[p++], a = x >= filter_bpp ? cur[x - filter_bpp] : 0, b = prev[x], c = x >= filter_bpp ? prev[x - filter_bpp] : 0;
-                if (filter == 1) v += a; else if (filter == 2) v += b; else if (filter == 3) v += (a + b) / 2; else if (filter == 4) v += paeth(a, b, c);
-                else if (filter) { err = "png filter"; return false; }
-                cur[x] = (uint8_t)v;
-            }
-            auto sample = [&](int x) {
-                int bit = x * bit_depth;
-                int byte = cur[bit >> 3];
-                int shift = 8 - bit_depth - (bit & 7);
-                return (byte >> shift) & ((1 << bit_depth) - 1);
-            };
-            for (int rx = 0; rx < cols; ++rx) {
-                int r = 0, g = 0, b = 0, a = 255, s = sample(rx);
-                if (color == 0) {
-                    r = g = b = bit_depth == 8 ? s : s * 255 / ((1 << bit_depth) - 1);
-                    if (trns.size() >= 2 && s == (int)((trns[0] << 8) | trns[1])) a = 0;
-                } else if (color == 2) {
-                    r = cur[rx * 3]; g = cur[rx * 3 + 1]; b = cur[rx * 3 + 2];
-                    if (trns.size() >= 6 && r == trns[1] && g == trns[3] && b == trns[5]) a = 0;
-                } else if (color == 3) {
-                    if (s * 3 + 2 < (int)plte.size()) { r = plte[s * 3]; g = plte[s * 3 + 1]; b = plte[s * 3 + 2]; }
-                    if (s < (int)trns.size()) a = trns[s];
-                } else if (color == 4) {
-                    r = g = b = cur[rx * 2]; a = cur[rx * 2 + 1];
-                } else {
-                    r = cur[rx * 4]; g = cur[rx * 4 + 1]; b = cur[rx * 4 + 2]; a = cur[rx * 4 + 3];
-                }
-                int x = interlace ? a7c[pass] + rx * a7ci[pass] : rx;
-                int y = interlace ? a7r[pass] + ry * a7ri[pass] : ry;
-                size_t di = ((size_t)y * w + x);
-                rgb[di * 3] = (uint8_t)r; rgb[di * 3 + 1] = (uint8_t)g; rgb[di * 3 + 2] = (uint8_t)b;
-                alpha[di] = (uint8_t)a;
-            }
-            prev.swap(cur);
-        }
-    }
-    return true;
+static bool decode_png(const std::vector<uint8_t>& bytes,std::vector<uint8_t>& rgb,std::vector<uint8_t>& alpha,int& w,int& h,std::string& error){
+    native_image::Diagnostics diagnostics;
+    const bool ok=native_image::decode_png(bytes,rgb,alpha,w,h,error,diagnostics);
+    VMS_RS(g_png_fast)+=diagnostics.png_fast;VMS_RS(g_png_fallback)+=diagnostics.png_fallback;return ok;
 }
-static bool gif_subblocks(const std::vector<uint8_t>& g, size_t& p, std::vector<uint8_t>& out, std::string& err) {
-    out.clear();
-    while (p < g.size()) {
-        int n = g[p++];
-        if (n == 0) return true;
-        if (p + (size_t)n > g.size()) { err = "gif sub"; return false; }
-        out.insert(out.end(), g.begin() + p, g.begin() + p + n);
-        p += n;
-    }
-    err = "gif trunc";
-    return false;
+static bool decode_gif(const std::vector<uint8_t>& bytes,std::vector<uint8_t>& rgb,std::vector<uint8_t>& alpha,int& w,int& h,std::string& error){
+    return native_image::decode_gif(bytes,rgb,alpha,w,h,error);
 }
-static bool decode_gif(const std::vector<uint8_t>& gif, std::vector<uint8_t>& rgb, std::vector<uint8_t>& alpha, int& w, int& h, std::string& err) {
-    if (gif.size() < 13 || gif[0] != 'G' || gif[1] != 'I' || gif[2] != 'F') { err = "not gif"; return false; }
-    int sw = gif[6] | (gif[7] << 8), sh = gif[8] | (gif[9] << 8);
-    int packed = gif[10];
-    size_t p = 13;
-    std::vector<uint8_t> gct;
-    if (packed & 0x80) {
-        int n = 1 << ((packed & 7) + 1);
-        if (p + (size_t)n * 3 > gif.size()) { err = "gif gct"; return false; }
-        gct.assign(gif.begin() + p, gif.begin() + p + n * 3);
-        p += (size_t)n * 3;
-    }
-    int trans = -1, iw = 0, ih = 0, left = 0, top = 0, interlace = 0;
-    std::vector<uint8_t> indices, palette = gct;
-    bool got = false;
-    while (p < gif.size() && !got) {
-        uint8_t tag = gif[p++];
-        if (tag == 0x3B) break;
-        if (tag == 0x21) {
-            if (p >= gif.size()) { err = "gif ext"; return false; }
-            uint8_t label = gif[p++];
-            if (label == 0xF9) {
-                if (p >= gif.size()) { err = "gif gce"; return false; }
-                int sz = gif[p++];
-                if (p + (size_t)sz > gif.size()) { err = "gif gce"; return false; }
-                if (sz >= 4 && (gif[p] & 1)) trans = gif[p + 3];
-                p += sz;
-                if (p < gif.size() && gif[p] == 0) p++;
-            } else {
-                std::vector<uint8_t> skip;
-                if (!gif_subblocks(gif, p, skip, err)) return false;
-            }
-        } else if (tag == 0x2C) {
-            if (p + 9 > gif.size()) { err = "gif img"; return false; }
-            left = gif[p] | (gif[p + 1] << 8); top = gif[p + 2] | (gif[p + 3] << 8);
-            iw = gif[p + 4] | (gif[p + 5] << 8); ih = gif[p + 6] | (gif[p + 7] << 8);
-            int pk = gif[p + 8]; p += 9;
-            interlace = (pk & 0x40) ? 1 : 0;
-            palette = gct;
-            if (pk & 0x80) {
-                int n = 1 << ((pk & 7) + 1);
-                if (p + (size_t)n * 3 > gif.size()) { err = "gif lct"; return false; }
-                palette.assign(gif.begin() + p, gif.begin() + p + n * 3);
-                p += (size_t)n * 3;
-            }
-            if (p >= gif.size() || iw <= 0 || ih <= 0 || palette.size() < 3) { err = "gif img"; return false; }
-            int min_code = gif[p++];
-            if (min_code < 2 || min_code > 8) { err = "gif lzw"; return false; }
-            std::vector<uint8_t> data;
-            if (!gif_subblocks(gif, p, data, err)) return false;
-            int clear = 1 << min_code, eoi = clear + 1, code_size = min_code + 1, next = eoi + 1;
-            std::vector<std::vector<uint8_t>> dict(4096);
-            for (int i = 0; i < clear; ++i) dict[i] = {(uint8_t)i};
-            uint32_t acc = 0; int bits = 0, di = 0, prev = -1;
-            auto read_code = [&]() -> int {
-                while (bits < code_size) {
-                    if (di >= (int)data.size()) return eoi;
-                    acc |= (uint32_t)data[di++] << bits;
-                    bits += 8;
-                }
-                int code = (int)(acc & ((1u << code_size) - 1));
-                acc >>= code_size; bits -= code_size;
-                return code;
-            };
-            indices.clear();
-            indices.reserve((size_t)iw * ih);
-            while ((int)indices.size() < iw * ih) {
-                int code = read_code();
-                if (code == eoi) break;
-                if (code == clear) {
-                    code_size = min_code + 1; next = eoi + 1; prev = -1;
-                    for (int i = eoi + 1; i < 4096; ++i) dict[i].clear();
-                    continue;
-                }
-                std::vector<uint8_t> entry;
-                if (code < next && !dict[code].empty()) entry = dict[code];
-                else if (code == next && prev >= 0) { entry = dict[prev]; entry.push_back(dict[prev][0]); }
-                else { err = "gif code"; return false; }
-                indices.insert(indices.end(), entry.begin(), entry.end());
-                if (prev >= 0 && next < 4096) {
-                    dict[next] = dict[prev];
-                    dict[next].push_back(entry[0]);
-                    next++;
-                    if (next == (1 << code_size) && code_size < 12) code_size++;
-                }
-                prev = code;
-            }
-            got = true;
-        } else { err = "gif block"; return false; }
-    }
-    if (!got) { err = "gif empty"; return false; }
-    w = std::max(sw, left + iw); h = std::max(sh, top + ih);
-    if (w <= 0 || h <= 0 || w > 1024 || h > 1024) { err = "gif size"; return false; }
-    rgb.assign((size_t)w * h * 3, 0);
-    alpha.assign((size_t)w * h, 0);
-    auto put = [&](int x, int y, int index) {
-        if ((unsigned)x >= (unsigned)w || (unsigned)y >= (unsigned)h) return;
-        size_t di = (size_t)y * w + x;
-        if (index == trans) { alpha[di] = 0; return; }
-        int pi = index * 3;
-        if (pi + 2 < (int)palette.size()) { rgb[di * 3] = palette[pi]; rgb[di * 3 + 1] = palette[pi + 1]; rgb[di * 3 + 2] = palette[pi + 2]; }
-        alpha[di] = 255;
-    };
-    if (!interlace) {
-        for (int y = 0; y < ih; ++y)
-            for (int x = 0; x < iw; ++x) {
-                size_t k = (size_t)y * iw + x;
-                put(left + x, top + y, k < indices.size() ? indices[k] : 0);
-            }
-    } else {
-        int starts[4] = {0, 4, 2, 1}, steps[4] = {8, 8, 4, 2}, row = 0;
-        for (int pass = 0; pass < 4; ++pass)
-            for (int y = starts[pass]; y < ih; y += steps[pass], ++row)
-                for (int x = 0; x < iw; ++x) {
-                    size_t k = (size_t)row * iw + x;
-                    put(left + x, top + y, k < indices.size() ? indices[k] : 0);
-                }
-    }
-    return true;
-}
-static bool decode_image(const std::vector<uint8_t>& bytes, std::vector<uint8_t>& rgb, std::vector<uint8_t>& alpha, int& w, int& h, std::string& err) {
-    P7_SCOPE(Decode);
-    if (bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8)
-        return j2me_image::decode_jpeg(bytes, rgb, alpha, w, h, err);
-    std::string png_err, gif_err;
-    if (decode_png(bytes, rgb, alpha, w, h, png_err)) return true;
-    if (decode_gif(bytes, rgb, alpha, w, h, gif_err)) return true;
-    err = png_err + "; " + gif_err;
-    return false;
+static bool decode_image(const std::vector<uint8_t>& bytes,std::vector<uint8_t>& rgb,std::vector<uint8_t>& alpha,int& w,int& h,std::string& error){
+    native_image::Result result;native_image::RunMetrics metrics;
+    native_image::decode_wait(native_prep_runtime::prep_queue(),native_prep_runtime::epoch,bytes,result,metrics);
+    // This merge and every Java allocation/exception stay on the VM owner.
+    VMS_RS(g_png_fast)+=result.diagnostics.png_fast;VMS_RS(g_png_fallback)+=result.diagnostics.png_fallback;
+    error=std::move(result.error);
+    if(result.ok){rgb=std::move(result.rgb);alpha=std::move(result.alpha);w=result.width;h=result.height;}
+    return result.ok;
 }
 static void install_image(Method* m, std::vector<uint8_t> rgb, std::vector<uint8_t> alpha, int w, int h, Frame& fr, bool mutable_image=false) {
     const int cid=ensure_class("javax/microedition/lcdui/Image");
@@ -1938,6 +1689,7 @@ static int stream_from(const std::vector<uint8_t>& data) {
 #include "threading.h"
 #include "m3g_support.h"
 #include "m3g_geometry.h"
+#include "micro3d_support.h"
 #include "m3g_texture238.h"
 #include "m3g_span239.h"
 #include "m3g_row240.h"
@@ -1946,6 +1698,8 @@ static int stream_from(const std::vector<uint8_t>& data) {
 #include "m3g_mesh242.h"
 #include "m3g_lighting242.h"
 #include "m3g_assembly242.h"
+#include "m3g_gpu_bridge.inc"
+#include "m3g_cpu_raster_bridge.inc"
 
 #include "runtime/midp_bridge.inc"
 
@@ -2031,7 +1785,9 @@ static void gc_mark_phase(std::vector<char>& mark, std::vector<int>& work, bool 
         }
     }
 }
-static void gc_collect(const std::string& why) { P61_SCOPE(3, nullptr); P7_SCOPE(Gc);
+static void gc_collect(const std::string& why) {
+    cpu_raster_boundary(m3g_raster_scope::Boundary::Yield); P61_SCOPE(3, nullptr); P7_SCOPE(Gc);
+    native_prep_runtime::Pause prep_pause;
     const auto diagnostic_phase=diag_phase_enter(runtime_diag::Phase::GC);
     RuntimeProfileScope gc(VMS_EXEC(g_runtime_profile),RuntimeProfile::Kind::GC);
     ++VMS_HEAP(g_gc_cycles);
@@ -2241,12 +1997,32 @@ static void thread_resume() {
 }
 static void thread_pump() { thread_resume(); }
 static void stop_thread(int p1_reason=2) {
+    cpu_raster_boundary(m3g_raster_scope::Boundary::Lifecycle);
+    if(m3g_cpu_raster_bridge::stats.commands)log_line(m3g_cpu_raster_bridge::counters());
     VMS_EXEC(g_exec_ctx).native_poll_host_deadline_us=0;
     g_timer_clock_owner=nullptr;
     if(p7::g_window_start.load(std::memory_order_relaxed)){ log_line(p7::counters_summary(p1_reason==3?"destroy":"stop")); p7::g_window_start.store(0,std::memory_order_relaxed); }
     p8_caught_report(); p8::g_caught.clear(); p8::g_caught_total=0; // P8.2: per-launch caught-exception totals
     startup_trace("stop/pool-before");
+    native_prep_runtime::Pause prep_pause;
     p7::pool().drain(); // P7.2: no worker task may outlive the heap it was submitted against
+    log_line(native_image::summary()+" scope=since_last_launch");
+    {const auto& s=m3g_gpu_bridge::stats;
+        log_line("M3GGPU_BRIDGE scope=since_last_launch geometry_requests="+std::to_string(s.geometry_requests)+
+            " geometry_resolved="+std::to_string(s.geometry_resolved)+" skin_calls="+std::to_string(s.skin_calls)+
+            " skin_blocks="+std::to_string(s.skin_blocks)+" skin_meshes="+std::to_string(s.skin_meshes)+" skin_resolved="+std::to_string(s.skin_resolved)+
+            " skin_vertices="+std::to_string(s.skin_vertices)+" captured_bytes="+std::to_string(s.captured_bytes)+
+            " capture_wall_us="+std::to_string(s.main_capture_ns/1000)+" commit_wall_us="+std::to_string(s.main_commit_ns/1000)+
+            " wait_wall_us="+std::to_string(s.wait_wall_ns/1000)+" stale="+std::to_string(s.stale_results)+
+            " api_validation_wall_us="+std::to_string(s.api_validation_ns/1000)+" api_cache_hits="+std::to_string(s.api_cache_hits)+
+            " api_seal_wall_us="+std::to_string(s.api_seal_ns/1000)+" api_seal_bytes="+std::to_string(s.api_seal_bytes)+
+            " resolved_is_not_device_verification=1");
+        if(m3g_gpu_bridge::diagnostic_declines){
+            std::string counts="M3GGPU_DECLINES";
+            for(size_t i=0;i<s.geometry_declines.size();++i)counts+=" "+std::string(m3g_gpu_bridge::geometry_decline_names[i])+"="+std::to_string(s.geometry_declines[i]);
+            log_line(counts);
+        }
+    }
     startup_trace("stop/pool-after");
     if(p7gc::g_enabled)log_line("P7GC_STATS parallel="+std::to_string(p7gc::g_parallel)+" serial="+std::to_string(p7gc::g_serial_small)+" trace_us_serial="+std::to_string(p7gc::g_trace_ns[0]/1000)+" n_serial="+std::to_string(p7gc::g_trace_n[0])+" trace_us_parallel="+std::to_string(p7gc::g_trace_ns[1]/1000)+" n_parallel="+std::to_string(p7gc::g_trace_n[1])+" probes="+std::to_string(p7gc::g_adapt.probes)+" donations="+std::to_string(p7gc::g_donations)+" verify_runs="+std::to_string(p7gc::g_verify_runs)+" verify_bad_slots="+std::to_string(p7gc::g_verify_bad_slots));
     if(p7present::g_enabled)log_line(p7present::stats());
@@ -2455,8 +2231,9 @@ static void p1_begin_m3g_epoch(){VMS_DIAG(g_p1_m3g_base)=p1_m3g_values();}
 static void p1_report_m3g_epoch(){auto v=p1_m3g_values();const auto& b=VMS_DIAG(g_p1_m3g_base);
     log_line("P1M3G scope=launch_delta launch="+std::to_string(VMS_DIAG(g_p1).launch_id)+" identity="+std::to_string(v.identity-b.identity)+" skin="+std::to_string(v.skin-b.skin)+" quantize="+std::to_string(v.quantize-b.quantize)+" light="+std::to_string(v.light-b.light)+" gathered="+std::to_string(v.gathered-b.gathered)+" emitted="+std::to_string(v.emitted-b.emitted)+" texture="+std::to_string(v.texture-b.texture)+" span="+std::to_string(v.span-b.span)+" row="+std::to_string(v.row-b.row));
 }
-// P8.10: jit/p7-worker/p7-audio/p7-gc/p7-present default ON; X.disable (Switch) or env=0 (desktop) turns one off.
-// Old X.enable files are ignored (never an error). Source is recorded for the P810DEFAULTS line.
+// Default-on CPU/font/presentation features use X.disable (Switch) or env=0 (desktop).
+// 3D GPU remains separately opt-in.
+// Default-on features ignore old X.enable files; opt-in paths use their separate policy.
 static bool p810_switch(const char* name,const char* env,std::string& src){
 #ifdef __SWITCH__
     (void)env; struct stat st{}; const std::string p=std::string("sdmc:/switch/j2me/")+name+".disable";
@@ -2466,6 +2243,20 @@ static bool p810_switch(const char* name,const char* env,std::string& src){
         if(!std::strcmp(v,"1")){src=std::string("env:")+env+"=1";return true;} }
 #endif
     src="default"; return true;
+}
+// Performance-negative optional paths remain opt-in; explicit disable wins.
+static bool p810_opt_in(const char* name,const char* env,std::string& src){
+#ifdef __SWITCH__
+    (void)env;struct stat st{};const std::string base=std::string("sdmc:/switch/j2me/")+name;
+    if(stat((base+".disable").c_str(),&st)==0){src=std::string(name)+".disable";return false;}
+    if(stat((base+".enable").c_str(),&st)==0){src=std::string(name)+".enable";return true;}
+#else
+    (void)name;if(const char* v=std::getenv(env)){
+        if(!std::strcmp(v,"1")){src=std::string("env:")+env+"=1";return true;}
+        if(!std::strcmp(v,"0")){src=std::string("env:")+env+"=0";return false;}
+    }
+#endif
+    src="default_off";return false;
 }
 static void p1_configure(){
     city_diag_configure();
@@ -2579,9 +2370,27 @@ static void configure_runtime_diagnostics() {
     }
     log_line("JIT mode=default_on requested="+std::to_string(jit_requested)+" enabled="+std::to_string(VMS_NATIVE(g_native_jit).enabled)+" source="+jit_src+
         " self_test="+std::to_string(VMS_NATIVE(g_native_jit).self_test)+" arch="+jit236::architecture()+" tier=T3_region_ic_switch_p68 loops=compiled ic=monomorphic_trivial_inline heap=read_and_checked_int_array_store wait_loops=never putstatic=interpreter");
-    {   // P7.2 worker base: default off; no work is moved onto the workers in this version.
+    {   // Shared worker services; admission and lifecycle guards still apply.
         const bool p7_requested=p810_switch("p7-worker","J2ME_P7_WORKER",w_src);
+        native_prep_runtime::shutdown();
         log_line(p7::configure(p7_requested,resver::g_epoch));
+        std::string cpu_worker_src,native_prep_src;
+        const bool cpu_worker_requested=p810_opt_in("m3g-cpu-worker","J2ME_M3G_CPU_WORKER",cpu_worker_src);
+        const bool native_prep_requested=p810_switch("native-prep","J2ME_NATIVE_PREP",native_prep_src);
+        const bool cpu_worker_enabled=m3g_cpu_raster_bridge::configure(cpu_worker_requested,VMS_DIAG(g_p1_profile).active,r4::state.active);
+        log_line("M3GCPU_WORKER requested="+std::to_string(cpu_worker_requested)+" enabled="+std::to_string(cpu_worker_enabled)+" worker=core2 sync_scope=mesh default=off source="+cpu_worker_src+" blocked_profile="+std::to_string(VMS_DIAG(g_p1_profile).active)+" blocked_r4="+std::to_string(r4::state.active)+" pool="+p7::pool().status());
+#ifdef __SWITCH__
+        struct stat m3g_gpu_file{};
+        const bool m3g_gpu_requested=stat("sdmc:/switch/j2me/m3g-gpu.enable",&m3g_gpu_file)==0;
+#else
+        const char* m3g_gpu_env=std::getenv("J2ME_M3G_GPU");
+        const bool m3g_gpu_requested=m3g_gpu_env&&std::strcmp(m3g_gpu_env,"1")==0;
+#endif
+        native_prep_runtime::configure(native_prep_requested,resver::g_epoch);
+        m3g_gpu::enabled=m3g_gpu_requested&&!VMS_DIAG(g_p1_profile).active;
+        m3g_gpu_bridge::diagnostic_declines=m3g_gpu::enabled;
+        log_line("M3GGPU requested="+std::to_string(m3g_gpu_requested)+" enabled="+std::to_string(m3g_gpu::enabled)+" provider=owner_or_test execution_evidence=separate prototype_visibility=per_request geometry_depth_policy=strict_depthless classes=frozen");
+        log_line("NATIVEPREP requested="+std::to_string(native_prep_requested)+" enabled="+std::to_string(native_prep_runtime::prep_queue()!=nullptr)+" worker=core2 sync_API_order=preserved source="+native_prep_src);
 #ifdef __SWITCH__
         struct stat p7c_file{};p7::g_count_on=stat("sdmc:/switch/j2me/p7-count.enable",&p7c_file)==0;
 #else
@@ -3064,6 +2873,7 @@ static void lifecycle_resume() {
 static void host_freeze236(bool freeze) {
     if(VMS_EXEC(g_midlet_state)==MidletState::Destroyed || VMS_EXEC(g_midlet_state)==MidletState::Empty)return;
     if(freeze) {
+        if(!host_render_lifecycle::barrier()){log_line("RENDEROWNER freeze deferred: not quiescent");return;}
         g_device_diag.owner.paused=true;g_device_diag.live.publish(g_device_diag.owner);g_device_diag.detector.reset();
         if(VMS_PLAT(g_host_frozen236))return;
         if(VMS_EXEC(g_midlet_state)!=MidletState::Active){lifecycle_pause(true);return;}
@@ -3097,6 +2907,7 @@ static void host_freeze236(bool freeze) {
 static void lifecycle_destroy(bool notify_only) {
     if(VMS_EXEC(g_run_depth) || VMS_EXEC(g_pump_depth)) {VMS_EXEC(g_notify_destroyed)=true;return;}
     if(VMS_EXEC(g_midlet_state)==MidletState::Destroyed || VMS_EXEC(g_midlet_state)==MidletState::Empty)return;
+    if(!host_render_lifecycle::barrier()){VMS_EXEC(g_notify_destroyed)=true;log_line("RENDEROWNER destroy deferred: not quiescent");return;}
     VMS_PLAT(g_host_frozen236)=false;VMS_PLAT(g_host_freeze_started236)=0;
     VMS_EXEC(g_midlet_state)=MidletState::Destroyed; VMS_PLAT(g_key_states)=0;
     audio_suspend(true); display_visibility();
@@ -3502,7 +3313,7 @@ static bool unzip(const std::vector<uint8_t>& zip, std::unordered_map<std::strin
         } else if(method==8) {
             raw.resize(usize?usize:1);
             unsigned long dlen=raw.size(),slen=csize;
-            int rc=puff(raw.data(),&dlen,zip.data()+data,&slen);
+            int rc=j2me_image::inflate_raw(raw.data(),&dlen,zip.data()+data,&slen);
             if(rc || dlen!=usize || slen!=csize)return fail("zip inflate mismatch: "+name);
             raw.resize(usize);
         } else return fail("zip method unsupported: "+std::to_string(method));
@@ -3708,11 +3519,16 @@ static std::string manifest_midlet() {
     return "";
 }
 static void launch_class(const std::string& main, const std::string& suite = "", bool import_legacy = false) {
+    if(!host_render_lifecycle::barrier()||!host_render_lifecycle::epoch_changed(uint64_t(resver::g_epoch)+1)){
+        log_line("RENDEROWNER launch deferred: not quiescent");return;
+    }
     // Copy before stop_thread: callers may pass the current identity by reference.
     const std::string identity = suite.empty() ? rms_class_identity(main, VMS_CL(g_classpath)) : suite;
     startup_trace("launch/stop-before");
     stop_thread();
     startup_trace("launch/stop-after");
+    native_image::totals::reset();
+    m3g_gpu_bridge::stats={};
     VMS_EXEC(g_last_console_line).clear(); VMS_EXEC(g_self_exit)=false;   // 0.2.112 F2: per-launch
     p1_new_launch(identity,main);
     VMS_PLAT(g_rms_suite) = identity; VMS_PLAT(g_rms_import_legacy) = import_legacy;
@@ -3733,6 +3549,7 @@ static void launch_class(const std::string& main, const std::string& suite = "",
     std::vector<int>().swap(VMS_HEAP(g_gc_work_scratch));
     VMS_CL(g_classes).clear(); VMS_CL(g_class_index).clear();
     resver::bump_epoch(); // P2.5: launch/suite switch invalidates every ResourceKey
+    native_prep_runtime::epoch_changed(resver::g_epoch);
     p7::pool().epoch_clear(resver::g_epoch); p7::counters_reset(); p8_caught_reset(); // P7.2 / P8.2
     VMS_HEAP(g_heap).assign(1, Obj{}); VMS_HEAP(g_free).clear();
     VMS_DIAG(g_exception_traces).clear();
@@ -4057,6 +3874,9 @@ static void maybe_emit_runtime_stats(){
     VMS_EXEC(g_speed_budget_window_frames)=VMS_EXEC(g_speed_group_timeouts)=0;
     VMS_EXEC(g_speed_slept_us)=0; VMS_EXEC(g_speed_cut_us)=0; VMS_EXEC(g_speed_add_us)=0; VMS_EXEC(g_pace_aligns)=0;
 }
+
+#include "game_data_editor.h"
+#include "game_text_input.h"
 
 #ifndef __SWITCH__
 #include "deterministic_driver.inc"

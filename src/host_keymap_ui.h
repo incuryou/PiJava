@@ -58,30 +58,33 @@ inline void footer(uint32_t* f,size_t pitch,
         left=x+width+32; // Equal blank space from text ink to the next icon.
     }
 }
+inline void render_tabs(uint32_t* f,size_t pitch,Page page,
+                        const host_menu::CenteredText& center) {
+    using host_menu::color;using host_menu::rect;
+    const int starts[]={49,267,525};
+    const char* names[]={"存档与退出","修改按键映射","内存修改"};
+    rect(f,pitch,0,0,1280,82,color(0xffffff));
+    rect(f,pitch,starts[int(page)]-17,27,5,30,color(0xc81e41));
+    if(center)for(int i=0;i<3;++i){int w=host_menu::text_advance(names[i],29);
+        center(starts[i]+w/2,42,names[i],int(page)==i?color(0x26313e):color(0x718094),29,w);}
+    prompt(f,pitch,1080,42,"L",30,center);prompt(f,pitch,1122,42,"R",30,center);
+    if(center)center(1191,42,"切换页面",color(0x718094),18,92);
+}
 inline void render(uint32_t* f,size_t pitch,const Editor& e,
                    const host_menu::Text& text,const host_menu::CenteredText& center,const TextRight& right={},host_pro::Preview* preview=nullptr,host_controller::InkMeasure ink_measure=nullptr) {
     const bool saves=e.page==Page::SaveExit;
     if(!f||pitch<1280)return;
     using host_menu::rect;using host_menu::color;
     const auto ink=color(0x26313e),muted=color(0x718094),red=color(0xc81e41),line=color(0xcbd4df),white=color(0xffffff);
-    rect(f,pitch,0,0,1280,720,color(0xf2f4f7));rect(f,pitch,0,0,1280,82,white);
-    rect(f,pitch,saves?32:250,27,5,30,red);
-    // Header ink and the accent bar share the exact same vertical center.
-    if(center) {
-        const std::string save_tab="存档与退出",map_tab="修改按键映射";
-        const int save_width=host_menu::text_advance(save_tab,29),map_width=host_menu::text_advance(map_tab,29);
-        center(49+save_width/2,42,save_tab,saves?ink:muted,29,save_width);
-        center(267+map_width/2,42,map_tab,saves?muted:ink,29,map_width);
-    }
-    prompt(f,pitch,1080,42,"L",30,center);prompt(f,pitch,1122,42,"R",30,center);
-    if(center)center(1191,42,"切换页面",muted,18,92);
+    rect(f,pitch,0,0,1280,720,color(0xf2f4f7));
+    render_tabs(f,pitch,e.page,center);
     rect(f,pitch,32,625,1216,1,color(0xdfe4eb));
     if(saves) {
         if(text) {
             const bool neutral=e.save_note.empty() || e.save_note_neutral;
             text(260,108,e.save_note.empty()?"删除存档、退出游戏前会再次确认":e.save_note,
                  neutral?muted:e.save_note_error?red:color(0x208351),17,845);
-            text(260,151,"当前游戏的即时存档",muted,18,845);
+            text(260,151,"当前游戏操作",muted,18,845);
         }
         const char* titles[]={"保存即时存档","删除即时存档","退出游戏"};
         const char* subtitles[]={"保存当前游戏进度","删除当前游戏的即时存档","退出到游戏列表"};

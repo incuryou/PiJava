@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -31,10 +32,14 @@
 #undef STB_IMAGE_IMPLEMENTATION
 
 namespace j2me_image {
+// stb is compiled without TLS in the original build. Serialize its shared
+// failure string and decode state across skin loading and worker image jobs.
+inline std::mutex& decoder_mutex(){static std::mutex mutex;return mutex;}
 
 inline bool decode_jpeg(const std::vector<uint8_t>& bytes,
                         std::vector<uint8_t>& rgb, std::vector<uint8_t>& alpha,
                         int& width, int& height, std::string& error) {
+    std::lock_guard<std::mutex> lock(decoder_mutex());
     if (bytes.size() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8) {
         error = "not jpeg";
         return false;

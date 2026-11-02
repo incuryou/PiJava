@@ -1,0 +1,53 @@
+#version 450
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer Positions { float positions[]; };
+layout(std430,binding=1) readonly buffer Normals { float normals[]; };
+layout(std430,binding=2) readonly buffer Matrices { float matrices[]; };
+layout(std430,binding=3) readonly buffer Ranges { uvec4 ranges[]; };
+layout(std430,binding=4) writeonly buffer PosedPositions { float posedPositions[]; };
+layout(std430,binding=5) writeonly buffer PosedNormals { float posedNormals[]; };
+layout(std140,binding=0) uniform Skin { uvec4 counts; };
+float dot3(float a,float x,float b,float y,float c,float z) {
+    precise float result=(a*x+b*y)+c*z; return result;
+}
+float invsqrtJava(float x) {
+    precise float halfValue=0.5*x;
+    precise float y=uintBitsToFloat(0x5f375996u-(floatBitsToUint(x)>>1u));
+    y=y*(1.5-(halfValue*y)*y);
+    y=y*(1.5-(halfValue*y)*y);
+    return y;
+}
+void main() {
+    uint v=gl_GlobalInvocationID.x;
+    if(v>=counts.x)return;
+    uint off=v*3u;
+    vec3 p=vec3(positions[off],positions[off+1u],positions[off+2u]);
+    vec3 n=vec3(0.0);
+    if(counts.z!=0u)n=vec3(normals[off],normals[off+1u],normals[off+2u]);
+    precise vec3 accum=vec3(0.0),an=vec3(0.0);
+    precise float ws=0.0;
+    for(uint b=0u;b<counts.y;++b) {
+        uvec4 r=ranges[b];
+        if(v<r.x||v-r.x>=r.y)continue;
+        float weight=uintBitsToFloat(r.z);
+        for(uint j=0u;j<3u;++j) {
+            uint m=r.w*16u+j*4u;
+            precise float tp=dot3(matrices[m],p.x,matrices[m+1u],p.y,matrices[m+2u],p.z)+matrices[m+3u];
+            accum[j]=accum[j]+tp*weight;
+            if(counts.z!=0u)an[j]=an[j]+dot3(matrices[m],n.x,matrices[m+1u],n.y,matrices[m+2u],n.z)*weight;
+        }
+        ws=ws+weight;
+    }
+    if(ws>0.0001) { precise float iw=1.0/ws; p=accum*iw; }
+    for(uint j=0u;j<3u;++j)posedPositions[off+j]=p[j];
+    if(counts.z!=0u) {
+        float len=dot3(an.x,an.x,an.y,an.y,an.z,an.z);
+        float original=dot3(n.x,n.x,n.y,n.y,n.z,n.z);
+        if(ws>0.0001&&len>0.0001) {
+            precise float scale=original*invsqrtJava(original);
+            precise vec3 normal=(an*invsqrtJava(len))*scale;
+            n=normal;
+        }
+        for(uint j=0u;j<3u;++j)posedNormals[off+j]=n[j];
+    }
+}

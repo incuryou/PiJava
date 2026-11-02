@@ -543,7 +543,7 @@ class Triangle
 				final int lightStride = l << 2; // l * 4
 
 				// Skip lights that aren't set to render or are at a different scope.
-				if (!light.isRenderingEnabled() || (light.getScope() & curScope) == 0)
+				if (light == null || !light.isRenderingEnabled() || (light.getScope() & curScope) == 0)
 				{
 					continue;
 				}

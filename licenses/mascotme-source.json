@@ -1,0 +1,58 @@
+{
+  "project": "MascotME",
+  "repository": "https://github.com/rmn20/MascotME",
+  "commit": "7659769711c8d93232b3364a00fe9c2c1e581772",
+  "license": "MIT",
+  "license_file": "licenses/mascotme.txt",
+  "date": "2026-10-31",
+  "files": {
+    "java/com/mascotcapsule/micro3d/v3/Graphics3D.java": {
+      "upstream_path": "src/com/mascotcapsule/micro3d/v3/Graphics3D.java",
+      "upstream_sha256": "22d05f5a2a159632588ae9b3df49c4bfdccb98737514fb130d3d9983776170d8"
+    },
+    "java/com/mascotcapsule/micro3d/v3/Rasterizer.java": {
+      "upstream_path": "src/com/mascotcapsule/micro3d/v3/Rasterizer.java",
+      "upstream_sha256": "209e237d56a2b88650371fcbe9c3eba067ed8374a46da06186e84bd1c7e255f8"
+    },
+    "java/com/mascotcapsule/micro3d/v3/Texture.java": {
+      "upstream_path": "src/com/mascotcapsule/micro3d/v3/Texture.java",
+      "upstream_sha256": "a4aa8356e89a1f2e70765d3386f47961354130ba30d7352ad2d89c77b5a973b8"
+    },
+    "java/com/mascotcapsule/micro3d/v3/Effect3D.java": {
+      "upstream_path": "src/com/mascotcapsule/micro3d/v3/Effect3D.java",
+      "upstream_sha256": "be4f865504e9a138ce0e29c6bae0a49389f76ea665fd6875dd9d31289d3836bb"
+    },
+    "java/com/mascotcapsule/micro3d/v3/Figure.java": {
+      "upstream_path": "src/com/mascotcapsule/micro3d/v3/Figure.java",
+      "upstream_sha256": "fe85b5ca339b165e15fb59eea51421a12869a26124ab720740d60a8f1eeae5aa"
+    },
+    "java/com/mascotcapsule/micro3d/v3/ActionTable.java": {
+      "upstream_path": "src/com/mascotcapsule/micro3d/v3/ActionTable.java",
+      "upstream_sha256": "26c1eaaeece04960218eca079eec536cca3947146a043dc45dff6878b29be95b"
+    },
+    "java/com/mascotcapsule/micro3d/v3/Loader.java": {
+      "upstream_path": "src/com/mascotcapsule/micro3d/v3/Loader.java",
+      "upstream_sha256": "5b79b68b6c99e43908bd216e5c58cf59c00a99d4e6cf84b3915f510ad17b48a8"
+    },
+    "java/com/mascotcapsule/micro3d/v3/MascotME.java": {
+      "upstream_path": "src/com/mascotcapsule/micro3d/v3/MascotME.java",
+      "upstream_sha256": "9eefcd7dfe409050833098786217d99f183bbbaf6228f2ab0718ac55efa95548"
+    }
+  },
+  "additional_adaptation": "Package-private rounded affine helpers in existing AffineTrans; public semantics and all previous fields retained.",
+  "modifications": [
+    "Actual MIDP target and synchronous ARGB transfer instead of framebuffer guessing/INI quality hacks",
+    "Strict parser and command bounds, CORE palette and normal payload corrections",
+    "Fractional animation interpolation, bone fallback and overflow-safe internal arithmetic",
+    "Independent per-renderer texture snapshots, per-primitive clip and stable ordering",
+    "Viewport-bounded raster traversal for large coordinates and clip expansion capacity",
+    "Owned tests, demo and Java-owned queue GC/J2S5 verification",
+    "Shared lazy shading-table cache across queued captures, ordinary Java-owned state",
+    "Persistent current texture selection for null reuse and legacy attribute bit0x08 handling",
+    "Camera direction/screen-down basis corrected using real normalized-direction caller evidence and separated A/B"
+  ],
+  "reference_only": [
+    "https://github.com/woesss/JL-Mod/tree/f723a190c0bdb44b31c3bc0ead6f8665c7ea517d",
+    "https://j2me-preservation.github.io/MascotCapsule/javadoc/com/mascotcapsule/micro3d/v3/Graphics3D.html"
+  ]
+}

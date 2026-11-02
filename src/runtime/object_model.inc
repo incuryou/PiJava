@@ -70,6 +70,10 @@ struct LiteralCache {
 struct Class {
     // Private M3G metadata only: no Java roots, never serialized.
     std::vector<std::pair<int,int>> m3g_slots238;
+    // Bounded field lookup cache: declaring class and field index only.
+    // Class reconstruction on launch/restore discards this derived metadata.
+    std::vector<std::pair<int,int>> m3g_field_slots31;
+    bool trusted_m3g_gpu = false; // Exact frozen API SHA; derived, never serialized.
     uint8_t trusted_library = 0;
     int library_value_slot = -1, library_keys_slot = -1, library_count_slot = -1;
     // Derived stream layout only, rebuilt with the class on launch/restore.
@@ -93,6 +97,8 @@ struct Class {
 struct Frame {
     Method* method = nullptr;
     uint64_t native_deadline_activation = 0; // transient provenance; not part of SavFrame/J2S5
+    uint64_t cpu_raster_scope = 0; // main-only; never serialized; restored frames remain synchronous
+    uint32_t cpu_raster_epoch = 0;
     uint64_t event_frame_cycle = 0; // transient loop iteration identity; not serialized
     CooperativePollObservation cooperative_poll; // transient; restore starts with no evidence
     std::vector<Value> locals, stack;

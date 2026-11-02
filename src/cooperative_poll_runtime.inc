@@ -16,6 +16,8 @@ static CooperativePollPattern cooperative_poll_resolve(const Frame& fr,bool* ret
         [&](int pc){return jvm_op_length(fr.method->code,pc);},
         [&](int pc){for(const auto& h:fr.method->handlers)if(h.pc==pc)return true;return false;});
     if(!v.valid())return {};
+    if(v.kind==6||v.kind==7)for(const auto& h:fr.method->handlers)
+        if(std::max(v.begin,h.start)<std::min(v.end,h.end))return {};
     if(v.kind==1) {
         const auto loaded=VMS_CL(g_class_index).find("java/lang/Math");
         if(loaded==VMS_CL(g_class_index).end()||VMS_CL(g_classes)[loaded->second].init_state<2) {
@@ -30,12 +32,11 @@ static CooperativePollPattern cooperative_poll_resolve(const Frame& fr,bool* ret
         if(!m||m->native||(m->flags&0x0528)!=0x0008||!m->handlers.empty()||
            m->code.size()!=sizeof(exact)||!std::equal(m->code.begin(),m->code.end(),exact))return {};
     }
-    auto field=[&](int cp,bool stat,int& decl,int& index) {
+    auto field=[&](int cp,bool stat,bool wide,int& decl,int& index) {
         if(cp<=0||size_t(cp)>=owner.cp.size()||owner.cp[cp].tag!=9)return false;
         std::string cls,name,desc;
         if(!pacing_resolve_member(owner,cp,cls,name,desc))return false;
-        if(!stat&&desc!="J")return false;
-        if(stat&&desc!="I"&&desc!="B"&&desc!="S"&&desc!="C"&&desc!="Z")return false;
+        if(wide?desc!="J":(desc!="I"&&desc!="B"&&desc!="S"&&desc!="C"&&desc!="Z"))return false;
         const auto loaded=VMS_CL(g_class_index).find(cls);
         if(loaded==VMS_CL(g_class_index).end()){if(retry)*retry=true;return false;}
         const auto* f=find_field(loaded->second,name,desc);
@@ -45,8 +46,8 @@ static CooperativePollPattern cooperative_poll_resolve(const Frame& fr,bool* ret
         for(size_t i=0;i<fields.size();++i)if(&fields[i]==f){index=int(i);return true;}
         return false;
     };
-    if(v.anchor_cp>=0&&!field(v.anchor_cp,false,v.anchor_owner,v.anchor_field))return {};
-    if(v.period_cp>=0&&!field(v.period_cp,true,v.period_owner,v.period_field))return {};
+    if(v.anchor_cp>=0&&!field(v.anchor_cp,v.kind==6,true,v.anchor_owner,v.anchor_field))return {};
+    if(v.period_cp>=0&&!field(v.period_cp,true,false,v.period_owner,v.period_field))return {};
     return v;
 }
 
@@ -104,6 +105,7 @@ static void cooperative_poll_clock(Frame& fr,int64_t& now,QuickSite& site,bool w
     }
     if(site.cooperative_poll<=0)return;
     const auto& v=fr.method->cooperative_polls[size_t(site.cooperative_poll-1)];
+    if((v.kind==6||v.kind==7)&&VMS_DIAG(g_p1_profile).active){obs.reset();return;}
     auto& ctx=current_context();
     auto quiet=[&]() {
         if(r4::state.active||VMS_RS(g_paint_depth)||VMS_PLAT(g_host_paused)||
@@ -126,9 +128,16 @@ static void cooperative_poll_clock(Frame& fr,int64_t& now,QuickSite& site,bool w
         return true;
     };
     auto values=[&](int64_t& anchor,int64_t& period,int& receiver,uint32_t& generation) {
-        if(!fr.stack.empty())return false;
         period=v.period_ms;receiver=0;generation=0;
-        if(v.anchor_local>=0) {
+        if(v.deadline_local>=0) {
+            if(size_t(v.deadline_local)>=fr.locals.size()||!fr.locals[v.deadline_local].is_long||
+               !cooperative_poll_deadline_window(fr.locals[v.deadline_local].l,now,anchor,period))return false;
+        } else if(v.kind==6) {
+            const auto& cls=VMS_CL(g_classes)[v.anchor_owner];const auto& field=cls.fields[v.anchor_field];
+            if(cls.init_state!=2||(field.flags&0x0040)||field.slot<0||size_t(field.slot)>=cls.statics.size()||
+               !cls.statics[field.slot].is_long)return false;
+            anchor=cls.statics[field.slot].l;
+        } else if(v.anchor_local>=0) {
             if(size_t(v.anchor_local)>=fr.locals.size()||!fr.locals[v.anchor_local].is_long)return false;
             anchor=fr.locals[v.anchor_local].l;
         } else {
@@ -146,8 +155,10 @@ static void cooperative_poll_clock(Frame& fr,int64_t& now,QuickSite& site,bool w
             if(cls.init_state!=2||(field.flags&0x0040)||field.slot<0||size_t(field.slot)>=cls.statics.size())return false;
             period=cls.statics[field.slot].i;
         }
-        return anchor>=0&&period>=2&&period<=120&&anchor<=INT64_MAX-period&&
-            now>=anchor&&now<anchor+period&&(v.kind!=3||now>anchor);
+        if(!(anchor>=0&&period>=2&&period<=120&&anchor<=INT64_MAX-period&&
+            now>=anchor&&now<anchor+period&&(v.kind!=3||now>anchor)))return false;
+        const bool top_long=!fr.stack.empty()&&fr.stack.back().is_long;
+        return cooperative_poll_stack_matches(v.kind,fr.stack.size(),top_long,top_long?fr.stack.back().l:0,anchor+period);
     };
     int64_t anchor=0,period=0;int receiver=0;uint32_t generation=0;
     const auto& clock=VMS_EXEC(g_game_clock);
@@ -163,9 +174,12 @@ static void cooperative_poll_clock(Frame& fr,int64_t& now,QuickSite& site,bool w
     }
     obs.last_ms=now;if(obs.reads<4)++obs.reads;if(obs.reads<4)return;
     auto requested=[&]()->int64_t {
-        // Keep at least a real millisecond for the original Java comparison.
+        // Stop napping earlier for the new shapes: the shorter awake tail
+        // increased frame jitter in host tests. Keep the original Java loop
+        // running through this tail; this is not an OS wake-time guarantee.
         const double real_left=double(anchor+period-now)*1000.0/clock.scale;
-        return real_left>1000.0?int64_t(std::min(500.0,real_left-1000.0)):0;
+        const double reserve=(v.kind==6||v.kind==7)?5000.0:1000.0;
+        return real_left>reserve?int64_t(std::min(500.0,real_left-reserve)):0;
     };
     if(!requested())return;
     audio_pump();now=game_current_ms();

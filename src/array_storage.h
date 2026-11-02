@@ -133,6 +133,23 @@ public:
     const int32_t* int_data() const {
         return kind_ == 'I' ? reinterpret_cast<const int32_t*>(bytes_.data()) : nullptr;
     }
+    // Short-lived typed read for an owned native copy; never retain across
+    // Java allocation/re-entry or hand the borrowed address to a worker.
+    const uint8_t* short_bytes_for_read() const {
+        return kind_ == 'S' ? bytes_.data() : nullptr;
+    }
+    // Synchronous primitive bulk write. The caller validates the complete range
+    // before borrowing; no pointer may survive Java allocation or re-entry.
+    uint8_t* short_bytes_for_write() {
+        if(kind_!='S')return nullptr;
+        content_version_=resver::tick();++resver::g_stats.array_view;
+        return bytes_.data();
+    }
+    uint8_t* int_bytes_for_write() {
+        if(kind_!='I')return nullptr;
+        content_version_=resver::tick();++resver::g_stats.array_view;
+        return bytes_.data();
+    }
 
 private:
     uint64_t reference_version_ = 0;

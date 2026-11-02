@@ -31,6 +31,7 @@ static bool draw(int cid,const Input& in){
     struct LightData {int mode;bool enabled;float r,g,b,pos[3],dir[3],constant,linear,quadratic,cutoff,exponent;};
     LightData ls[32];
     for(int l=0;l<ln;++l){int ref=lights->get(l).ref,rendering=0,scope=0,color=0,bits=0;auto& d=ls[l];
+        if(!ref){d.enabled=false;continue;} // setLight(null) leaves an empty slot.
         if(!exact_class(ref,"javax/microedition/m3g/Light")||!m3g_int(ref,"rendering","Z",rendering)||!m3g_int(ref,"scope","I",scope))return fail();
         d.enabled=rendering&&(scope&in.scope)!=0;if(!d.enabled)continue;
         if(!m3g_int(ref,"mode","I",d.mode)||!m3g_int(ref,"color","I",color)||!m3g_int(ref,"intensity","F",bits))return fail();

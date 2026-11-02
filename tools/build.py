@@ -21,9 +21,9 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
-VERSION = "0.2.114-keyui7-gpuf5-fit30"
+VERSION = "0.2.114-keyui7-gpuf5-fit41-menu7"
 # NACP has only 15 usable UTF-8 bytes; use a compact chapter-save build identity.
-NACP_VERSION = "0.2.114-k7-f30"
+NACP_VERSION = "0.2.114-k7-f41n"
 # These legacy raw-opcode regression fixtures deliberately have no Java source.
 EXAMPLE_BYTECODE_FIXTURES = {"Mix.jar": ("Wide.class",), "Old.jar": ("Jsr.class",)}
 
@@ -213,7 +213,7 @@ def verify_nro(path, nacp_expected, icon_path=None):
 
 
 def stage_switch_romfs(destination):
-    """Production Switch assets: classes, fonts, phone skins; no example JARs."""
+    """Production Switch classes, bitmap fonts, skins and shaders; no example JARs."""
     # Stage separately so desktop regression fixtures remain available.
     if destination.exists():
         shutil.rmtree(destination)
@@ -248,6 +248,18 @@ def build_filter_shaders(dkp):
         pins.append('constexpr ShaderAsset ' + stage + '_asset = {' + str(len(data)) + ', "' + hashlib.sha256(data).hexdigest() + '"};')
     pins += ["}}", ""]
     (ROOT / "src/presentation/gpu_filter_assets.h").write_text("\n".join(pins))
+    m3g_pins = ['#pragma once', '// Generated from complete, stage-specific UAM modules.',
+                'namespace m3g_gpu { namespace shader_assets {']
+    for name, stage in (("m3g", "vert"), ("m3g", "frag"), ("m3g_skin", "comp")):
+        module = output / (name + "." + stage + ".dksh")
+        run("Compiling M3G GPU " + stage, [uam, "-s", stage, "-o", module,
+                                         ROOT / "shaders" / (name + "." + stage)])
+        data = module.read_bytes()
+        m3g_pins.append('constexpr j2me_present::gpu_filter::ShaderAsset ' + stage +
+                        ' = {' + str(len(data)) + ', "' + hashlib.sha256(data).hexdigest() + '"};')
+    m3g_pins += ['}}', '']
+    (ROOT / "src/m3g_gpu_shader_assets.h").write_text("\n".join(m3g_pins))
+
 
 
 def switch(dkp, tools, args):

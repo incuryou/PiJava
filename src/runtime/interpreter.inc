@@ -91,6 +91,7 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
         }
         ++guard;
         if (!r4::state.active && (guard > (VMS_EXEC(g_slice_ms) <= 4 ? 250000 : 1000000) || ((guard & 1023) == 0 && monotonic_ms() >= slice_deadline))) {
+            cpu_raster_boundary(m3g_raster_scope::Boundary::Yield);
             city_sync_step(st->back(),st->size(),VMS_EXEC(g_fast_ops)+VMS_EXEC(g_slow_ops));
             diag_checkpoint(*st);
             guard = 0;
@@ -552,6 +553,16 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
                 push(Value::of_l(now));
                 return;
             }
+            // Only a new invocation can use the bridge. Restored frames continue
+            // their original bytecode PC; an unsupported probe has no Java writes.
+            if (!r4::state.active) {
+                Value gpu_result;
+                if (m3g_gpu_bridge::try_invoke(mm,a,n,gpu_result)) {
+                    if constexpr(ProfileMethods)if(!mm->native)VMS_EXEC(g_execution_profile).called(mm->cpu_profile);
+                    if (!VMS_EXEC(g_thrown) && !is_void) push(gpu_result);
+                    return;
+                }
+            }
             if (mm->native) {
                 if(service_repaints_wait_event(mm,n?a[0].ref:0)){
                     // No native/paint work has begun. Preserve this exact
@@ -589,7 +600,7 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
                 if (current_context().unhandled) { int ref = current_context().unhandled; current_context().unhandled = 0; throw_ref(ref); }
                 if (VMS_EXEC(g_thrown)) return;
                 if (!is_void && !nf.stack.empty()) push(nf.stack.back());
-            } else push_frame(mm, a, n);
+            } else {push_frame(mm,a,n);m3g_cpu_raster_bridge::open_frame(st->back());}
         };
         if (op == 196) {
             op = u8();
@@ -774,8 +785,9 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
             fr.pc = base + off;
             break;
         }
-        case 172: case 173: case 174: case 175: case 176: p1_snapshot(current_context(),st->back(),st->size()); result = pop(); complete_class_initialization(st->back(),true); release_frame_monitor(st->back()); st->pop_back(); if (st->empty()) return result; st->back().stack.push_back(result); break;
+        case 172: case 173: case 174: case 175: case 176: m3g_cpu_raster_bridge::close_frame(st->back()); p1_snapshot(current_context(),st->back(),st->size()); result = pop(); complete_class_initialization(st->back(),true); release_frame_monitor(st->back()); st->pop_back(); if (st->empty()) return result; st->back().stack.push_back(result); break;
         case 177: {
+            m3g_cpu_raster_bridge::close_frame(st->back());
             p1_snapshot(current_context(),st->back(),st->size());
             bool object=st->back().return_object;Value value=st->back().constructed;
             complete_class_initialization(st->back(),true);release_frame_monitor(st->back());st->pop_back();
@@ -896,6 +908,7 @@ static Value run_impl(Method* entry, const std::vector<Value>& args) { P61_SCOPE
         }
         if (VMS_EXEC(g_thrown) && st->empty()) break;
     }
+    if(!st->empty())cpu_raster_boundary(m3g_raster_scope::Boundary::Yield);
     if (current_context().unhandled && !scope.has_parent()) {
         int ref = current_context().unhandled; current_context().unhandled = 0;
         report_uncaught(ref);

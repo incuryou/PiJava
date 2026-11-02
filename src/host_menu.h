@@ -21,7 +21,7 @@ namespace host_menu {
 
 constexpr int width = 1280;
 constexpr int height = 720;
-constexpr int visible_rows = 9;
+constexpr int visible_rows = 10;
 constexpr int bezel_count = 8;
 // ID 0 remains reserved for old records, but is no longer selectable.
 inline constexpr std::array<int,4> bezel_choices={{4,5,6,j2me_present::adaptive_bezel}};
@@ -44,6 +44,12 @@ struct Settings {
 };
 
 enum class Focus { Games = 0, Bezel = 1, Filter = 2, Speed = 3, Fps = 4, Rotation = 5 };
+
+// The renderer and touchscreen share these header bounds.
+inline constexpr j2me_present::Viewport library_favorites_rect{40,26,208,56};
+inline constexpr j2me_present::Viewport library_all_rect{248,26,208,56};
+inline bool library_header_hit(const j2me_present::Viewport& r,int x,int y){return x>=r.x&&y>=r.y&&x<r.x+r.w&&y<r.y+r.h;}
+inline int library_tab_hit(int x,int y){return library_header_hit(library_favorites_rect,x,y)?0:library_header_hit(library_all_rect,x,y)?1:-1;}
 
 inline Focus option_step(Focus focus,int direction){
     constexpr Focus order[]={Focus::Bezel,Focus::Filter,Focus::Rotation,Focus::Speed,Focus::Fps};
@@ -148,6 +154,29 @@ inline int text_advance(const std::string& text, int size) {
     return width;
 }
 
+struct LibraryHeader {
+    std::array<std::string,2> tabs;
+    int tab_px=27,gap=0,y_left=0,y_caption_x=0,minus_left=0,minus_caption_x=0;
+    j2me_present::Viewport toggle{};
+};
+inline LibraryHeader library_header_layout(int favorite_count,int total_count,
+        const std::function<int(const std::string&,int)>& advance={}) {
+    LibraryHeader h;h.tabs={"收藏列表 "+std::to_string(favorite_count),"全部游戏 "+std::to_string(total_count)};
+    const auto measure=[&](const std::string& s,int px){return std::max(0,advance?advance(s,px):text_advance(s,px));};
+    while(h.tab_px>18&&(measure(h.tabs[0],h.tab_px)>178||measure(h.tabs[1],h.tab_px)>178))--h.tab_px;
+    h.gap=270-62-std::min(178,measure(h.tabs[0],h.tab_px));
+    h.y_left=270+std::min(178,measure(h.tabs[1],h.tab_px))+h.gap;
+    h.y_caption_x=h.y_left+kSwitchButtonN+10;
+    const int y_right=h.y_caption_x+measure("切换",18);
+    h.minus_left=y_right+h.gap;h.minus_caption_x=h.minus_left+kSwitchButtonN+10;
+    h.toggle={h.y_left,30,y_right-h.y_left,52};
+    return h;
+}
+inline bool library_toggle_hit(int x,int y,int favorite_count=0,int total_count=0,
+        const std::function<int(const std::string&,int)>& advance={}) {
+    return library_header_hit(library_header_layout(favorite_count,total_count,advance).toggle,x,y);
+}
+
 // P8.11: ping-pong scroll offset for a line wider than its box. Pauses 1.2 s at
 // each end, moves 60 px/s. Returns 0 when the text fits. Pure function of time.
 constexpr int scroll_pause_ms = 1200;
@@ -167,6 +196,18 @@ inline int scroll_offset(int text_width, int box_width, int64_t ms) {
     return over - int(t * scroll_px_per_s / 1000);
 }
 
+// Draw a five-point yellow star independently of shared-font glyph coverage.
+inline void favorite_star(uint32_t* frame,size_t pitch,int cx,int cy,int diameter=24){
+    if(!frame||pitch<size_t(width))return;
+    std::array<float,10> xs{},ys{};
+    for(int i=0;i<10;++i){float a=float(i)*0.62831853f-1.57079633f,r=diameter*(i%2?0.225f:0.5f);xs[i]=cx+std::cos(a)*r;ys[i]=cy+std::sin(a)*r;}
+    for(int y=std::max(0,cy-diameter/2);y<std::min(height,cy+diameter/2+1);++y)
+        for(int x=std::max(0,cx-diameter/2);x<std::min(width,cx+diameter/2+1);++x){
+            bool inside=false;for(int i=0,j=9;i<10;j=i++)if((ys[i]>y+0.5f)!=(ys[j]>y+0.5f)&&x+0.5f<(xs[j]-xs[i])*(y+0.5f-ys[i])/(ys[j]-ys[i])+xs[i])inside=!inside;
+            if(inside)frame[size_t(y)*pitch+x]=color(0xf4c542);
+        }
+}
+
 inline void render_menu(uint32_t* frame, size_t pitch,
                         const std::vector<std::string>& labels, int sel,
                         Focus focus, const Settings& settings,
@@ -179,7 +220,12 @@ inline void render_menu(uint32_t* frame, size_t pitch,
                         int64_t scroll_ms = 0,
                         bool* scrolling = nullptr,
                         bool status_error = false,
-                        bool status_neutral = true) {
+                        bool status_neutral = true,
+                        const std::vector<uint8_t>& favorites = {},
+                        bool favorites_tab = false,
+                        const std::string& search_query = {},
+                        int favorite_count = -1,
+                        int total_count = -1) {
     if (scrolling) *scrolling = false;
     if (!frame || pitch < size_t(width)) return;
     const uint32_t background = color(0xf3f3f3);
@@ -243,10 +289,10 @@ inline void render_menu(uint32_t* frame, size_t pitch,
     };
     // Kenney Nintendo Switch face buttons: one dark disk, white letter inside.
     const auto switch_key = [&](int cx, int cy, char key) {
-        if(key=='+') {
+        if(key=='+'||key=='-') {
             rounded(cx-15,cy-15,30,30,15.0f,color(0x2a2a2a));
             rect(frame,pitch,cx-7,cy-1,15,3,on_accent);
-            rect(frame,pitch,cx-1,cy-7,3,15,on_accent);
+            if(key=='+')rect(frame,pitch,cx-1,cy-7,3,15,on_accent);
             return;
         }
         constexpr int n = kSwitchButtonN;
@@ -264,46 +310,63 @@ inline void render_menu(uint32_t* frame, size_t pitch,
     };
 
     constexpr int header_center_y=57;
-    if(centered)centered(48+measure("游戏",34)/2,header_center_y,"游戏",foreground,34,100);
-    else label(48,40,"游戏",foreground,34,100);
-    rect(frame, pitch, 164, 47, 1, 27, line_color);
-
+    const int favorite_total=favorite_count>=0?favorite_count:favorites_tab?int(labels.size()):int(std::count_if(favorites.begin(),favorites.end(),[](uint8_t v){return v!=0;}));
+    const int all_total=total_count>=0?total_count:int(labels.size());
+    const auto header=library_header_layout(favorite_total,all_total,advance);
+    const auto& tabs=header.tabs;
+    const int tab_x[]={62,270};
+    const int tab_px=header.tab_px;
+    // L3-style tabs: a red vertical marker, no selected-card background.
+    rect(frame,pitch,favorites_tab?45:253,43,5,28,accent);
+    for(int tab=0;tab<2;++tab){const auto ink=(favorites_tab==(tab==0))?foreground:secondary;
+        if(centered)centered(tab_x[tab]+measure(tabs[tab],tab_px)/2,header_center_y,tabs[tab],ink,tab_px,178);
+        else label(tab_x[tab],header_center_y-tab_px/2,tabs[tab],ink,tab_px,178);
+    }
+    const int y_left=header.y_left,y_caption_x=header.y_caption_x;
+    switch_key(y_left+kSwitchButtonN/2,header_center_y,'Y');
+    if(centered)centered(y_caption_x+measure("切换",18)/2,header_center_y,"切换",secondary,18,86);
+    else label(y_caption_x,48,"切换",secondary,18,86);
+    const bool selected_favorite=!labels.empty()&&sel>=0&&size_t(sel)<labels.size()&&
+        (favorites_tab||(size_t(sel)<favorites.size()&&favorites[size_t(sel)]));
+    const std::string favorite_action=selected_favorite?"取消收藏":"收藏游戏";
+    switch_key(header.minus_left+kSwitchButtonN/2,header_center_y,'-');
+    if(centered)centered(header.minus_caption_x+measure(favorite_action,18)/2,header_center_y,favorite_action,secondary,18,110);
+    else label(header.minus_caption_x,header_center_y-9,favorite_action,secondary,18,110);
     switch_key(1125, header_center_y, '+');
     if(centered)centered(1151+measure("更多设置",18)/2,header_center_y,"更多设置",secondary,18,95);
     else label(1151,header_center_y-9,"更多设置",secondary,18,95);
-    rect(frame, pitch, 892, 124, 1, 466, line_color);
+    rect(frame, pitch, 892, 91, 1, 524, line_color);
 
     const size_t count = labels.size();
     const size_t selected_index = count == 0 ? 0 :
         std::min<size_t>(sel < 0 ? 0 : size_t(sel), count - 1);
     const size_t first = (selected_index / visible_rows) * visible_rows;
-    const std::string position = count == 0 ? "0 / 0" :
-        std::to_string(selected_index + 1) + " / " + std::to_string(count);
-    if(centered)centered(184+measure(position,20)/2,header_center_y,position,secondary,20,120);
-    else label(184,header_center_y-10,position,secondary,20,120);
-
     if (count == 0) {
-        label(82, 164, "暂无游戏", secondary, 24, 754);
-        label(82, 211, "请将 JAR 游戏放入 /switch/j2me/games/", secondary, 20, 754);
+        label(82, 131, !search_query.empty()?"未找到游戏":favorites_tab?"暂无收藏":"暂无游戏", secondary, 24, 754);
+        label(82, 178, !search_query.empty()?"请尝试其他名称":favorites_tab?"可在全部游戏中按 - 收藏游戏":"请将 JAR 游戏放入 /switch/j2me/games/", secondary, 20, 754);
     } else {
         for (int row = 0; row < visible_rows && first + size_t(row) < count; ++row) {
             const size_t index = first + size_t(row);
-            const int y = 124 + row * 50;
+            const int y = 91 + row * 50;
             if (index == selected_index) {
                 if (focus == Focus::Games) rounded(48, y, 812, 46, 12.0f, selected);
                 rounded(64, y + 19, 8, 8, 4.0f, focus == Focus::Games ? accent : secondary);
             }
             const bool mark = index < saved.size() && saved[index];
-            constexpr int badge = 28, gap = 8;
-            const int name_limit = mark ? 754 - badge - gap : 754;
-            if (index == selected_index) scrolled(82, y + 11, labels[index], foreground, 24, name_limit);
-            else label(82, y + 11, labels[index], foreground, 24, name_limit);
+            const bool favorite = !favorites_tab && index < favorites.size() && favorites[index];
+            constexpr int badge = 28, gap = 8, star = 24;
+            const std::string number=std::to_string(index+1)+". ";
+            const int number_width=measure(number,24);
+            label(82,y+11,number,foreground,24,std::max(1,number_width));
+            const int name_x=82+number_width;
+            const int name_limit=std::max(1,754-number_width-(mark?badge+gap:0)-(favorite?star+gap:0));
+            if (index == selected_index) scrolled(name_x, y + 11, labels[index], foreground, 24, name_limit);
+            else label(name_x, y + 11, labels[index], foreground, 24, name_limit);
+            int tail=name_x+std::min(measure(labels[index],24),name_limit)+gap;
+            if(favorite){favorite_star(frame,pitch,tail+star/2,y+23,star);tail+=star+gap;}
             if (mark) {
-                int adv = measure(labels[index], 24);
-                if (adv > name_limit) adv = name_limit;
-                const int bx = 82 + adv + gap;
-                rounded(bx, y + 9, badge, 28, 8.0f, accent);
-                label(bx + 6, y + 15, "存", on_accent, 16, badge - 8);
+                rounded(tail, y + 9, badge, 28, 8.0f, accent);
+                label(tail + 6, y + 15, "存", on_accent, 16, badge - 8);
             }
         }
     }
@@ -316,38 +379,38 @@ inline void render_menu(uint32_t* frame, size_t pitch,
         label(920, y, name, secondary, 20, 310);
         label(920, y + 37, value, enabled ? foreground : secondary, 24, max_width);
     };
-    option(138, Focus::Bezel, "遮罩", bezel_name(settings.bezel), true, 272);
-    rect(frame, pitch, 920, 214, 310, 1, line_color);
-    option(226, Focus::Filter, "滤镜", display_filter::name(settings.filter), true, 272);
-    rect(frame, pitch, 920, 302, 310, 1, line_color);
-    option(314, Focus::Rotation, "画面旋转", rotation_name(settings.rotation), true, 272);
-    rect(frame, pitch, 920, 390, 310, 1, line_color);
-    option(402, Focus::Speed, "速度", speed_label.empty() ? "原生" : speed_label, true, 120);
-    rect(frame, pitch, 920, 478, 310, 1, line_color);
-    option(490, Focus::Fps, "显示帧数", settings.show_fps ? "开启" : "关闭", true, 190);
-    rounded(1178, 526, 52, 30, 15.0f, settings.show_fps ? accent : secondary);
-    rounded(settings.show_fps ? 1203 : 1182, 530, 22, 22, 11.0f, on_accent);
-
+    option(105, Focus::Bezel, "遮罩", bezel_name(settings.bezel), true, 272);
+    rect(frame, pitch, 920, 181, 310, 1, line_color);
+    option(193, Focus::Filter, "滤镜", display_filter::name(settings.filter), true, 272);
+    rect(frame, pitch, 920, 269, 310, 1, line_color);
+    option(281, Focus::Rotation, "画面旋转", rotation_name(settings.rotation), true, 272);
+    rect(frame, pitch, 920, 357, 310, 1, line_color);
+    option(369, Focus::Speed, "速度", speed_label.empty() ? "原生" : speed_label, true, 120);
+    rect(frame, pitch, 920, 445, 310, 1, line_color);
+    option(457, Focus::Fps, "显示帧数", settings.show_fps ? "开启" : "关闭", true, 190);
+    rounded(1178, 493, 52, 30, 15.0f, settings.show_fps ? accent : secondary);
+    rounded(settings.show_fps ? 1203 : 1182, 497, 22, 22, 11.0f, on_accent);
     // P8.11: no status -> the selected JAR's manifest name (details), else its label.
     // P8.11-r2: same right edge as the list text (82 + 754 = 836), left of the divider at 892.
     constexpr int detail_width = status_width;
-    if (!status.empty()) label(48, 586, status, color(status_error?0xc81e41:status_neutral?0x718094:0x208351), status_px, detail_width);
+    if (!status.empty()) label(48, 593, status, color(status_error?0xc81e41:status_neutral?0x718094:0x208351), status_px, detail_width);
     else if (count != 0)
-        scrolled(48, 586, selected_index < details.size() && !details[selected_index].empty()
+        scrolled(48, 593, selected_index < details.size() && !details[selected_index].empty()
                               ? details[selected_index] : labels[selected_index], secondary, 20, detail_width);
-    rect(frame, pitch, 48, 621, 1184, 1, line_color);
+    rect(frame, pitch, 48, 624, 1184, 1, line_color);
     // Match the approved preview: three compact hints, one confirm action.
     // Keep the same footer in either pane; X/B remain optional shortcuts.
-    label(48, 653, "↑ ↓ 选择", secondary, 18, 90);
-    label(160, 653, "← → 游戏 / 选项", secondary, 18, 148);
-    label(326, 653, "L / R 翻页", secondary, 18, 148);
+    label(48, 660, "↑ ↓ 选择", secondary, 18, 90);
+    label(160, 660, "← → 游戏 / 选项", secondary, 18, 148);
+    label(326, 660, "L / R 翻页", secondary, 18, 148);
+    if(!search_query.empty())label(520, 660, "B 清除搜索", secondary, 18, 180);
 
-    rounded(936, 638, 140, 55, 27.5f, accent);
-    switch_key(969, 665, 'X');
-    label(995, 653, "继续", on_accent, 24, 65);
-    rounded(1092, 638, 140, 55, 27.5f, accent);
-    switch_key(1125, 665, 'A');
-    label(1151, 653, "开始", on_accent, 24, 65);
+    rounded(936, 645, 140, 55, 27.5f, accent);
+    switch_key(969, 672, 'X');
+    label(995, 660, "继续", on_accent, 24, 65);
+    rounded(1092, 645, 140, 55, 27.5f, accent);
+    switch_key(1125, 672, 'A');
+    label(1151, 660, "开始", on_accent, 24, 65);
 }
 
 inline void render_delete(uint32_t* frame,size_t pitch,const menu_actions::Deletion& deletion,

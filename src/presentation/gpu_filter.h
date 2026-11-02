@@ -20,8 +20,8 @@ inline bool supported(display_filter::Filter f){
 }
 // Pure packing accepts 1x1 for contract tests; production still applies the
 // Java logical-screen policy (min16, max800, <=409600 pixels) before presentation.
-inline bool pack(const std::vector<uint8_t>& rgb,int w,int h,display_filter::Filter f,std::vector<uint32_t>& out,bool adaptive=false){
-    if(!logical_screen::valid_extent(w,h)||!supported(f)||rgb.size()!=size_t(w)*h*3)return false;
+inline bool pack(const std::vector<uint8_t>& rgb,int w,int h,display_filter::Filter f,std::vector<uint32_t>& out,bool adaptive=false,bool allow_original=false){
+    if(!logical_screen::valid_extent(w,h)||(!supported(f)&&!(allow_original&&f==display_filter::Filter::Original))||rgb.size()!=size_t(w)*h*3)return false;
     out.resize(header_words+size_t(w)*h);out[0]=uint32_t(w);out[1]=uint32_t(h);out[2]=uint32_t(f);out[3]=adaptive?1u:0u;
     for(size_t i=0;i<size_t(w)*h;++i)out[header_words+i]=0xff000000u|uint32_t(rgb[3*i])|(uint32_t(rgb[3*i+1])<<8)|(uint32_t(rgb[3*i+2])<<16);
     return true;

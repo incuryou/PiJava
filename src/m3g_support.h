@@ -34,7 +34,7 @@ static int m3g_inflate(int input,int output) {
     const uint8_t* p=src.read_bytes();
     if((p[0]&15)!=8 || (p[0]>>4)>7 || ((unsigned(p[0])<<8)+p[1])%31 || (p[1]&32))return -1;
     unsigned long used=n-6, produced=dst.size();
-    if(puff(dst.byte_data(),&produced,p+2,&used)||used!=n-6||produced!=dst.size())return -1;
+    if(j2me_image::inflate_raw(dst.byte_data(),&produced,p+2,&used)||used!=n-6||produced!=dst.size())return -1;
     uint32_t a=1,b=0;for(size_t i=0;i<produced;++i){a=(a+dst.read_bytes()[i])%65521;b=(b+a)%65521;}
     uint32_t expected=(uint32_t(p[n-4])<<24)|(uint32_t(p[n-3])<<16)|(uint32_t(p[n-2])<<8)|p[n-1];
     return ((b<<16)|a)==expected?int(produced):-1;

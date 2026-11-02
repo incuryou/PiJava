@@ -139,7 +139,7 @@ inline bool commit(const std::string& path,Store& s,const std::string& id,const 
     s=std::move(next);return true;
 }
 enum class Phase { Phone, Slot, Choice };
-enum class Page { SaveExit, Keymap };
+enum class Page { SaveExit, Keymap, Data };
 enum class Pending { None, Delete, Exit };
 struct ChoiceRepeat {
     int direction=0;int64_t next=0;
@@ -164,7 +164,8 @@ struct Editor {
     ChoiceRepeat choice_repeat;
     std::string name,id,note;
     void begin(const Store& s,const std::string& game_id,const std::string& game_name,bool stdkeys,bool paused) {
-        *this=Editor{};open=true;id=game_id;name=game_name;standard=stdkeys;was_paused=paused;draft=lookup(s,id);
+        const Page reopen_page=id==game_id?page:Page::SaveExit;
+        *this=Editor{};page=reopen_page;open=true;id=game_id;name=game_name;standard=stdkeys;was_paused=paused;draft=lookup(s,id);
     }
 };
 inline std::pair<int,int> position(int p) {
@@ -186,9 +187,10 @@ inline Result act(Editor& e,Action a) {
     if(a!=Action::Up&&a!=Action::Down&&a!=Action::Left&&a!=Action::Right)e.choice_repeat.reset();
     if(a==Action::Close)return Result::Close;
     if(a==Action::PreviousPage || a==Action::NextPage) {
-        if(e.pending==Pending::None)e.page=e.page==Page::SaveExit?Page::Keymap:Page::SaveExit;
+        if(e.pending==Pending::None)e.page=static_cast<Page>((int(e.page)+(a==Action::NextPage?1:2))%3);
         return Result::None;
     }
+    if(e.page==Page::Data)return a==Action::Back?Result::Close:Result::None;
     if(e.page==Page::SaveExit) {
         if(e.pending!=Pending::None) {
             if(a==Action::Back)e.pending=Pending::None;

@@ -7,6 +7,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "puff_init.h"
 
 extern "C" int puff(unsigned char* dest, unsigned long* destlen, const unsigned char* source, unsigned long* sourcelen);
 
@@ -147,7 +148,7 @@ inline bool read_manifest_only(const std::string& path, std::string& out, uint64
         else if (method == 8) {
             std::vector<uint8_t> raw(usize ? usize : 1);
             unsigned long dlen = raw.size(), slen = csize;
-            if (puff(raw.data(), &dlen, comp.data(), &slen) != 0) break;
+            if (j2me_image::inflate_raw(raw.data(), &dlen, comp.data(), &slen) != 0) break;
             out.assign((const char*)raw.data(), dlen); ok = true;
         }
     } while (false);

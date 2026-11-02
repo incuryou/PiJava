@@ -1,5 +1,6 @@
 #pragma once
 #include "vm_rs_fallback.h"
+#include "m3g_float.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Arithmetic translated from the bundled SkinnedMesh/M3GMath. No approximation
 // changes: preserve binary32 order, quantization, range checks, bone order.
@@ -160,9 +161,9 @@ if(!inverse_core(m,tmp)){++stats.transform_declines;return false;}
  VMS_RS_NSREF(vms_ref_composite_calls, composite_calls, uint64_t) VMS_RS_NSREF(vms_ref_transform_to_calls, transform_to_calls, uint64_t) VMS_RS_NSREF(vms_ref_transform_to_nodes, transform_to_nodes, uint64_t)
 static void identity_core(float out[16]){for(int i=0;i<16;++i)out[i]=i%5==0?1.0f:0.0f;}
 static void multiply_core(const float l[16],const float r[16],float dst[16]){
-    // Exactly the same expression as the existing m3g_multiply native island.
+    // Same binary32 boundaries as Java and the m3g_multiply native island.
     float out[16];for(int row=0;row<16;row+=4)for(int col=0;col<4;++col)
-        out[row+col]=l[row]*r[col]+l[row+1]*r[col+4]+l[row+2]*r[col+8]+l[row+3]*r[col+12];
+        out[row+col]=m3g_float::dot4(l[row],r[col],l[row+1],r[col+4],l[row+2],r[col+8],l[row+3],r[col+12]);
     for(int i=0;i<16;++i)dst[i]=out[i];
 }
 static bool composite_core(int object,float result[16],ArrayStorage* forbidden=nullptr){

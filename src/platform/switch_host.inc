@@ -1,15 +1,21 @@
 // Horizon frontend, input, layered presenter and application lifecycle.
 #include "../present_fps.h"
+#include "../host_render_lifecycle.h"
 #include <switch.h>
 #include <dirent.h>
 #include "../n1_paths.h"
 #include "../host_menu.h"
 #include "../game_names.h"
+#include "../game_aliases.h"
+#include "../game_favorites.h"
+#include "../launcher_library.h"
 #include "../menu_catalog.h"
+#include "../game_title_cache.h"
 #include "../host_menu_settings.h"
 #include "../host_display_preferences.h"
 #include "../host_display_menu.h"
 #include "../host_keymap_ui.h"
+#include "../host_data_editor.h"
 #include "../controller_skin_labels.h"
 #include "../presentation/orientation.h"
 static presentation::orientation::Cache g_orientation;
@@ -17,6 +23,8 @@ static const std::vector<uint8_t>* g_display_pixels=nullptr;
 static int g_display_w=240,g_display_h=320;
 static host_keymap::Store g_keymaps;
 static host_keymap::Editor g_keymap_editor;
+static host_data::Editor g_data_editor;
+static game_data::Session g_data_session;
 static host_pro::Preview g_keymap_pro;
 static host_keymap::Config g_keymap_active;
 static host_controller::Legends g_controller_legends;
@@ -36,6 +44,27 @@ static speed_keys::State g_speed_keys; // P8.3: SHA256-keyed speed.cfg
 #include "../chapter_save_ui.h"
 #ifdef J2ME_ENABLE_DEKO3D
 #include "../switch_gpu_present.h"
+#include "../switch_gpu_owner.h"
+#include "../presentation/backend_policy.h"
+static void menu_gpu_stage(SwitchGpuPresent::Stage stage){
+    using G=SwitchGpuPresent::Stage;using M=menu_stall::Stage;M value=M::GpuCommands;
+    switch(stage){case G::Acquire:value=M::GpuAcquire;break;case G::AcquireDone:value=M::GpuAcquireDone;break;
+    case G::Fence:value=M::GpuFence;break;case G::Upload:value=M::GpuUpload;break;case G::Commands:value=M::GpuCommands;break;
+    case G::Submit:value=M::GpuSubmit;break;case G::Present:value=M::GpuPresent;break;case G::Done:value=M::GpuDone;break;
+    case G::Finish:value=M::GpuFinish;break;case G::Close:value=M::GpuClose;break;default:break;}
+    if(p7::t_slot==p7::RenderSlot)menu_stall::gpu(value);else menu_stall::main(value);
+}
+// Host lifetime is explicit; __appExit can run after ordinary C++ destructors.
+static SwitchGpuOwner* g_render_owner=nullptr;
+static bool g_render_async=false;
+static uint64_t g_render_sequence=0,g_render_epoch=0,g_render_credit_us=0;
+static render_owner::ChromeSnapshot& render_chrome(){static auto* value=new render_owner::ChromeSnapshot;return *value;}
+static render_owner::RgbSnapshot& render_rgb(){static auto* value=new render_owner::RgbSnapshot;return *value;}
+static bool render_owner_barrier();
+static bool render_owner_epoch(uint64_t epoch);
+static m3g_gpu::GeometryResult render_gpu_geometry(m3g_gpu::GeometryRequest&& request);
+static m3g_gpu::SkinResult render_gpu_skin(m3g_gpu::SkinRequest&& request);
+static void render_owner_report(bool force=false);
  VMS_PLAT_ACCESSOR(g_gpu_present, SwitchGpuPresent)
 struct GpuHostLayerCache {
     std::vector<uint32_t> rgba,canvas,raw; uint64_t generation=0;
@@ -99,8 +128,20 @@ enum class HostSurface { Game, Menu, Import };
 // P8.11 host-only menu UI state (display text and scroll clock; never keys or saves).
 struct MenuNameUi { menu_catalog::State catalog; int64_t scroll_t0 = 0; int last_sel = -1; bool scrolling = false; int64_t last_tick = 0; };
 static MenuNameUi g_menu_name_ui;
+static game_titles::Service g_title_service;
+static bool g_title_worker_available=false;
+static std::map<std::string,size_t> g_title_indices;
 static menu_actions::Deletion g_menu_delete;
 static host_display_menu::Model g_display_menu;
+static game_aliases::Store g_game_aliases;
+static bool g_game_aliases_loaded=false;
+static const char* g_game_aliases_path="sdmc:/switch/j2me/game-names.cfg";
+static game_favorites::Store g_game_favorites;
+static bool g_game_favorites_loaded=false;
+static const char* g_game_favorites_path="sdmc:/switch/j2me/favorites.cfg";
+static std::vector<uint8_t> g_menu_favorite_marks;
+static launcher_library::View g_launcher_view;
+static int g_launcher_total_count=0,g_launcher_favorite_count=0;
 static menu_actions::Repeat g_menu_repeat;
 static chapter_ui::State g_chapter_import;
 static u64 g_chapter_blocked=0;
@@ -113,7 +154,8 @@ static void invalidate_display_preferences() {
     VMS_RS(g_fb_dirty)=true;
 #ifdef J2ME_ENABLE_DEKO3D
     VMS_PLAT(g_gpu_layers).raw_frame.invalidate();
-    VMS_PLAT(g_gpu_present).invalidate_game();
+    if(!g_render_async)VMS_PLAT(g_gpu_present).invalidate_game();
+    render_chrome()={};
 #endif
 }
 static void select_display_preferences(const std::string& path,bool force=false) {
@@ -210,6 +252,9 @@ static bool save_menu_settings() {
 }
 static void close_presenter() {
 #ifdef J2ME_ENABLE_DEKO3D
+    m3g_gpu::geometry_executor=nullptr;m3g_gpu::skin_executor=nullptr;
+    if(g_render_owner){g_render_owner->queue.close();if(g_render_async)render_owner_report(true);}
+    g_render_async=false;render_chrome()={};render_rgb()={};g_render_credit_us=0;
     VMS_PLAT(g_gpu_present).close();VMS_PLAT(g_gpu_layers).clear();
 #endif
     VMS_PLAT(g_gpu_active) = false;
@@ -219,27 +264,137 @@ static void close_presenter() {
     VMS_PLAT(g_cpu_cleared)=0;
     VMS_PLAT(g_present_stats)={};
 }
+#ifdef J2ME_ENABLE_DEKO3D
+static void render_owner_report(bool force) {
+    if(!g_render_owner)return;
+    static int64_t reported=0;
+    render_owner::Completion error;
+    if(g_render_owner->queue.poll_error(error))
+        log_line("RENDEROWNER error sequence="+std::to_string(error.sequence)+" epoch="+std::to_string(error.epoch)+" reason="+error.error);
+    const auto now=paint_clock_us();
+    if(!force&&now-reported<1000000)return;
+    reported=now;
+    const auto stats=g_render_owner->queue.stats();
+    render_owner::Completion completed;
+    const bool has_completion=g_render_owner->queue.poll_completion(completed);
+    const auto counts=g_render_owner->backend.counts();
+    log_line("RENDEROWNER accepted_commands="+std::to_string(stats.accepted)+" completed_commands="+std::to_string(stats.submitted)+
+        " present_submitted="+std::to_string(counts.presents)+" gpu_geometry_completed="+std::to_string(counts.geometry)+
+        " gpu_skin_completed="+std::to_string(counts.skin)+" geometry_skin_declines="+std::to_string(counts.declines)+
+        " m3g_allocations="+std::to_string(counts.allocations)+" m3g_reuses="+std::to_string(counts.reuses)+
+        " m3g_resident_bytes="+std::to_string(counts.resident_bytes)+" m3g_peak_bytes="+std::to_string(counts.peak_bytes)+
+        " fence_completed_at_barrier="+std::to_string(stats.fence_completed)+" cancelled="+std::to_string(stats.cancelled)+
+        " producer_credit_wait_us="+std::to_string(g_render_credit_us)+" latest_sequence="+std::to_string(has_completion?completed.sequence:0)+
+        " rgb_snapshot_copies="+std::to_string(render_rgb().copies)+" rgb_snapshot_bytes="+std::to_string(render_rgb().copy_bytes)+
+        " rgb_snapshot_reuses="+std::to_string(render_rgb().reuses)+
+        " latest_epoch="+std::to_string(has_completion?completed.epoch:0)+" latest_owner_us="+std::to_string(has_completion?completed.total_us:0)+
+        " latest_gpu_acquire_us="+std::to_string(has_completion?completed.acquire_wait_us:0)+
+        " latest_slot_fence_wait_us="+std::to_string(has_completion?completed.gpu_wait_us:0)+
+        " latest_upload_us="+std::to_string(has_completion?completed.upload_us:0)+
+        " scanout_verified=0 gpu_slots=3 cpu_pending_limit=1");
+}
+static bool render_owner_barrier() {
+    if(!VMS_PLAT(g_gpu_active))return true;
+    if(g_render_async?g_render_owner->queue.drain():VMS_PLAT(g_gpu_present).finish())return true;
+    log_line("RENDEROWNER lifecycle drain failed; closing before CPU fallback");
+    close_presenter();return true; // Joined and released; CPU fallback is safe.
+}
+static bool render_owner_epoch(uint64_t epoch) {
+    render_rgb().clear();
+    if(!g_render_async){const bool ok=render_owner_barrier();VMS_PLAT(g_gpu_present).invalidate_game();return ok;}
+    g_render_owner->queue.cancel_before_epoch(epoch);
+    if(!g_render_owner->queue.drain()||!g_render_owner->queue.resume(epoch)){
+        close_presenter();return true; // Old epoch cannot reach the window now.
+    }
+    g_render_epoch=epoch;render_chrome()={};return true;
+}
+static m3g_gpu::GeometryResult render_gpu_geometry(m3g_gpu::GeometryRequest&& request) {
+    using namespace m3g_gpu;
+    if(!g_render_async||!g_render_owner)return {Code::Unavailable,"owner_unavailable",{}, {}};
+    if(request.epoch!=resver::g_epoch)return {Code::Cancelled,"stale_epoch",{}, {}};
+    if(g_render_epoch!=request.epoch&&!render_owner_epoch(request.epoch))return {Code::Unavailable,"owner_epoch",{}, {}};
+    auto result=std::make_shared<ResultState<GeometryResult>>();
+    render_owner::FrameRequest frame;frame.kind=render_owner::FrameRequest::Kind::Geometry;
+    frame.sequence=++g_render_sequence;frame.epoch=request.epoch;
+    frame.geometry.reset(new GeometryJob(std::move(request),result));
+    // Java paint may already hold the sole producer credit. Reuse it.
+    if(!render_owner::acquire_for_present(g_render_owner->queue)||!g_render_owner->queue.submit(std::move(frame)))
+        return {Code::Unavailable,"owner_rejected",{}, {}};
+    return result->wait(); // prototype CPU visibility barrier, not a throughput claim
+}
+static m3g_gpu::SkinResult render_gpu_skin(m3g_gpu::SkinRequest&& request) {
+    using namespace m3g_gpu;
+    if(!g_render_async||!g_render_owner)return {Code::Unavailable,"owner_unavailable",{}, {}};
+    if(request.epoch!=resver::g_epoch)return {Code::Cancelled,"stale_epoch",{}, {}};
+    if(g_render_epoch!=request.epoch&&!render_owner_epoch(request.epoch))return {Code::Unavailable,"owner_epoch",{}, {}};
+    auto result=std::make_shared<ResultState<SkinResult>>();
+    render_owner::FrameRequest frame;frame.kind=render_owner::FrameRequest::Kind::Skin;
+    frame.sequence=++g_render_sequence;frame.epoch=request.epoch;
+    frame.skin.reset(new SkinJob(std::move(request),result));
+    if(!render_owner::acquire_for_present(g_render_owner->queue)||!g_render_owner->queue.submit(std::move(frame)))
+        return {Code::Unavailable,"owner_rejected",{}, {}};
+    return result->wait();
+}
+#endif
 // Called after loading menu.cfg and on explicit filter changes, never per frame.
 // Backend selection also selects the existing CPU/GPU scheduling branch.
 static bool select_presenter() {
     bool request_gpu=false;
 #ifdef J2ME_ENABLE_DEKO3D
-    request_gpu=j2me_present::gpu_filter::supported(VMS_PLAT(g_menu_settings).filter)&&!VMS_DIAG(g_p1_profile).active;
+    host_render_lifecycle::set_callbacks(render_owner_barrier,render_owner_epoch);
+    VMS_PLAT(g_gpu_present).set_stage_callback(menu_gpu_stage);
+    struct stat m3g_flag{};
+    const bool m3g_requested=stat("sdmc:/switch/j2me/m3g-gpu.enable",&m3g_flag)==0;
+    std::string owner_source;
+    const bool owner_requested=m3g_requested||p810_switch("render-owner","J2ME_RENDER_OWNER",owner_source);
+    request_gpu=j2me_present::request_gpu_backend(VMS_PLAT(g_menu_settings).filter,owner_requested,VMS_DIAG(g_p1_profile).active);
 #endif
     if(request_gpu!=VMS_PLAT(g_gpu_active)) {
         log_drain();
         close_presenter(); // Release the old window owner before creating the next.
 #ifdef J2ME_ENABLE_DEKO3D
         if(request_gpu) {
-            VMS_PLAT(g_gpu_active)=VMS_PLAT(g_gpu_present).init();
+            if(owner_requested){
+                static bool exit_registered=false;
+                if(!exit_registered){
+                    std::atexit([]{if(g_render_owner)g_render_owner->queue.close();g_render_async=false;});
+                    exit_registered=true;
+                }
+                delete g_render_owner;g_render_owner=new SwitchGpuOwner;
+                g_render_owner->backend.set_stage_callback(menu_gpu_stage);
+                g_render_async=g_render_owner->queue.start();
+                if(g_render_async){
+                    g_render_epoch=resver::g_epoch;g_render_owner->queue.resume(g_render_epoch);
+                    m3g_gpu::geometry_executor=render_gpu_geometry;m3g_gpu::skin_executor=render_gpu_skin;
+                }
+                VMS_PLAT(g_gpu_active)=g_render_async;
+                // A failed owner init has already destroyed its window resources
+                // on the owner; choose CPU rather than creating a second device.
+                if(!g_render_async)render_owner_report(true);
+                log_line("RENDEROWNER requested=1 enabled="+std::to_string(g_render_async)+" core=1 priority=45 audio_priority=44 producer_acquire=credit gpu_acquire=owner cpu_pending_limit=1 gpu_slots=3 sdk_acquire_cancel=unsupported");
+            }else VMS_PLAT(g_gpu_active)=VMS_PLAT(g_gpu_present).init();
             if(!VMS_PLAT(g_gpu_active))log_line("RENDER GPU initialization returned failure; CPU selected");
         }
 #endif
     }
-    log_line(std::string("RENDER policy=filter filter=")+std::to_string(int(VMS_PLAT(g_menu_settings).filter))+
+    log_line(std::string("RENDER policy=filter_or_owner filter=")+std::to_string(int(VMS_PLAT(g_menu_settings).filter))+
         " requested="+(request_gpu?"gpu":"cpu")+" effective="+(VMS_PLAT(g_gpu_active)?"gpu":"cpu")+
         " p1_cpu="+std::to_string(VMS_DIAG(g_p1_profile).active));
     return VMS_PLAT(g_gpu_active);
+}
+// Apply the selected display filter at the main-menu lifecycle boundary.
+static void apply_and_save_display_setting(std::string& status){
+    invalidate_display_preferences();select_presenter();
+    const bool saved=save_menu_settings();
+    status=saved?"设置保存成功":"设置保存失败，本次运行仍然生效";
+    g_menu_note_error=!saved;g_menu_note_neutral=false;
+}
+static void change_filter_menu_setting(std::string& status){
+    if(!host_render_lifecycle::barrier()){
+        status="暂时无法切换滤镜，请稍后重试";g_menu_note_error=true;g_menu_note_neutral=false;return;
+    }
+    host_menu::change_filter(VMS_PLAT(g_menu_settings),1);
+    apply_and_save_display_setting(status);
 }
 // libnx calls __appExit after C++ destructors and the logger's atexit join.
 // Use a local stream here; the normal logger's globals no longer exist.
@@ -292,7 +447,12 @@ static void acquire_cpu_frame() {
 static void acquire_game_frame() {
 #ifdef J2ME_ENABLE_DEKO3D
     if(VMS_PLAT(g_gpu_active)) {
-        if(VMS_PLAT(g_gpu_present).acquire_frame())return;
+        if(g_render_async){
+            const auto start=paint_clock_us();
+            const bool ok=render_owner::acquire_for_present(g_render_owner->queue);
+            g_render_credit_us+=uint64_t(std::max<int64_t>(0,paint_clock_us()-start));
+            if(ok)return;
+        }else if(VMS_PLAT(g_gpu_present).acquire_frame())return;
         log_line("RENDER GPU acquire returned failure; falling back to CPU");
         close_presenter();
     }
@@ -305,6 +465,17 @@ static void acquire_game_frame() {
 static void compose_host_surface(u32* frame,u32 pitch,const std::string& label,
                                  bool include_game,bool force_chrome) {
     if (g_keymap_editor.open) {
+        if(g_data_editor.open) {
+            host_data::View view;view.count=g_data_session.count();view.ready=g_data_session.ready();
+            view.busy=g_data_session.busy();view.note=g_data_session.note;view.type=g_data_session.type();
+            for(size_t i=g_data_editor.first();!view.busy&&i<view.count&&view.rows.size()<host_data::visible_rows;++i) {
+                int64_t value=0;const bool readable=g_data_session.read(i,value);
+                view.rows.push_back({g_data_session.label(i),readable?std::to_string(value):"位置已失效"});
+            }
+            host_data::render(frame,pitch,g_data_editor,view,host_text_callback(frame,pitch),host_text_callback(frame,pitch,true),
+                [](const std::string& label,int size){const auto m=VMS_PLAT(g_host_font).measure(label,size);return m.ok?m.x+m.w:host_menu::text_advance(label,size);});
+            return;
+        }
         host_keymap::render(frame,pitch,g_keymap_editor,host_text_callback(frame,pitch),host_text_callback(frame,pitch,true),
             [](const std::string& label,int size) {
                 const auto measured=VMS_PLAT(g_host_font).measure(label,size);
@@ -326,7 +497,8 @@ static void compose_host_surface(u32* frame,u32 pitch,const std::string& label,
                                                                               : host_menu::text_advance(s, px);
                                },
                                g_menu_name_ui.catalog.details, monotonic_ms() - g_menu_name_ui.scroll_t0, &g_menu_name_ui.scrolling,
-                               g_menu_note_error,g_menu_note_neutral);
+                               g_menu_note_error,g_menu_note_neutral,g_menu_favorite_marks,
+                               g_launcher_view.favorites_only,g_launcher_view.query,g_launcher_favorite_count,g_launcher_total_count);
         host_menu::render_delete(frame,pitch,g_menu_delete,host_text_callback(frame,pitch),host_text_callback(frame,pitch,true));
         host_display_menu::render(frame,pitch,g_display_menu,VMS_PLAT(g_menu_settings),host_text_callback(frame,pitch),host_text_callback(frame,pitch,true));
         chapter_ui::render(frame,pitch,g_chapter_import,host_text_callback(frame,pitch));
@@ -396,7 +568,7 @@ static void compose_host_surface(u32* frame,u32 pitch,const std::string& label,
 }
 
 static void present_impl();
-static void present(){const auto phase=diag_phase_enter(runtime_diag::Phase::Present);present_impl();diag_native_leave(phase);}
+static void present(){menu_stall::main(menu_stall::Stage::Present);const auto phase=diag_phase_enter(runtime_diag::Phase::Present);present_impl();diag_native_leave(phase);menu_stall::main(menu_stall::Stage::PresentDone);}
 static void present_impl() {
     const int64_t present_started=paint_clock_us();
     g_display_pixels=nullptr;
@@ -445,24 +617,26 @@ static void present_impl() {
             (VMS_PLAT(g_menu_settings).show_fps && previous_label!=label) || VMS_PLAT(g_cpu_cleared)==0;
         if(rebuild) {
             canvas.resize(j2me_present::canvas_pixels);
-            compose_host_surface(canvas.data(),1280,label,!layered,true);
+            menu_stall::main(menu_stall::Stage::Compose);compose_host_surface(canvas.data(),1280,label,!layered,true);menu_stall::main(menu_stall::Stage::ComposeDone);
             ++generation;bezel=VMS_PLAT(g_menu_settings).bezel;fps=int(VMS_PLAT(g_menu_settings).show_fps);previous_label=label;
             cache.mapping_generation=g_controller_legends.generation();
             cache.source_w=g_display_w;cache.source_h=g_display_h;
         }
         was_layered=layered;
         const auto filter=VMS_PLAT(g_menu_settings).filter;
-        const bool shader=layered&&j2me_present::gpu_filter::supported(filter);
+        const bool shader=layered&&display_filter::valid(filter);
         const bool adaptive=VMS_PLAT(g_menu_settings).bezel==j2me_present::adaptive_bezel;
         const j2me_present::gpu_filter::FrameKey frame_key{resver::g_epoch,uint64_t(uint32_t(VMS_RS(g_game_frames))),g_display_w,g_display_h,filter,adaptive};
         bool valid=true;
-        if(shader){
+        if(g_render_async){
+            valid=!layered||(g_display_pixels&&logical_screen::valid(frame_key.w,frame_key.h));
+        }else if(shader){
             // Dirty is also an explicit refresh signal (for example host-side
             // restored pixels), even if a completed-frame counter repeats.
             const bool changed=cache.raw_frame.needs_upload(frame_key);
             if(VMS_RS(g_fb_dirty)&&!changed)VMS_PLAT(g_gpu_present).invalidate_game();
             if(changed||VMS_RS(g_fb_dirty)){
-                valid=g_display_pixels&&logical_screen::valid(frame_key.w,frame_key.h)&&j2me_present::gpu_filter::pack(*g_display_pixels,frame_key.w,frame_key.h,filter,cache.raw,adaptive);
+                valid=g_display_pixels&&logical_screen::valid(frame_key.w,frame_key.h)&&j2me_present::gpu_filter::pack(*g_display_pixels,frame_key.w,frame_key.h,filter,cache.raw,adaptive,true);
                 if(valid)cache.raw_frame.committed(frame_key);
             }
         }else{
@@ -485,6 +659,39 @@ static void present_impl() {
                 slot.ok?slot.w:0,slot.ok?slot.h:0,slot.ok?slot.x:0,slot.ok?slot.y:0);
             fps_overlay={box.x,box.y,std::min(box.w,1280-box.x),std::min(box.h,720-box.y)};
         }
+        if(g_render_async){
+            if(g_render_epoch!=frame_key.epoch)valid=render_owner_epoch(frame_key.epoch)&&valid;
+            render_owner_report();
+            render_owner::FrameRequest frame;
+            frame.sequence=++g_render_sequence;frame.epoch=frame_key.epoch;frame.generation=generation;
+            frame.chrome=render_chrome().freeze(canvas,generation);
+            frame.key=frame_key;frame.layered=layered;frame.shader=shader;frame.adaptive=adaptive;
+            frame.rotation=VMS_PLAT(g_menu_settings).rotation;frame.overlay=fps_overlay;
+            frame.invalidate=VMS_RS(g_fb_dirty)||!shader;
+            if(layered&&g_display_pixels)
+                frame.rgb=render_rgb().freeze(*g_display_pixels,frame_key,frame.rotation,VMS_RS(g_fb_dirty));
+            const auto credit_started=paint_clock_us();
+            menu_stall::main(menu_stall::Stage::OwnerCredit);
+            const bool credit=valid&&render_owner::acquire_for_present(g_render_owner->queue);
+            const uint64_t submit_wait=uint64_t(std::max<int64_t>(0,paint_clock_us()-credit_started));
+            g_render_credit_us+=submit_wait;
+            menu_stall::main(menu_stall::Stage::OwnerSubmit);
+            const bool accepted=credit&&g_render_owner->queue.submit(std::move(frame));
+            const auto done=paint_clock_us();
+            // Main timing describes this submission only. Owner completion N-1
+            // never becomes Java N's deadline budget or synchronous GPU wait.
+            const uint64_t total=uint64_t(done-present_started);
+            VMS_PLAT(g_present_stats).add(total,submit_wait,total>submit_wait?total-submit_wait:0,0,0);
+            if(accepted){
+                VMS_PLAT(g_cpu_cleared)=3;
+                if(VMS_EXEC(g_frame_work_finished_us)){
+                    VMS_EXEC(g_frame_wait_budget).observe(VMS_EXEC(g_frame_work_us),std::max<int64_t>(0,done-VMS_EXEC(g_frame_work_finished_us)-int64_t(submit_wait)));
+                    VMS_EXEC(g_frame_work_finished_us)=0;
+                }
+                return; // Java N+1 can execute while owner renders N.
+            }
+            log_line("RENDEROWNER accept failed; draining owner and selecting CPU");close_presenter();
+        }else{
         const bool ok=valid && VMS_PLAT(g_gpu_present).present_layers(reinterpret_cast<const uint8_t*>(canvas.data()),generation,
                         layered&&!shader?reinterpret_cast<const uint8_t*>(rgba.data()):nullptr,
                         shader?cache.raw.data():nullptr,shader?&frame_key:nullptr,
@@ -507,18 +714,20 @@ static void present_impl() {
             return;
         }
         log_line("RENDER GPU submission returned failure; falling back to CPU");close_presenter();
+        }
         if(VMS_PLAT(g_host_surface)==HostSurface::Menu){VMS_PLAT(g_menu_status)="GPU 运行失败，已回退 CPU";g_menu_note_error=true;g_menu_note_neutral=false;}
     }
 #endif
+    menu_stall::main(menu_stall::Stage::CpuAcquire);
     { P7_SCOPE(PresentWait); acquire_cpu_frame(); }
     P7_SCOPE(Present);
     const int64_t copy_started=paint_clock_us();
     u32* frame=VMS_PLAT(g_cpu_frame);
     const u32 stride_bytes=VMS_PLAT(g_cpu_stride);
     u32 pitch = stride_bytes / 4;
-    compose_host_surface(frame,pitch,label,true,false);
+    menu_stall::main(menu_stall::Stage::Compose);compose_host_surface(frame,pitch,label,true,false);menu_stall::main(menu_stall::Stage::ComposeDone);
     const int64_t prepared=paint_clock_us();
-    framebufferEnd(&VMS_PLAT(g_win));VMS_PLAT(g_cpu_frame)=nullptr;VMS_PLAT(g_cpu_stride)=0;
+    menu_stall::main(menu_stall::Stage::CpuPresent);framebufferEnd(&VMS_PLAT(g_win));VMS_PLAT(g_cpu_frame)=nullptr;VMS_PLAT(g_cpu_stride)=0;
     const int64_t done=paint_clock_us();
     // Keep Java work between acquire and copy out of presentation timings.
     VMS_PLAT(g_present_stats).add(VMS_PLAT(g_cpu_acquire_us)+done-copy_started,VMS_PLAT(g_cpu_acquire_us),prepared-copy_started,done-prepared);
@@ -531,11 +740,66 @@ static void present_impl() {
     VMS_PLAT(g_cpu_acquire_us)=0;
 }
 struct Entry { std::string label, path; };
+static std::vector<Entry> g_launcher_catalog;
+static std::unordered_map<std::string,size_t> g_launcher_catalog_indices;
+static bool g_launcher_names_changed=false;
+static void rebuild_launcher(std::vector<Entry>& items,int& selected){
+    g_launcher_view.rebuild(g_launcher_catalog,[](const std::string& path){return g_game_favorites.contains(path);},items,selected);
+    g_launcher_total_count=int(g_launcher_catalog.size());g_launcher_favorite_count=0;
+    for(const auto& item:g_launcher_catalog)if(g_game_favorites.contains(item.path))++g_launcher_favorite_count;
+    g_menu_name_ui.catalog.dirty=true;g_menu_repeat.reset();
+}
+static bool begin_chapter_import(const std::vector<Entry>& items,int selected){
+    if(selected<0||size_t(selected)>=items.size())return false;
+    for(size_t i=0;i<g_launcher_catalog.size();++i)if(g_launcher_catalog[i].path==items[size_t(selected)].path)
+        return g_chapter_import.begin(g_launcher_catalog,int(i));
+    return false;
+}
+static void remember_launcher_title(const std::string& path,const std::string& label){
+    const auto found=g_launcher_catalog_indices.find(path);if(found==g_launcher_catalog_indices.end())return;
+    auto& item=g_launcher_catalog[found->second];if(item.label!=label){item.label=label;g_launcher_names_changed=true;}
+}
+
+static std::string filename_label(const std::string& path) {
+    const auto at=path.find_last_of("/\\");return at==std::string::npos?path:path.substr(at+1);
+}
+static bool apply_game_title(size_t i,const game_titles::Record& record) {
+    auto& paths=VMS_PLAT(g_menu_paths);auto& labels=VMS_PLAT(g_menu_labels);auto& catalog=g_menu_name_ui.catalog;
+    catalog.names.names[record.path]=record.name;catalog.names.details[record.path]=record.detail;
+    const auto label=g_game_aliases.label(record.path,record.name.empty()?filename_label(record.path):record.name);
+    remember_launcher_title(record.path,label);
+    if(i>=paths.size()||i>=labels.size()||i>=catalog.details.size()||paths[i]!=record.path)return false;
+    const bool changed=labels[i]!=label||catalog.details[i]!=record.detail;
+    labels[i]=label;catalog.details[i]=record.detail;
+    if(int(i)==VMS_PLAT(g_menu_selected)){catalog.name_pending=false;if(changed)g_menu_name_ui.scroll_t0=monotonic_ms();}
+    return changed;
+}
+static bool refresh_visible_titles() {
+    if(!g_title_worker_available)return false;
+    const auto& paths=VMS_PLAT(g_menu_paths);if(paths.empty())return false;
+    const size_t selected=std::min(size_t(std::max(0,VMS_PLAT(g_menu_selected))),paths.size()-1);
+    const size_t first=selected/host_menu::visible_rows*host_menu::visible_rows;
+    bool changed=false;
+    for(size_t i=first;i<std::min(paths.size(),first+host_menu::visible_rows);++i){
+        game_titles::Record record;if(g_title_service.find(paths[i],record))changed=apply_game_title(i,record)||changed;
+    }
+    return changed;
+}
 static std::vector<Entry> scan_games() {
+    if(!g_game_aliases_loaded){g_game_aliases.load(g_game_aliases_path);g_game_aliases_loaded=true;}
+    if(!g_game_favorites_loaded){g_game_favorites.load(g_game_favorites_path);g_game_favorites_loaded=true;}
     std::vector<Entry> items;
-    for (auto& g : n1paths::scan_games("sdmc:/switch/j2me")) items.push_back({g.label, g.path});
+    std::vector<std::string> paths;
+    for (auto& g : n1paths::scan_games("sdmc:/switch/j2me")) {
+        game_titles::Record record;const bool known=g_title_worker_available&&g_title_service.find(g.path,record);
+        items.push_back({g_game_aliases.label(g.path,known&&!record.name.empty()?record.name:g.label),g.path});
+    }
+    for(const auto& item:items)paths.push_back(item.path);
+    g_title_service.reset(paths);
     log_line("GAMES scan=games_only dir=sdmc:/switch/j2me/games count=" + std::to_string(items.size()));
-    g_menu_name_ui.catalog.dirty = true;
+    g_launcher_catalog=items;g_launcher_catalog_indices.clear();g_launcher_catalog_indices.reserve(items.size());
+    for(size_t i=0;i<g_launcher_catalog.size();++i)g_launcher_catalog_indices.emplace(g_launcher_catalog[i].path,i);
+    int selected=0;rebuild_launcher(items,selected);
     return items;
 }
 static std::string instant_state_path(const std::string& jar) {
@@ -553,30 +817,116 @@ static bool instant_state_exists(const std::string& jar) {
 }
 #include "../instant_state.inc"
 static void draw_menu(const std::vector<Entry>& items, int sel, const std::string& status) {
+    menu_stall::menu(true);menu_stall::progress.context(sel,int(items.size()));menu_stall::main(menu_stall::Stage::Draw);
     VMS_PLAT(g_host_surface) = HostSurface::Menu;
     VMS_PLAT(g_cpu_cleared) = 0;
     VMS_PLAT(g_menu_selected) = std::max(0, std::min(sel, std::max(0, int(items.size()) - 1)));
     VMS_PLAT(g_menu_status) = status;
     const int selected=VMS_PLAT(g_menu_selected);
+    menu_stall::main(menu_stall::Stage::Preferences);
     select_display_preferences(items.empty()?std::string():items[selected].path);
     auto& catalog = g_menu_name_ui.catalog;
     if (catalog.dirty) {
         catalog.rebuild(items, VMS_PLAT(g_menu_labels), VMS_PLAT(g_menu_paths), VMS_PLAT(g_menu_saved));
+        g_title_indices.clear();for(size_t i=0;i<items.size();++i)g_title_indices.emplace(items[i].path,i);
+        g_menu_favorite_marks.clear();for(const auto& item:items)g_menu_favorite_marks.push_back(!g_launcher_view.favorites_only&&g_game_favorites.contains(item.path));
         g_menu_name_ui.last_sel = -1;
     }
     if (VMS_PLAT(g_menu_selected) != g_menu_name_ui.last_sel) { g_menu_name_ui.last_sel = VMS_PLAT(g_menu_selected); g_menu_name_ui.scroll_t0 = monotonic_ms(); }
+    menu_stall::main(menu_stall::Stage::Page);
     catalog.prepare_page(VMS_PLAT(g_menu_paths), VMS_PLAT(g_menu_saved), VMS_PLAT(g_menu_selected), host_menu::visible_rows, instant_state_exists);
+    menu_stall::main(menu_stall::Stage::Titles);refresh_visible_titles();
+    menu_stall::main(menu_stall::Stage::Select);
     catalog.select(VMS_PLAT(g_menu_paths), VMS_PLAT(g_menu_selected), monotonic_ms());
+    if(!items.empty()){
+        const size_t first=size_t(selected)/host_menu::visible_rows*host_menu::visible_rows;
+        std::vector<std::string> priority{items[selected].path};
+        for(size_t i=first;i<std::min(items.size(),first+host_menu::visible_rows);++i)if(int(i)!=selected)priority.push_back(items[i].path);
+        menu_stall::main(menu_stall::Stage::Prioritize);g_title_service.prioritize(priority);
+    }
+    menu_stall::main(menu_stall::Stage::DrawDone);
 }
-static void poll_menu_name() {
-    const int64_t start = paint_clock_us();
+static void search_launcher(std::vector<Entry>& items,int& selected,std::string& status){
+    g_title_service.enable(false);
+    SwkbdConfig keyboard{};Result rc=swkbdCreate(&keyboard,0);
+    if(R_FAILED(rc)){g_title_service.enable(true);status="系统键盘不可用，请重试";g_menu_note_error=true;g_menu_note_neutral=false;draw_menu(items,selected,status);return;}
+    swkbdConfigMakePresetDefault(&keyboard);swkbdConfigSetType(&keyboard,SwkbdType_All);
+    swkbdConfigSetReturnButtonFlag(&keyboard,0);swkbdConfigSetHeaderText(&keyboard,"搜索游戏");
+    swkbdConfigSetGuideText(&keyboard,"输入游戏名称；支持中文，英文不区分大小写；留空显示全部");
+    swkbdConfigSetInitialText(&keyboard,g_launcher_view.query.c_str());
+    swkbdConfigSetStringLenMax(&keyboard,game_aliases::max_chars);swkbdConfigSetStringLenMin(&keyboard,0);
+    char answer[game_aliases::max_chars*4+1]{};
+    if(host_render_lifecycle::barrier()){menu_stall::Pause modal;rc=swkbdShow(&keyboard,answer,sizeof(answer));}else rc=MAKERESULT(Module_Libnx,LibnxError_BadInput);
+    swkbdClose(&keyboard);g_title_service.enable(true);g_menu_repeat.reset();
+    if(R_SUCCEEDED(rc)){
+        std::string normalized;
+        if(game_aliases::normalize(answer,normalized)){
+            g_launcher_view.query=std::move(normalized);rebuild_launcher(items,selected);
+            status=items.empty()?"没有匹配的游戏":"";g_menu_note_error=false;g_menu_note_neutral=true;
+        }else{status="搜索内容无效，请重新输入";g_menu_note_error=true;g_menu_note_neutral=false;}
+    }
+    draw_menu(items,selected,status);
+}
+static void toggle_launcher_favorite(std::vector<Entry>& items,int& selected,std::string& status){
+    if(selected<0||size_t(selected)>=items.size())return;
+    const std::string path=items[selected].path;const bool favorite=!g_game_favorites.contains(path);
+    const bool ok=g_game_favorites.set(g_game_favorites_path,path,favorite);
+    if(ok)rebuild_launcher(items,selected);
+    g_menu_repeat.reset();
+    status=ok?(favorite?"已收藏游戏":"已取消收藏"):"收藏保存失败，请检查 SD 卡";
+    g_menu_note_error=!ok;g_menu_note_neutral=false;draw_menu(items,selected,status);
+}
+// The main header has only favorite/all tabs; Search belongs to More Settings.
+static bool update_launcher_navigation(u64 down,bool touch,int tx,int ty,std::vector<Entry>& items,int& selected,std::string& status,
+        const std::function<int(const std::string&,int)>& advance={}){
+    if(down&HidNpadButton_Minus){toggle_launcher_favorite(items,selected,status);return true;}
+    if((down&HidNpadButton_B)&&!g_launcher_view.query.empty()){
+        g_launcher_view.query.clear();rebuild_launcher(items,selected);
+        VMS_PLAT(g_menu_focus)=host_menu::Focus::Games;
+        status=items.empty()&&g_launcher_view.favorites_only?"暂无收藏游戏":"";
+        g_menu_note_error=false;g_menu_note_neutral=true;draw_menu(items,selected,status);return true;
+    }
+    const int tab=touch?host_menu::library_tab_hit(tx,ty):-1;
+    if((down&HidNpadButton_Y)||tab>=0||(touch&&host_menu::library_toggle_hit(tx,ty,g_launcher_favorite_count,g_launcher_total_count,advance))){
+        g_launcher_view.favorites_only=tab>=0?tab==0:!g_launcher_view.favorites_only;
+        rebuild_launcher(items,selected);
+        g_menu_repeat.reset();VMS_PLAT(g_menu_focus)=host_menu::Focus::Games;
+        status=items.empty()?(g_launcher_view.favorites_only?"暂无收藏游戏":"没有匹配的游戏"):"";
+        g_menu_note_error=false;g_menu_note_neutral=true;draw_menu(items,selected,status);return true;
+    }
+    return false;
+}
+static void poll_menu_name(std::vector<Entry>& items,int& sel) {
+    menu_stall::main(menu_stall::Stage::PollTitles);
     auto& catalog = g_menu_name_ui.catalog;
-    if (!catalog.poll_name(VMS_PLAT(g_menu_paths), monotonic_ms(),g_menu_repeat.browsing)) return;
-    g_menu_name_ui.scroll_t0 = monotonic_ms();
-    VMS_PLAT(g_cpu_cleared) = 0;
-    log_line("MENUNAME read=1 entries=" + std::to_string(VMS_PLAT(g_menu_paths).size()) +
-             " fallback_total=" + std::to_string(catalog.names.misses) + " cached=" + std::to_string(catalog.names.names.size()) +
-             " us=" + std::to_string(paint_clock_us() - start));
+    bool changed=false;
+    const int selected=VMS_PLAT(g_menu_selected);
+    const bool uncached=selected>=0&&size_t(selected)<items.size()&&!g_title_service.contains(items[size_t(selected)].path);
+    if(!g_title_worker_available||uncached){
+        if(catalog.poll_name(VMS_PLAT(g_menu_paths),monotonic_ms(),g_menu_repeat.browsing)){
+            const size_t i=size_t(std::max(0,VMS_PLAT(g_menu_selected)));
+            if(i<items.size()){
+                VMS_PLAT(g_menu_labels)[i]=g_game_aliases.label(items[i].path,catalog.title(items[i].path,filename_label(items[i].path)));
+                changed=true;
+            }
+        }
+    }
+    if(g_title_worker_available)for(const auto& record:g_title_service.poll(8)){
+        const auto found=g_title_indices.find(record.path);
+        changed=apply_game_title(found==g_title_indices.end()?size_t(-1):found->second,record)||changed;
+    }
+    changed=refresh_visible_titles()||changed;
+    if(changed)VMS_PLAT(g_cpu_cleared)=0;
+    if(!items.empty()){
+        const size_t selected=std::min(size_t(std::max(0,VMS_PLAT(g_menu_selected))),items.size()-1);
+        const size_t first=selected/host_menu::visible_rows*host_menu::visible_rows;
+        for(size_t i=first;i<std::min(items.size(),first+host_menu::visible_rows);++i){items[i].label=VMS_PLAT(g_menu_labels)[i];remember_launcher_title(items[i].path,items[i].label);}
+    }
+    if(g_launcher_names_changed){
+        g_launcher_names_changed=false;
+        if(!g_launcher_view.query.empty()){rebuild_launcher(items,sel);draw_menu(items,sel,VMS_PLAT(g_menu_status));}
+    }
+    menu_stall::main(menu_stall::Stage::PollDone);
 }
 static void draw_import_prompt(const Entry& entry) {
     VMS_PLAT(g_host_surface) = HostSurface::Import;
@@ -614,14 +964,14 @@ static void update_menu_delete(u64 down,std::vector<Entry>& items,int& sel,std::
     if(down&HidNpadButton_B){
         const int selected=g_menu_delete.selection;
         g_menu_delete.open=false;g_menu_delete.confirming=false;
-        g_display_menu.open=true;g_display_menu.selection=selected==0?1:2;
+        g_display_menu.open=true;g_display_menu.selection=selected==2?2:selected==0?3:4;
     }
     else if(down&HidNpadButton_AnyUp)result=g_menu_delete.act(Action::Up);
     else if(down&HidNpadButton_AnyDown)result=g_menu_delete.act(Action::Down);
     else if(down&HidNpadButton_A)result=g_menu_delete.act(Action::Confirm);
     if(result==Result::InheritSave) {
         g_menu_repeat.reset();g_chapter_blocked=held;
-        if(!g_chapter_import.begin(items,sel))status="至少需要两款游戏，才能选择来源章节";
+        if(!begin_chapter_import(items,sel))status="至少需要两款游戏，才能选择来源章节";
         if(down)draw_menu(items,sel,status);
         return;
     }
@@ -645,21 +995,53 @@ static void update_menu_delete(u64 down,std::vector<Entry>& items,int& sel,std::
     }
     if(down)draw_menu(items,sel,status);
 }
-static void update_display_menu(u64 down,u64 held,const std::vector<Entry>& items,int sel,std::string& status) {
+static void update_display_menu(u64 down,u64 held,std::vector<Entry>& items,int& sel,std::string& status) {
     using host_display_menu::Action;
-    if(down&HidNpadButton_B){g_display_menu.open=false;draw_menu(items,sel,status);return;}
-    if(down&HidNpadButton_AnyUp)g_display_menu.move(-1);
-    else if(down&HidNpadButton_AnyDown)g_display_menu.move(1);
-    if(!(down&HidNpadButton_A)){if(down)draw_menu(items,sel,status);return;}
+    if(down&HidNpadButton_B){
+        g_display_menu.open=false;g_menu_repeat.reset();
+        draw_menu(items,sel,status);return;
+    }
+    const bool up=(held|down)&HidNpadButton_AnyUp,downward=(held|down)&HidNpadButton_AnyDown;
+    const int moved=g_menu_repeat.update(up!=downward?(downward?1:-1):0,monotonic_ms());
+    if(moved)g_display_menu.move(moved);
+    if(!(down&HidNpadButton_A)){if(down||moved)draw_menu(items,sel,status);return;}
+    g_menu_repeat.reset();
     const auto action=g_display_menu.selected();
     if(action==Action::Back){g_display_menu.open=false;draw_menu(items,sel,status);return;}
+    if(action==Action::Search){g_display_menu.open=false;search_launcher(items,sel,status);return;}
     if(items.empty()){g_display_menu.open=false;status="先选择一款游戏";draw_menu(items,sel,status);return;}
-    if(action==Action::Inherit) {
+    if(action==Action::Rename) {
+        g_display_menu.open=false;
+        if(!g_game_aliases.writable){status="名称配置无法读取，请检查 SD 卡";g_menu_note_error=true;g_menu_note_neutral=false;draw_menu(items,sel,status);return;}
+        g_title_service.enable(false);
+        SwkbdConfig keyboard{};Result rc=swkbdCreate(&keyboard,0);
+        if(R_FAILED(rc)){g_title_service.enable(true);status="系统键盘不可用，请重试";g_menu_note_error=true;g_menu_note_neutral=false;draw_menu(items,sel,status);return;}
+        swkbdConfigMakePresetDefault(&keyboard);
+        swkbdConfigSetType(&keyboard,SwkbdType_All);
+        swkbdConfigSetReturnButtonFlag(&keyboard,0);
+        swkbdConfigSetHeaderText(&keyboard,"重命名游戏");
+        swkbdConfigSetGuideText(&keyboard,"可切换中文输入；留空恢复自动名称");
+        std::string initial;
+        const auto current_name=g_game_aliases.label(items[sel].path,g_menu_name_ui.catalog.title(items[sel].path,filename_label(items[sel].path)));
+        if(!game_aliases::normalize(current_name,initial))initial.clear();
+        swkbdConfigSetInitialText(&keyboard,initial.c_str());
+        swkbdConfigSetStringLenMax(&keyboard,game_aliases::max_chars);
+        swkbdConfigSetStringLenMin(&keyboard,0);
+        char name[game_aliases::max_chars*4+1]={};
+        host_render_lifecycle::barrier();{menu_stall::Pause modal;rc=swkbdShow(&keyboard,name,sizeof(name));}swkbdClose(&keyboard);g_title_service.enable(true);
+        if(R_SUCCEEDED(rc)) {
+            const bool ok=g_game_aliases.set(g_game_aliases_path,items[sel].path,name);
+            if(ok){items[sel].label=g_game_aliases.label(items[sel].path,g_menu_name_ui.catalog.title(items[sel].path,filename_label(items[sel].path)));remember_launcher_title(items[sel].path,items[sel].label);rebuild_launcher(items,sel);g_menu_name_ui.scroll_t0=monotonic_ms();}
+            status=ok?"游戏名称已更新":"保存名称失败，请检查名称长度或 SD 卡";
+            g_menu_note_error=!ok;g_menu_note_neutral=false;
+        }else {status="已取消或未完成重命名";g_menu_note_error=false;g_menu_note_neutral=true;}
+        g_menu_repeat.reset();
+    } else if(action==Action::Inherit) {
         g_display_menu.open=false;g_menu_repeat.reset();g_chapter_blocked=held;
-        if(!g_chapter_import.begin(items,sel))status="至少需要两款游戏，才能选择来源章节";
+        if(!begin_chapter_import(items,sel))status="至少需要两款游戏，才能选择来源章节";
     } else if(action==Action::DeleteGame||action==Action::DeleteInstant) {
         g_display_menu.open=false;
-        g_menu_delete.begin(items[sel].path,game_names::strip_jar(items[sel].path));
+        g_menu_delete.begin(items[sel].path,items[sel].label);
         g_menu_delete.selection=action==Action::DeleteGame?0:1;
         g_menu_delete.confirming=true;
     }
@@ -698,16 +1080,23 @@ static std::set<int> mapped_codes(u64 held) {
     return host_keymap::codes(g_keymap_active,standard_game_keys(),mapped_buttons(held & ~g_keymap_blocked));
 }
 static void select_game_keymap(const Entry& entry,const std::string& id) {
+    g_keymap_editor=host_keymap::Editor{};
+    g_data_editor=host_data::Editor{};g_data_session.reset();g_data_session.set_type('I');
     std::map<std::string,std::string> display_props;
     for(const char* key:{"MIDlet-Name","MIDlet-1"}){auto it=VMS_CL(g_props).find(key);if(it!=VMS_CL(g_props).end())display_props.emplace(it->first,it->second);}
     g_keymap_id=id;g_keymap_name=game_names::choose_name(display_props);
     if(g_keymap_name.empty())g_keymap_name=game_names::strip_jar(entry.path);
+    g_keymap_name=g_game_aliases.label(entry.path,g_keymap_name);
     g_keymap_active=host_keymap::lookup(g_keymaps,id);g_keymap_tracker.clear();g_keymap_blocked=~u64(0);
     g_controller_legends.invalidate();
+    const auto* text_profile=game_canvas_text::profile(id);
+    log_line("TEXTINPUT capability schema=1 standard_midp=1 canvas_profile="+std::string(text_profile?text_profile->id:"none")+" trigger=physical_A");
     log_line("KEYMAP game="+g_keymap_name+" id="+id+" source="+(g_keymaps.games.count(id)?std::string("game"):std::string("global"))+" auto="+std::to_string(g_keymap_active.automatic));
 }
+#include "switch_text_input.inc"
 static void close_keymap(u64 held,bool focus_paused) {
     const bool was_paused=g_keymap_editor.was_paused;
+    g_data_editor.open=false;if(g_data_session.busy())g_data_session.cancel();
     g_keymap_editor.open=false;g_keymap_tracker.clear();g_keymap_blocked|=held;
     if(!was_paused && !focus_paused)host_freeze236(false);
     VMS_PLAT(g_cpu_cleared)=0;VMS_RS(g_fb_dirty)=true;VMS_PLAT(g_fps_reset)=true;
@@ -717,14 +1106,97 @@ static void open_keymap(u64 held) {
     const bool paused=VMS_PLAT(g_host_paused);
     host_freeze236(true);g_keymap_tracker.clear();g_keymap_blocked|=held;
     g_keymap_editor.begin(g_keymaps,g_keymap_id,g_keymap_name,standard_game_keys(),paused);
+    g_data_editor.open=g_keymap_editor.page==host_keymap::Page::Data;
+    if(g_data_editor.open){g_data_session.valid();g_data_editor.begin();g_data_editor.clamp(g_data_session.count());}
     if(g_keymap_editor.save_note.empty()&&!g_canvas_notice.empty()) {
         g_keymap_editor.save_note=g_canvas_notice;
         g_keymap_editor.save_note_error=false;g_keymap_editor.save_note_neutral=true;
     }
     VMS_PLAT(g_cpu_cleared)=0;
-    log_line("L3MENU open page=save_exit L3_reserved=1 game="+g_keymap_name);
+    log_line("L3MENU open page="+std::string(g_keymap_editor.page==host_keymap::Page::Data?"data":g_keymap_editor.page==host_keymap::Page::Keymap?"keymap":"save_exit")+" L3_reserved=1 game="+g_keymap_name);
+}
+static host_data::InputResult request_game_data_value(const char* title,const std::string& guide,
+                                                     const std::string& initial,int64_t& value) {
+    SwkbdConfig keyboard{};Result rc=swkbdCreate(&keyboard,0);
+    if(R_FAILED(rc))return host_data::InputResult::Unavailable;
+    swkbdConfigMakePresetDefault(&keyboard);
+    swkbdConfigSetType(&keyboard,SwkbdType_NumPad);
+    swkbdConfigSetLeftOptionalSymbolKey(&keyboard,"-");
+    swkbdConfigSetReturnButtonFlag(&keyboard,0);
+    swkbdConfigSetHeaderText(&keyboard,title);
+    swkbdConfigSetGuideText(&keyboard,guide.c_str());
+    swkbdConfigSetInitialText(&keyboard,initial.c_str());
+    swkbdConfigSetStringLenMin(&keyboard,1);swkbdConfigSetStringLenMax(&keyboard,20);
+    char answer[128]{};host_render_lifecycle::barrier();{menu_stall::Pause modal;rc=swkbdShow(&keyboard,answer,sizeof answer);}swkbdClose(&keyboard);
+    g_keymap_blocked=~u64(0); // Applet dismissal buttons must be released before game input.
+    if(R_FAILED(rc))return host_data::InputResult::Cancelled;
+    return game_data::parse_decimal(answer,value)?host_data::InputResult::Accepted:host_data::InputResult::Invalid;
+}
+static host_data::Result update_game_data_editor(u64 down,u64 held) {
+    g_data_session.valid();g_data_editor.clamp(g_data_session.count());
+    g_keymap_blocked|=held;
+    if(down&(HidNpadButton_StickL|HidNpadButton_B)) {
+        if(g_data_session.busy())g_data_session.cancel();g_data_editor.open=false;
+        return host_data::Result::Resume;
+    }
+    if(g_data_session.busy()) {
+        g_data_session.step(16384);g_data_editor.clamp(g_data_session.count());
+        return host_data::Result::None;
+    }
+    if(down&HidNpadButton_Minus) {
+        g_data_session.set_type(host_data::next_type(g_data_session.type()));
+        g_data_editor.selection=0;g_data_editor.note.clear();g_data_editor.note_error=false;
+    } else if(down&HidNpadButton_Y) {
+        g_data_session.reset();g_data_editor.selection=0;g_data_editor.note.clear();g_data_editor.note_error=false;
+    } else if(down&(HidNpadButton_Plus|HidNpadButton_X|HidNpadButton_A)) {
+        const bool fresh=down&HidNpadButton_Plus,refine=!fresh&&(down&HidNpadButton_X),editing=!fresh&&!refine;
+        int64_t old=0;
+        if((refine||editing)&&(!g_data_session.ready()||!g_data_session.count())) {
+            g_data_editor.note=g_data_session.ready()?"没有候选，请按 + 重新搜索":"请先按 + 完成首次搜索";g_data_editor.note_error=false;
+            return host_data::Result::None;
+        }
+        if(editing&&!g_data_session.read(g_data_editor.selection,old)) {
+            g_data_editor.note="选中位置已失效，请重新搜索";g_data_editor.note_error=true;return host_data::Result::None;
+        }
+        const std::string guide=editing?"旧值："+std::to_string(old)+"；位置："+g_data_session.label(g_data_editor.selection):
+            refine?"输入游戏变化后的整数，筛选上一轮候选":"输入游戏中显示的整数（可用负号）";
+        int64_t value=0;
+        const auto input=request_game_data_value(editing?"修改选中数据":refine?"继续筛选":"首次搜索",guide,editing?std::to_string(old):"",value);
+        if(input==host_data::InputResult::Cancelled)return host_data::Result::None;
+        g_data_editor.note.clear();g_data_editor.note_error=false;
+        if(input==host_data::InputResult::Unavailable) {g_data_editor.note="无法打开数字键盘，请重试";g_data_editor.note_error=true;}
+        else if(input==host_data::InputResult::Invalid) {g_data_editor.note="请输入有效的十进制整数（64 位范围）";g_data_editor.note_error=true;}
+        else if(editing) {
+            const bool ok=g_data_session.write(g_data_editor.selection,value);
+            g_data_editor.note=ok?"已修改："+std::to_string(old)+" → "+std::to_string(value)+"；位置："+g_data_session.label(g_data_editor.selection):"修改失败：位置失效或数值超出此类型范围";g_data_editor.note_error=!ok;
+        } else {
+            g_data_editor.selection=0;
+            if(!g_data_session.begin(value,refine)) {g_data_editor.note=g_data_session.note;g_data_editor.note_error=true;}
+        }
+    } else if(down&HidNpadButton_AnyLeft)g_data_editor.move(-int(host_data::visible_rows),g_data_session.count());
+    else if(down&HidNpadButton_AnyRight)g_data_editor.move(int(host_data::visible_rows),g_data_session.count());
+    else if(down&HidNpadButton_AnyUp)g_data_editor.move(-1,g_data_session.count());
+    else if(down&HidNpadButton_AnyDown)g_data_editor.move(1,g_data_session.count());
+    return host_data::Result::None;
 }
 static bool update_keymap_editor(u64 down,u64 held,bool focus_paused) {
+    if((down&(HidNpadButton_L|HidNpadButton_R))&&g_keymap_editor.pending==host_keymap::Pending::None) {
+        if(g_data_session.busy())g_data_session.cancel();
+        host_keymap::act(g_keymap_editor,down&HidNpadButton_L?host_keymap::Action::PreviousPage:host_keymap::Action::NextPage);
+        g_data_editor.open=g_keymap_editor.page==host_keymap::Page::Data;
+        if(g_data_editor.open){g_data_session.valid();g_data_editor.begin();g_data_editor.clamp(g_data_session.count());}
+        if(g_keymap_editor.page==host_keymap::Page::Keymap&&!g_keymap_pro_attempted) {
+            g_keymap_pro_attempted=true;
+            log_line("KEYMAP pro_loaded="+std::to_string(g_keymap_pro.load("romfs:/ui/pro-controller.rgba")));
+        }
+        log_line("L3MENU page="+std::string(g_data_editor.open?"data":g_keymap_editor.page==host_keymap::Page::Keymap?"keymap":"save_exit"));
+        g_keymap_blocked|=held;VMS_PLAT(g_cpu_cleared)=0;return false;
+    }
+    if(g_data_editor.open) {
+        const auto result=update_game_data_editor(down,held);
+        if(result==host_data::Result::Resume)close_keymap(held,focus_paused);
+        return false; // All three tabs share the same pause owner.
+    }
     const auto previous_page=g_keymap_editor.page;
     using host_keymap::Action;host_keymap::Result result=host_keymap::Result::None;
     const u64 directions=HidNpadButton_AnyUp|HidNpadButton_AnyDown|HidNpadButton_AnyLeft|HidNpadButton_AnyRight;
@@ -773,6 +1245,7 @@ static bool update_keymap_editor(u64 down,u64 held,bool focus_paused) {
         g_keymap_editor.save_note_error=existed&&!ok;g_keymap_editor.save_note_neutral=!existed;
         log_line("L3MENU delete_instant existed="+std::to_string(existed)+" ok="+std::to_string(ok));
     } else if(result==host_keymap::Result::ExitGame) {
+        g_data_editor.open=false;g_data_session.cancel();g_data_session.reset();
         g_keymap_editor.open=false;g_keymap_tracker.clear();g_keymap_blocked|=held;
         log_line("L3MENU exit confirmed=1");return true;
     } else if(result==host_keymap::Result::Close)close_keymap(held,focus_paused);
@@ -807,6 +1280,9 @@ static void unpack_nested_jars() {
     } else log_line("JAR nested failed " + nested_error);
 }
 static void launch_entry(const Entry& e, bool import_legacy = false) {
+    menu_stall::menu(false);
+    g_title_service.enable(false);
+    reset_game_text_input();
     select_display_preferences(e.path,true);
     VMS_PLAT(g_launched_path) = e.path;
     VMS_PLAT(g_host_surface) = HostSurface::Game;
@@ -872,6 +1348,7 @@ int main(int argc, char** argv) {
     romfsInit();
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad; padInitializeAny(&pad);
+    hidInitializeTouchScreen();bool launcher_touch_held=false;
     bool log_rotated = false;
     const std::string log_path = n1paths::prepare_log("sdmc:/switch/j2me", &log_rotated);
     mkdir("sdmc:/switch/j2me/games", 0777);
@@ -904,10 +1381,12 @@ int main(int argc, char** argv) {
     log_line("SCREEN " + std::to_string(fw) + "x" + std::to_string(fh));
     VMS_RS(g_screen_w) = 240; VMS_RS(g_screen_h) = 320;
     VMS_RS(g_fb).assign((size_t)VMS_RS(g_screen_w) * VMS_RS(g_screen_h) * 3, 0);
+    g_title_worker_available=g_title_service.start("sdmc:/switch/j2me/game-titles.cache");
+    log_line("GAMETITLES worker="+std::to_string(g_title_worker_available)+" cache=game-titles.cache title_only=1");
     static std::vector<Entry> items = scan_games();
     VMS_PLAT_LOCAL3(sel, main_sel, in_game, main_in_game, last_ks, main_last_ks, static int sel = 0, in_game = 0, last_ks = -1;)
     VMS_PLAT_LOCAL(import_prompt, main_import_prompt, static bool import_prompt = false;)
-    bool focus_paused=false;
+    bool focus_paused=false,renderer_focused=true;
     const bool config_loaded = host_menu::load_settings("sdmc:/switch/j2me/menu.cfg", VMS_PLAT(g_menu_settings));
     // This test build starts in aspect-fit even when an earlier skin was saved.
     VMS_PLAT(g_menu_settings).bezel = j2me_present::adaptive_bezel;
@@ -932,26 +1411,39 @@ int main(int argc, char** argv) {
                " hashed=" + std::to_string(g_speed_keys.hashed) + " cache_hits=" + std::to_string(g_speed_keys.hits) + " cache_entries=" + std::to_string(g_speed_keys.cache.size())); }
     log_line("MENU native=1280x720 viewport=aspect-fit first-edge-stop speed=per-game native/30/60 settings_loaded=" + std::to_string(config_loaded) +
              " speeds_loaded=" + std::to_string(speeds_loaded) + " speeds=" + std::to_string(VMS_PLAT(g_game_speeds).size()));
-    draw_menu(items, sel, status);
+    menu_stall::menu(true);draw_menu(items, sel, status);
     static AppletHookCookie p8_exit_cookie; // P8.2: HOME->close / exit request writes the last P7COUNT summary
     appletHook(&p8_exit_cookie, [](AppletHookType t, void*) { if (t == AppletHookType_OnExitRequest) p8_exit_summary(); }, nullptr);
     g_die_catch = true;
-    while (appletMainLoop()) {
+    while (true) {
+        menu_stall::main(menu_stall::Stage::Applet);
+        if(!appletMainLoop())break;
+        menu_stall::main(menu_stall::Stage::Loop);
         diag_host(in_game!=0,VMS_PLAT(g_host_paused)||VMS_PLAT(g_exit_sheet)||g_keymap_editor.open);
         if (setjmp(g_die_jmp) != 0) {
+            // An uncaught Java failure can bypass ordinary lifecycle_destroy.
+            // Retire the accepted immutable game frames before drawing its menu.
+            host_render_lifecycle::barrier();
+            reset_game_text_input();
             g_device_diag.owner.phase=runtime_diag::Phase::Error;g_device_diag.live.publish(g_device_diag.owner);
-            g_keymap_editor.open=false;g_keymap_tracker.clear();
+            g_keymap_editor.open=false;g_data_editor.open=false;g_data_session.reset();g_keymap_tracker.clear();
             g_chapter_import=chapter_ui::State{};g_display_menu.open=false;
             stop_thread(); in_game = 0; import_prompt = false; VMS_PLAT(g_exit_sheet) = false; VMS_PLAT(g_sheet_paused_here) = false; VMS_PLAT(g_sheet_swallow) = 0; status = VMS_EXEC(g_error);
             g_menu_note_error=true;g_menu_note_neutral=false;g_menu_repeat.reset();
             draw_menu(items, sel, status); log_line("EX back-to-menu " + VMS_EXEC(g_error)); present(); continue;
         }
+        menu_stall::main(menu_stall::Stage::Focus);
         const bool focused=appletGetFocusState()==AppletFocusState_InFocus;
+        menu_stall::menu(!in_game&&focused);
+        if(renderer_focused&&!focused)host_render_lifecycle::barrier();
+        renderer_focused=focused;
+        menu_stall::main(menu_stall::Stage::TitleEnable);g_title_service.enable(!in_game&&focused);
         if(in_game && !focused && !focus_paused) {focus_paused=true;host_freeze236(true);}
         if(in_game && focused && focus_paused) {focus_paused=false;if(!g_keymap_editor.open && !VMS_PLAT(g_exit_sheet))host_freeze236(false);}
         host_lifecycle_poll242();
         if(in_game && VMS_EXEC(g_midlet_state)==MidletState::Destroyed) {
-            in_game=0;focus_paused=false;g_keymap_editor.open=false;g_keymap_tracker.clear();VMS_PLAT(g_exit_sheet)=false;VMS_PLAT(g_sheet_paused_here)=false;VMS_PLAT(g_sheet_swallow)=0;items=scan_games();
+            reset_game_text_input();
+            in_game=0;focus_paused=false;g_keymap_editor.open=false;g_data_editor.open=false;g_data_session.reset();g_keymap_tracker.clear();VMS_PLAT(g_exit_sheet)=false;VMS_PLAT(g_sheet_paused_here)=false;VMS_PLAT(g_sheet_swallow)=0;items=scan_games();
             if(VMS_EXEC(g_self_exit)) {   // 0.2.112 F2: neutral one-line hint, measured with the menu font at the status-bar size
                 VMS_EXEC(g_self_exit)=false;
                 status=self_exit_hint::status(VMS_EXEC(g_last_console_line),[](const std::string& s){
@@ -962,11 +1454,15 @@ int main(int argc, char** argv) {
             if(!g_canvas_notice.empty()){status=g_canvas_notice;g_menu_note_error=false;g_menu_note_neutral=true;}
             sel=std::max(0,std::min(sel,std::max(0,int(items.size())-1)));draw_menu(items,sel,status);
         }
-        if(!focused) {if(g_chapter_import.open){g_chapter_blocked=~u64(0);g_menu_repeat.reset();}g_keymap_editor.choice_repeat.reset();{ P7_SCOPE(Idle); svcSleepThread(10000000); }continue;}
-        padUpdate(&pad);
+        if(!focused) {menu_stall::menu(false);g_menu_repeat.reset();if(g_chapter_import.open){g_chapter_blocked=~u64(0);}g_keymap_editor.choice_repeat.reset();{ P7_SCOPE(Idle); svcSleepThread(10000000); }continue;}
+        if(in_game)apply_pending_game_text();
+        menu_stall::main(menu_stall::Stage::Input);padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
         u64 up = padGetButtonsUp(&pad);
         u64 held = padGetButtons(&pad);
+        HidTouchScreenState launcher_touch{};hidGetTouchScreenStates(&launcher_touch,1);
+        const bool launcher_touch_down=launcher_touch.count>0&&!launcher_touch_held;
+        launcher_touch_held=launcher_touch.count>0;
         g_keymap_blocked &= held;
         int ks=0;
         if(in_game && !g_keymap_editor.open && !VMS_PLAT(g_exit_sheet))
@@ -985,7 +1481,7 @@ int main(int argc, char** argv) {
                      (stick && !dpad ? " stick-only" : "") + " sel=" + std::to_string(sel));
         }
         if(!in_game && g_display_menu.open) {
-            g_menu_repeat.reset();update_display_menu(down,held,items,sel,status);
+            update_display_menu(down,held,items,sel,status);
             present();{P7_SCOPE(Idle);svcSleepThread(16000000);}continue;
         }
         if(!in_game && g_menu_delete.open) {
@@ -1018,8 +1514,13 @@ int main(int argc, char** argv) {
             open_keymap(held);present();continue;
         }
         if (!in_game) {
-            // Games plus bezel, filter, per-game speed cap and FPS options.
-            // Minus retains the legacy-import flow as a secondary shortcut.
+            // Touch and controller tabs share the exact rectangles drawn by host_menu.
+            const int tx=launcher_touch.count?int(launcher_touch.touches[0].x):-1;
+            const int ty=launcher_touch.count?int(launcher_touch.touches[0].y):-1;
+            if(update_launcher_navigation(down,launcher_touch_down,tx,ty,items,sel,status,
+                [](const std::string& s,int px){const auto m=VMS_PLAT(g_host_font).measure(s,px);
+                    return m.ok&&m.advance>0?m.advance:host_menu::text_advance(s,px);})){present();continue;}
+            // Main-menu library navigation never changes the full game catalog.
             const bool up_held=held&HidNpadButton_AnyUp,down_held=held&HidNpadButton_AnyDown;
             const bool page_back_held=held&(HidNpadButton_L|HidNpadButton_ZL),page_next_held=held&(HidNpadButton_R|HidNpadButton_ZR);
             const int direction=VMS_PLAT(g_menu_focus)!=host_menu::Focus::Games?0:
@@ -1046,8 +1547,7 @@ int main(int argc, char** argv) {
             }
             else if ((down & HidNpadButton_Plus)) {
                 g_menu_repeat.reset();
-                if(items.empty())status="先选择一款游戏";
-                else g_display_menu.begin();
+                g_display_menu.begin();
                 draw_menu(items,sel,status);present();continue;
             }
             else if (down & HidNpadButton_X) {
@@ -1055,7 +1555,7 @@ int main(int argc, char** argv) {
                 else if (items.empty()) status = "先选择一款游戏";
                 else if (!instant_state_exists(items[sel].path)) status = "没有即时存档";
                 else {
-                    select_display_preferences(items[sel].path,true);
+                    menu_stall::menu(false);select_display_preferences(items[sel].path,true);
                     VMS_PLAT(g_launched_path) = items[sel].path;
                     VMS_PLAT(g_host_surface) = HostSurface::Game;
                     VMS_PLAT(g_cpu_cleared) = 0;
@@ -1067,6 +1567,7 @@ int main(int argc, char** argv) {
                     VMS_EXEC(g_speed_frame_open) = false;
                     log_line(std::string("CONTINUE begin ") + items[sel].path + " bezel=" + std::to_string(VMS_PLAT(g_menu_settings).bezel) +
                              " fps=" + std::to_string(VMS_PLAT(g_menu_settings).show_fps) + " speed=" + host_speed::log_name(VMS_EXEC(g_speed_cap)));
+                    g_title_service.enable(false);
                     VMS_CL(g_jar_files).clear(); VMS_CL(g_props).clear();
                     std::vector<uint8_t> bytes;
                     std::string err;
@@ -1103,8 +1604,6 @@ int main(int argc, char** argv) {
                     sel=menu_actions::page(sel,1,int(items.size()),host_menu::visible_rows); changed = true;
                 } else if ((down & (HidNpadButton_L | HidNpadButton_ZL)) && !items.empty()) {
                     sel=menu_actions::page(sel,-1,int(items.size()),host_menu::visible_rows); changed = true;
-                } else if ((down & HidNpadButton_Minus) && !items.empty()) {
-                    import_prompt = true; draw_import_prompt(items[sel]); present(); continue;
                 } else if ((down & HidNpadButton_A) && !items.empty()) {
                     log_line("LAUNCH begin " + items[sel].label + " path=" + items[sel].path);
                     launch_entry(items[sel]); status=g_canvas_notice; in_game = 1; VMS_EXEC(g_slices) = 0;
@@ -1119,8 +1618,7 @@ int main(int argc, char** argv) {
                     VMS_PLAT(g_menu_settings).bezel = host_menu::next_bezel(VMS_PLAT(g_menu_settings).bezel);
                     settings_changed = true;
                 } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Filter) {
-                    settings_changed=host_menu::change_filter(VMS_PLAT(g_menu_settings),1);
-                    if(settings_changed)select_presenter();
+                    change_filter_menu_setting(status);
                 } else if (VMS_PLAT(g_menu_focus) == host_menu::Focus::Rotation && !items.empty()) {
                     auto chosen=VMS_PLAT(g_menu_settings);
                     host_menu::change_rotation(chosen,1);
@@ -1160,12 +1658,13 @@ int main(int argc, char** argv) {
             }
         } else {
             g_menu_repeat.reset();
+            if(try_game_text_input(down,held,focus_paused)){present();continue;}
             g_keymap_tracker.update(mapped_codes(held),[](int code,bool release){dispatch_key(code,release);});
             // Different phone codes can share a GameCanvas action (e.g. Up and 2).
             if(Value* key_held=game_canvas_state(VMS_RS(g_current),"keyHeld"))key_held->i=VMS_PLAT(g_key_states);
 
         }
-        if (!in_game && !import_prompt && !g_menu_delete.open && !g_display_menu.open) poll_menu_name();
+        if (!in_game && !import_prompt && !g_menu_delete.open && !g_display_menu.open) poll_menu_name(items,sel);
         if (in_game && VMS_PLAT(g_exit_sheet)) {
             { P7_SCOPE(Idle); std::this_thread::sleep_for(std::chrono::milliseconds(16)); }
         } else if (in_game) {
@@ -1201,8 +1700,11 @@ int main(int argc, char** argv) {
             }
         }
     }
+    menu_stall::menu(false);
+    g_data_editor.open=false;g_data_session.reset();
+    g_title_service.stop();
     lifecycle_destroy();
-    p7::pool().shutdown(); // P7.2
+    native_prep_runtime::shutdown();p7::pool().shutdown(); // P7.2
     VMS_PLAT(g_audio_sink).shutdown();
     close_presenter();
     close_host_fonts();

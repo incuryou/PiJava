@@ -2,6 +2,7 @@
 #ifndef J2ME_M3G_GEOMETRY_H
 #define J2ME_M3G_GEOMETRY_H
 #include "m3g_native.h"
+#include "m3g_float.h"
  VMS_RS_ACCESSOR(g_m3g_native_vectors, uint64_t) VMS_RS_ACCESSOR(g_m3g_native_vertices, uint64_t) VMS_RS_ACCESSOR(g_m3g_native_matrices, uint64_t)
 static bool m3g_read_matrix(int self,float m[16]) {
     ArrayStorage* a=m3g_array(m3g_ref(self,"matrix","[F"),"[F",16);if(!a)return false;
@@ -10,7 +11,7 @@ static bool m3g_read_matrix(int self,float m[16]) {
 }
 static void m3g_apply_vector(const float m[16],ArrayStorage& out,size_t i,float x,float y,float z,float w) {
     // Match Java's row-major float evaluation order; copy matrix before mutations.
-    for(int r=0;r<4;++r)out.set(i+r,Value::of_i(f_bits(m[4*r]*x+m[4*r+1]*y+m[4*r+2]*z+m[4*r+3]*w)));
+    for(int r=0;r<4;++r)out.set(i+r,Value::of_i(f_bits(m3g_float::dot4(m[4*r],x,m[4*r+1],y,m[4*r+2],z,m[4*r+3],w))));
 }
 static bool m3g_transform_vectors(int self,int array) {
     float m[16];ArrayStorage* a=m3g_array(array,"[F",0);
@@ -30,14 +31,14 @@ static bool m3g_transform_vertices(int self,int vertices,int output,bool W) {
 static bool m3g_transform_texcoords(int self,int array) {
     float m[16];ArrayStorage* a=m3g_array(array,"[F",0);
     if(!a||(a->size()&1)||!m3g_read_matrix(self,m))return false;
-    for(size_t i=0;i<a->size();i+=2){float s=bits_f(a->get(i).i),t=bits_f(a->get(i+1).i);a->set(i,Value::of_i(f_bits(m[0]*s+m[1]*t+m[3])));a->set(i+1,Value::of_i(f_bits(m[4]*s+m[5]*t+m[7])));}
+    for(size_t i=0;i<a->size();i+=2){float s=bits_f(a->get(i).i),t=bits_f(a->get(i+1).i);a->set(i,Value::of_i(f_bits(m3g_float::add(m3g_float::add(m3g_float::mul(m[0],s),m3g_float::mul(m[1],t)),m[3]))));a->set(i+1,Value::of_i(f_bits(m3g_float::add(m3g_float::add(m3g_float::mul(m[4],s),m3g_float::mul(m[5],t)),m[7]))));}
     return true;
 }
 static bool m3g_multiply(int left,int right,int target) {
     ArrayStorage* a=m3g_array(left,"[F",16),*b=m3g_array(right,"[F",16),*out=m3g_array(target,"[F",16);
     if(!a||!b||!out)return false;
     float l[16],r[16];for(int i=0;i<16;++i){l[i]=bits_f(a->get(i).i);r[i]=bits_f(b->get(i).i);}
-    for(int row=0;row<16;row+=4)for(int col=0;col<4;++col)out->set(row+col,Value::of_i(f_bits(l[row]*r[col]+l[row+1]*r[col+4]+l[row+2]*r[col+8]+l[row+3]*r[col+12])));
+    for(int row=0;row<16;row+=4)for(int col=0;col<4;++col)out->set(row+col,Value::of_i(f_bits(m3g_float::dot4(l[row],r[col],l[row+1],r[col+4],l[row+2],r[col+8],l[row+3],r[col+12]))));
     ++VMS_RS(g_m3g_native_matrices);return true;
 }
 #include "m3g_background.h"

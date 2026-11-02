@@ -16,11 +16,19 @@ def main():
     assert romfs==(objects/'romfs.bin').read_bytes(),'ROMFS mismatch'
     elf=(objects/'j2mevm.elf').read_bytes();assert elf[:4]==b'\x7fELF' and struct.unpack_from('<H',elf,18)[0]==183,'not AArch64 ELF'
     staged=objects/'romfs-release';files=[]
+    for required in ('font/cjk16.bin','font/small12.bin'):
+        assert (staged/required).is_file(),'missing ordinary game font: '+required
+    expected={str(f.relative_to(r/'romfs')) for directory in ('classes','font','skins','ui','shaders')
+              for f in (r/'romfs'/directory).rglob('*') if f.is_file()}
+    assert {str(f.relative_to(staged)) for f in staged.rglob('*') if f.is_file()}==expected,'production ROMFS file set mismatch'
     for f in sorted(staged.rglob('*')):
         if f.is_file():
             rel=f.relative_to(staged);original=r/'romfs'/rel
             assert f.read_bytes()==original.read_bytes(),'staged asset mismatch: '+str(rel)
-            assert rel.parts[0] in ('classes','font','skins') or rel.as_posix() in ('ui/pro-controller.rgba','shaders/filter.vert.dksh','shaders/filter.frag.dksh'),'unexpected production asset'
+            assert rel.parts[0] in ('classes','font','skins') or rel.as_posix() in (
+                'ui/pro-controller.rgba','shaders/filter.vert.dksh','shaders/filter.frag.dksh',
+                'shaders/m3g.vert.dksh','shaders/m3g.frag.dksh',
+                'shaders/m3g_skin.comp.dksh'),'unexpected production asset: '+rel.as_posix()
             assert f.suffix!='.jar','game/example JAR accidentally embedded'
             files.append({'path':str(rel),'sha256':sha(f),'size':f.stat().st_size})
     sources={str(f.relative_to(r)):sha(f) for f in sorted((r/'src').rglob('*')) if f.is_file()}

@@ -9,7 +9,34 @@
  VMS_RS_ACCESSOR(g_m3g_fallback_aa, uint64_t) VMS_RS_ACCESSOR(g_m3g_fallback_dither, uint64_t) VMS_RS_ACCESSOR(g_m3g_fallback_fog, uint64_t) VMS_RS_ACCESSOR(g_m3g_fallback_mip, uint64_t)
 static Value* m3g_field(int ref, const char* name, const char* desc) {
     if (ref <= 0 || ref >= int(VMS_HEAP(g_heap).size()) || VMS_HEAP(g_heap)[ref].cls < 0) return nullptr;
-    Field* f = find_field(VMS_HEAP(g_heap)[ref].cls, name, desc);
+    const int cls=VMS_HEAP(g_heap)[ref].cls;
+    if(size_t(cls)>=VMS_CL(g_classes).size())return nullptr;
+    // Native islands repeatedly access a small, fixed set of fields. Avoid
+    // rescanning the class (Graphics3D has over a hundred fields) each row.
+    // Hashes choose a slot only; the current name/descriptor validate each hit.
+    uint32_t hash=2166136261u;
+    for(const unsigned char* p=reinterpret_cast<const unsigned char*>(name);*p;++p)hash=(hash^*p)*16777619u;
+    hash=(hash^0xffu)*16777619u;
+    for(const unsigned char* p=reinterpret_cast<const unsigned char*>(desc);*p;++p)hash=(hash^*p)*16777619u;
+    auto& cache=VMS_CL(g_classes)[cls].m3g_field_slots31;
+    if(cache.empty())cache.assign(64,{-1,-1});
+    // Mix the upper bits: depthBuffer, rowFogStep240 and compBlender otherwise
+    // collide on the low six FNV bits and evict one another on every row.
+    auto& bound=cache[(hash^(hash>>16))&63u];Field* f=nullptr;
+    if(bound.first>=0&&size_t(bound.first)<VMS_CL(g_classes).size()){
+        auto& fields=VMS_CL(g_classes)[bound.first].fields;
+        if(bound.second>=0&&size_t(bound.second)<fields.size()){
+            auto& candidate=fields[bound.second];
+            if(candidate.name==name&&candidate.desc==desc)f=&candidate;
+        }
+    }
+    if(!f){
+        f=find_field(cls,name,desc);
+        if(f&&f->owner>=0&&size_t(f->owner)<VMS_CL(g_classes).size()){
+            const auto& fields=VMS_CL(g_classes)[f->owner].fields;
+            bound={f->owner,int(f-fields.data())};
+        }
+    }
     if (!f || f->slot < 0) return nullptr;
     auto& v = f->is_static ? VMS_CL(g_classes)[f->owner].statics : VMS_HEAP(g_heap)[ref].fields;
     return size_t(f->slot) < v.size() ? &v[f->slot] : nullptr;
@@ -24,57 +51,16 @@ static ArrayStorage* m3g_array(int ref,const char* desc,size_t minimum) {
     if(ref<=0||ref>=int(VMS_HEAP(g_heap).size()))return nullptr;
     Obj& o=VMS_HEAP(g_heap)[ref];return o.is_array&&o.array_desc==desc&&o.elems.size()>=minimum?&o.elems:nullptr;
 }
-static int m3g_clamp(int n) { return std::max(0,std::min(255,n)); }
-static uint32_t m3g_pack(const int c[4]) {
-    return (uint32_t(m3g_clamp(c[0]))<<24)|(uint32_t(m3g_clamp(c[1]))<<16)|(uint32_t(m3g_clamp(c[2]))<<8)|uint32_t(m3g_clamp(c[3]));
-}
-static void m3g_unpack(uint32_t p,int c[4]) { for(int i=0;i<4;++i)c[i]=(p>>(24-8*i))&255; }
-struct M3GNativeTexture {
-    ArrayStorage* pixels=nullptr; int width=0,height=0,format=100,mode=227,color=0;
-    bool linear=false,repeatS=false,repeatT=false; float uv[6]={};
-};
-static int m3g_wrap(double n,int size,bool repeat) {
-    if(!repeat)return n<0?0:(n>=size?size-1:int(n));
-    double v=std::fmod(n,double(size));if(v<0)v+=size;return int(v);
-}
-static uint32_t m3g_sample(const M3GNativeTexture& t,double s,double v) {
-    // Java Triangle coordinates are already in texel units.
-    if(!t.linear) {
-        int x=m3g_wrap(std::floor(s),t.width,t.repeatS),y=m3g_wrap(std::floor(v),t.height,t.repeatT);
-        return uint32_t(t.pixels->get(size_t(y)*t.width+x).i);
-    }
-    double sx=std::trunc(s*256.0)-128.0,sy=std::trunc(v*256.0)-128.0;
-    double ix=std::floor(sx/256.0),iy=std::floor(sy/256.0);
-    int fx=int(sx-ix*256.0),fy=int(sy-iy*256.0);
-    int x0=m3g_wrap(ix,t.width,t.repeatS),x1=m3g_wrap(ix+1,t.width,t.repeatS);
-    int y0=m3g_wrap(iy,t.height,t.repeatT),y1=m3g_wrap(iy+1,t.height,t.repeatT);
-    int a[4],b[4],c[4],d[4],out[4];
-    m3g_unpack(t.pixels->get(size_t(y0)*t.width+x0).i,a);m3g_unpack(t.pixels->get(size_t(y0)*t.width+x1).i,b);
-    m3g_unpack(t.pixels->get(size_t(y1)*t.width+x0).i,c);m3g_unpack(t.pixels->get(size_t(y1)*t.width+x1).i,d);
-    for(int k=0;k<4;++k)out[k]=((((a[k]*(256-fx)+b[k]*fx)>>8)*(256-fy))+(((c[k]*(256-fx)+d[k]*fx)>>8)*fy))>>8;
-    return m3g_pack(out);
-}
-static uint32_t m3g_texture_blend(uint32_t bg,uint32_t fg,const M3GNativeTexture& t) {
-    int b[4],f[4],c[4],o[4];m3g_unpack(bg,b);m3g_unpack(fg,f);m3g_unpack(t.color,c);
-    for(int i=0;i<4;++i)o[i]=b[i];
-    bool alpha=t.format==96,rgba=t.format==98||t.format==100;
-    if(t.mode==228) { if(alpha)o[0]=f[0];else return fg; }
-    else if(alpha) { if(t.mode!=226)o[0]=(b[0]*f[0]+128)>>8; }
-    else if(t.mode==224) { for(int i=1;i<4;++i)o[i]=std::min(255,b[i]+f[i]);if(rgba)o[0]=(b[0]*f[0]+128)>>8; }
-    else if(t.mode==225) { for(int i=1;i<4;++i)o[i]=b[i]+(((c[i]-b[i])*f[i]+128)>>8);if(rgba)o[0]=(b[0]*f[0]+128)>>8; }
-    else if(t.mode==226) { if(t.format==99)return fg;if(t.format==100)for(int i=1;i<4;++i)o[i]=b[i]+(((f[i]-b[i])*f[0])>>8); }
-    else if(t.mode==227) { for(int i=1;i<4;++i)o[i]=(b[i]*f[i]+(rgba?128:0))>>8;if(rgba)o[0]=(b[0]*f[0]+b[0])>>8; }
-    return m3g_pack(o);
-}
-static uint32_t m3g_composite(uint32_t bg,uint32_t fg,int alpha,int mode) {
-    if(mode==68)return fg;
-    if((mode==64||mode==65)&&alpha<=0)return bg;
-    if(mode==64&&alpha>=255)return fg;
-    int b[4],f[4],o[4];m3g_unpack(bg,b);m3g_unpack(fg,f);
-    if(mode==64) {o[0]=alpha+((b[0]*(255-alpha))>>8);for(int i=1;i<4;++i)o[i]=(f[i]*alpha+b[i]*(255-alpha))>>8;}
-    else if(mode==65) {o[0]=b[0]+((alpha*(255-b[0]))>>8);for(int i=1;i<4;++i)o[i]=std::min(255,b[i]+((f[i]*alpha)>>8));}
-    else {int shift=mode==67?7:8;for(int i=0;i<4;++i)o[i]=std::min(255,(b[i]*f[i])>>shift);}
-    return m3g_pack(o);
+#include "m3g_raster.h"
+using m3g_raster::m3g_clamp;
+using m3g_raster::m3g_pack;
+using m3g_raster::m3g_unpack;
+using m3g_raster::m3g_wrap;
+using m3g_raster::m3g_composite;
+struct M3GNativeTexture : m3g_raster::Texture {ArrayStorage* pixels=nullptr;};
+namespace m3g_raster {
+// Main-only capture hook. No ArrayStorage address enters a worker command.
+inline bool (*cpu_capture)(int,const Command&,ArrayStorage*,ArrayStorage*,const std::array<ArrayStorage*,4>&)=nullptr;
 }
 static bool m3g_draw_triangle(int g,int tri,int appearance,int defColor,bool hasColors,bool hasTex,bool perspective) {
     int hints=0,w=0,h=0,ox=0,oy=0,vx=0,vy=0,l=0,t=0,r=0,b=0,depthEnabled=0,alphaFactor=0;
@@ -130,58 +116,22 @@ static bool m3g_draw_triangle(int g,int tri,int appearance,int defColor,bool has
         co[i]=hasColors?uint32_t(colors->get(i).i):uint32_t(defColor);
         if(!std::isfinite(x[i])||!std::isfinite(y[i])||!std::isfinite(z[i])||!std::isfinite(iw[i]))return false;
     }
-    double area=(x[1]-x[0])*(y[2]-y[0])-(y[1]-y[0])*(x[2]-x[0]);
-    if(!std::isfinite(area))return false;
-    ++VMS_RS(g_m3g_native_triangles);
-    if(std::fabs(area)<1e-6)return true;
-    int order[3]={0,1,2};if(area<0){std::swap(order[1],order[2]);area=-area;}
-    const int64_t originX=int64_t(ox)+vx,originY=int64_t(oy)+vy;
-    int64_t ll=std::max<int64_t>(l,-originX),rr=std::min<int64_t>(r,int64_t(w)-originX);
-    int64_t tt=std::max<int64_t>(t,-originY),bb=std::min<int64_t>(b,int64_t(h)-originY);
-    if(ll>=rr||tt>=bb)return true;
-    // Clip before converting floats to integers, including very large offscreen coordinates.
-    double minx=std::max(double(ll),std::ceil(std::min({x[0],x[1],x[2]})-0.5));
-    double maxx=std::min(double(rr),std::floor(std::max({x[0],x[1],x[2]})-0.5)+1);
-    double miny=std::max(double(tt),std::ceil(std::min({y[0],y[1],y[2]})-0.5));
-    double maxy=std::min(double(bb),std::floor(std::max({y[0],y[1],y[2]})-0.5)+1);
-    if(minx>=maxx||miny>=maxy)return true;
-    double offset=0;
-    if(depthEnabled&&(factor!=0||units!=0)) {
-        double dzdx=((z[1]-z[0])*(y[2]-y[0])-(z[2]-z[0])*(y[1]-y[0]))/((x[1]-x[0])*(y[2]-y[0])-(y[1]-y[0])*(x[2]-x[0]));
-        double dzdy=((x[1]-x[0])*(z[2]-z[0])-(x[2]-x[0])*(z[1]-z[0]))/((x[1]-x[0])*(y[2]-y[0])-(y[1]-y[0])*(x[2]-x[0]));
-        offset=factor*std::hypot(dzdx,dzdy)+units*1e-7;
-    }
-    int vc[3][4];for(int i=0;i<3;++i)m3g_unpack(co[i],vc[i]);
-    bool topLeft[3];double dx[3],dy[3];
-    for(int k=0;k<3;++k){int a=order[(k+1)%3],c=order[(k+2)%3];dx[k]=x[c]-x[a];dy[k]=y[c]-y[a];topLeft[k]=dy[k]<0||(dy[k]==0&&dx[k]>0);}
-    for(int py=int(miny);py<int(maxy);++py) {
-        double edge[3];for(int k=0;k<3;++k){int a=order[(k+1)%3];edge[k]=dx[k]*(py+0.5-y[a])-dy[k]*(minx+0.5-x[a]);}
-        for(int px=int(minx);px<int(maxx);++px) {
-            double e[3]={edge[0],edge[1],edge[2]};for(int k=0;k<3;++k)edge[k]-=dy[k];
-            if((e[0]<0||(e[0]==0&&!topLeft[0]))||(e[1]<0||(e[1]==0&&!topLeft[1]))||(e[2]<0||(e[2]==0&&!topLeft[2])))continue;
-            double weight[3];for(int k=0;k<3;++k)weight[order[k]]=e[k]/area;
-            size_t index=size_t(originY+py)*w+size_t(originX+px);
-            double zz=weight[0]*z[0]+weight[1]*z[1]+weight[2]*z[2]+offset;
-            int depth=int(std::max(-32768.0,std::min(32767.0,zz)));
-            if(depthEnabled&&test&&depths->get(index).i<depth)continue;
-            int c[4];for(int k=0;k<4;++k)c[k]=int(weight[0]*vc[0][k]+weight[1]*vc[1][k]+weight[2]*vc[2][k]);
-            uint32_t fg=hasColors?m3g_pack(c):uint32_t(defColor);
-            double recip=1;if(perspective){double q=weight[0]*iw[0]+weight[1]*iw[1]+weight[2]*iw[2];if(q==0||!std::isfinite(q))continue;recip=1/q;}
-            for(int k=0;k<count;++k) {
-                double s=(weight[0]*tex[k].uv[0]+weight[1]*tex[k].uv[2]+weight[2]*tex[k].uv[4])*recip;
-                double v=(weight[0]*tex[k].uv[1]+weight[1]*tex[k].uv[3]+weight[2]*tex[k].uv[5])*recip;
-                fg=m3g_texture_blend(fg,m3g_sample(tex[k],s,v),tex[k]);
-            }
-            int alpha=((fg>>24)*alphaFactor)>>8;if(alpha<int(threshold*255))continue;
-            if(depthEnabled&&write)depths->set(index,Value::of_i(depth));
-            if(colorWrite||alphaWrite) {
-                uint32_t bg=pixels->get(index).i,out=m3g_composite(bg,fg,alpha,mode);
-                if(!colorWrite)out=(out&0xff000000u)|(bg&0x00ffffffu);
-                if(!alphaWrite)out=(out&0x00ffffffu)|(bg&0xff000000u);
-                pixels->set(index,Value::of_i(int32_t(out)));++VMS_RS(g_m3g_native_pixels);
-            }
-        }
-    }
-    return true;
+    m3g_raster::Command command;
+    command.w=w;command.h=h;command.ox=ox;command.oy=oy;command.vx=vx;command.vy=vy;command.l=l;command.t=t;command.r=r;command.b=b;command.depthEnabled=depthEnabled;command.alphaFactor=alphaFactor;command.mode=mode;command.test=test;command.write=write;command.colorWrite=colorWrite;command.alphaWrite=alphaWrite;command.threshold=threshold;command.factor=factor;command.units=units;command.hasColors=hasColors;command.perspective=perspective;command.defColor=defColor;command.count=count;
+    for(int j=0;j<3;++j){command.x[j]=x[j];command.y[j]=y[j];command.z[j]=z[j];command.iw[j]=iw[j];command.co[j]=co[j];}
+    std::array<ArrayStorage*,4> texture_sources{};
+    for(int j=0;j<count;++j){command.textures[size_t(j)]=tex[j];texture_sources[size_t(j)]=tex[j].pixels;}
+    if(m3g_raster::cpu_capture&&m3g_raster::cpu_capture(g,command,pixels,depths,texture_sources))return true;
+    struct DirectIO {
+        ArrayStorage *pixels,*depths;const std::array<ArrayStorage*,4>& textures;
+        uint32_t color(size_t i)const{return uint32_t(pixels->get(i).i);}
+        void color(size_t i,uint32_t v){pixels->set(i,Value::of_i(int32_t(v)));}
+        int depth(size_t i)const{return depths->get(i).i;}
+        void depth(size_t i,int v){depths->set(i,Value::of_i(v));}
+        uint32_t texture(int unit,size_t i)const{return uint32_t(textures[size_t(unit)]->get(i).i);}
+    } io{pixels,depths,texture_sources};
+    const auto result=m3g_raster::draw(command,io);
+    VMS_RS(g_m3g_native_triangles)+=result.triangles;VMS_RS(g_m3g_native_pixels)+=result.pixels;
+    return result.ok;
 }
 #endif

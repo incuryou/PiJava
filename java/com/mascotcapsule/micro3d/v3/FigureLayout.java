@@ -10,17 +10,28 @@ public class FigureLayout {
     public FigureLayout(AffineTrans trans,int sx,int sy,int cx,int cy) {
         setAffineTrans(trans);setScale(sx,sy);setCenter(cx,cy);
     }
-    public final AffineTrans getAffineTrans() { return transforms==null?transform:transforms.length==0?null:transforms[selected]; }
-    public final void setAffineTrans(AffineTrans trans) { transform=trans;transforms=null;selected=0; }
+    public final AffineTrans getAffineTrans() {
+        // Fit30 snapshots have selected>=0 and use dynamic array lookup. New
+        // selections capture the reference in transform without changing fields.
+        return selected<0 || transforms==null?transform:transforms.length==0?null:transforms[selected];
+    }
+    public final void setAffineTrans(AffineTrans trans) { transform=trans;transforms=null;selected=-1; }
     public final void setAffineTrans(AffineTrans[] trans) {
         if(trans==null)throw new NullPointerException();
         for(int i=0;i<trans.length;i++)if(trans[i]==null)throw new NullPointerException();
-        transforms=trans;transform=null;selected=0;
+        transform=getAffineTrans();transforms=trans;selected=-1;
     }
     public final void setAffineTransArray(AffineTrans[] trans) { setAffineTrans(trans); }
     public final void selectAffineTrans(int idx) {
         if(idx<0 || idx>=(transforms==null?1:transforms.length))throw new IllegalArgumentException();
-        selected=idx;
+        if(transforms!=null)transform=transforms[idx];
+        selected=-1;
+    }
+    // Command-list selection reads the registered set without changing the
+    // caller's current selection. This adds no state to existing snapshots.
+    final AffineTrans _getAffineTrans(int idx) {
+        if(idx<0||idx>=(transforms==null?1:transforms.length))throw new IllegalArgumentException();
+        return transforms==null?getAffineTrans():transforms[idx];
     }
     public final int getScaleX() { return scaleX; }
     public final int getScaleY() { return scaleY; }

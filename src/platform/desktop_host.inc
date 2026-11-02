@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
     VMS_RS(g_fb).assign((size_t)VMS_RS(g_screen_w) * VMS_RS(g_screen_h) * 3, 0);
     log_line(std::string("BOOT ") + kVer + " " + main_class);
     launch_class(main_class, rms_identity, import_legacy);
-    if(r4::state.active){r4_run_loop();p7::pool().shutdown();return 0;}
+    if(r4::state.active){r4_run_loop();native_prep_runtime::shutdown();p7::pool().shutdown();return 0;}
     const int64_t diagnostic_started_us=paint_clock_us();
     if (const char* ks = std::getenv("J2ME_KEYS")) {
         int code = 0; bool num = false;
@@ -78,6 +78,7 @@ int main(int argc, char** argv) {
              " gc_cycles=" + std::to_string(VMS_HEAP(g_gc_cycles)) + " gc_array_refs_scanned=" + std::to_string(VMS_HEAP(g_gc_array_refs_scanned)));
     report_optimization_window(paint_clock_us()-diagnostic_started_us,VMS_EXEC(g_runtime_profile).take());
     write_png(out, VMS_RS(g_fb), VMS_RS(g_screen_w), VMS_RS(g_screen_h));
+
     lifecycle_destroy();
-    p7::pool().shutdown(); return 0;
+    native_prep_runtime::shutdown();p7::pool().shutdown(); return 0;
 }

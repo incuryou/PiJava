@@ -13,6 +13,8 @@ static uint32_t diag_method(Method* method){
 static void diag_watchdog_tick(){
     static runtime_diag::Watchdog watchdog;
     watchdog.poll(paint_clock_us(),g_device_diag.live,g_device_diag.labels,[](const char* line){j2melog::write_raw(line,true);});
+    static menu_stall::Watchdog menu_watchdog;
+    menu_watchdog.poll(menu_stall::now_us(),menu_stall::progress,[](const char* line){j2melog::write_raw(line,true);});
 }
 static void diag_host(bool active,bool paused){
     auto& o=g_device_diag.owner;o.host_us=paint_clock_us();o.active=active;o.paused=paused;o.phase=runtime_diag::Phase::Host;g_device_diag.live.publish(o);
